@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import inspect
 from dataclasses import dataclass, replace
 from enum import Enum
-from functools import partial
+from functools import cache, partial
 from typing import ClassVar
 
 import numpy as np
@@ -858,6 +859,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
             or self.use_dedicated_xqa
+            or (
+                # The FI native decode wrapper can plan uniform multi-token
+                # queries (verify batches) when FlashInfer is new enough.
+                not self.use_trtllm_decode_attention
+                and flashinfer_supports_uniform_multi_token_decode()
+            )
         )
         self._init_reorder_batch_threshold(
             1,
@@ -978,8 +985,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> AttentionCGSupport:
         """Get the cudagraph support level for FlashInfer attention.
 
-        SM90 XQA supports only single-token decode. SM12x uses the dedicated
-        XQA API, which supports speculative and non-causal decode.
+        The SM90 XQA integration only enables single-token decode today
+        (specdec mask not wired). Elsewhere, uniform spec-decode batches
+        capture FULL graphs via trtllm-gen or, with a new enough FlashInfer,
+        via the FI native tensor-core decode path.
         """
         if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -1007,9 +1016,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 has_trtllm_support = False
                 break
 
-        if has_trtllm_support and (
-            is_sm12x or not vllm_config.attention_config.use_non_causal
-        ):
+        # The decode paths only support causal attention.
+        if (
+            has_trtllm_support or flashinfer_supports_uniform_multi_token_decode()
+        ) and not vllm_config.attention_config.use_non_causal:
             return AttentionCGSupport.UNIFORM_BATCH
         else:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -1681,11 +1691,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
-                num_input_tokens = num_decode_tokens
+                # Spec-as-decode verify batches carry a uniform
+                # num_decode_tokens // num_decodes tokens per request; the
+                # wrapper's batch size and kv metadata are per request.
+                assert num_decode_tokens % num_decodes == 0
+                decode_q_len = num_decode_tokens // num_decodes
 
-                decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
-                )
+                decode_wrapper = self._get_decode_wrapper(num_decodes, use_cudagraph)
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
@@ -1697,11 +1709,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 fast_plan_decode(
                     decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                    indptr_cpu=self.paged_kv_indptr.cpu[: num_decodes + 1],
                     indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
+                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[:num_decodes],
                     num_qo_heads=self.num_qo_heads * self.dcp_world_size,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
@@ -1716,6 +1726,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    q_len_per_req=decode_q_len,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -2555,6 +2566,14 @@ class FlashInferImpl(AttentionImpl):
             )
 
 
+@cache
+def flashinfer_supports_uniform_multi_token_decode() -> bool:
+    """Whether the installed FlashInfer can plan the tensor-core decode path
+    for a uniform q_len_per_req > 1 (spec-decode verify) and keep the plan
+    cudagraph-safe."""
+    return "q_len_per_req" in inspect.signature(fast_decode_plan).parameters
+
+
 def fast_plan_decode(
     self,  # decode wrapper
     indptr_cpu: torch.Tensor,
@@ -2577,6 +2596,7 @@ def fast_plan_decode(
     non_blocking: bool = True,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    q_len_per_req: int = 1,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
@@ -2618,6 +2638,7 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            q_len_per_req=q_len_per_req,
         )
         self.vllm_first_call = False
         return
@@ -2645,6 +2666,7 @@ def fast_plan_decode(
         non_blocking=non_blocking,
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
+        q_len_per_req=q_len_per_req,
     )
 
 
