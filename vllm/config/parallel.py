@@ -559,6 +559,9 @@ class ParallelConfig:
                 f"{sorted({1, pcp, tp * pcp})}."
             )
 
+        if self.decode_context_parallel_size == 1:
+            self.dcp_comm_backend = "ag_rs"
+
         return self
 
     def set_dcp_defaults(
