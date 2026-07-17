@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -72,6 +73,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -672,16 +674,6 @@ class DeepseekV4MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts or 0
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        assert self.n_physical_experts % self.tp_size == 0, (
-            f"n_physical_experts={self.n_physical_experts} must be divisible by "
-            f"tp_size={self.tp_size}. Adjust num_redundant_experts."
-        )
-        self.n_local_physical_experts = self.n_physical_experts // self.tp_size
-        self.n_local_experts = self.n_local_physical_experts
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.physical_expert_start = self.experts_start_idx
-        self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -703,6 +695,12 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        self.n_local_experts = self.experts.expert_map_manager.local_num_experts
+        self.experts_start_idx = 0
+        self.experts_end_idx = self.n_local_experts
+        self.n_local_physical_experts = self.n_local_experts
+        self.physical_expert_start = self.experts_start_idx
+        self.physical_expert_end = self.experts_end_idx
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -814,10 +812,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        self.layer_name = prefix
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
@@ -827,6 +828,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            eager_scratch_pool=eager_scratch_pool,
+            topk_scores_buffer=topk_scores_buffer,
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
@@ -984,6 +987,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1012,7 +1023,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention._run_parallel_input_projections
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
-        # kv_score). fused_wqa_wkv stays on the default stream.
+        # kv_score). fused_wqa_wkv stays on the default stream. The generic
+        # breakable path captures this overlap; the monolithic path keeps it
+        # inside the opaque `deepseek_v4_attention` custom op.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
@@ -1021,6 +1034,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             config.index_topk,
             dtype=torch.int32,
         )
+        self.topk_scores_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1039,6 +1053,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=self.eager_scratch_pool,
+                topk_scores_buffer=self.topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
