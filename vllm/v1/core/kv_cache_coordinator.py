@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    is_deepseek_v4_hybrid_kv_cache_config,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -598,25 +599,53 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        self.has_dcp_replicated_group = any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            for group in kv_cache_config.kv_cache_groups
+        )
+        # Prefix caching under DCP is unsafe for hybrid layouts whose groups do
+        # not advance from exactly the same cached prefix. Keep the historical
+        # DeepSeek V4 MLA/SWA guard. DFlash is different: the draft KV cache is
+        # replicated and window-bounded under DCP, so prefix-cache hits are safe
+        # as long as the draft group can materialize its local sliding-window
+        # tail and older context slots remain padded.
+        self.disable_prefix_cache_for_dcp_hybrid = (
+            enable_caching
+            and dcp_world_size > 1
+            and pcp_world_size == 1
+            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+        )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
-        assert all(
-            block_size % hash_block_size == 0 for block_size in group_block_sizes
-        ), (
-            "Each KV cache group's real block_size must be divisible by "
-            f"hash_block_size. block_sizes={group_block_sizes}, "
-            f"hash_block_size={hash_block_size}"
-        )
+        if not self.disable_prefix_cache_for_dcp_hybrid:
+            assert all(
+                block_size % hash_block_size == 0 for block_size in group_block_sizes
+            ), (
+                "Each KV cache group's real block_size must be divisible by "
+                f"hash_block_size. block_sizes={group_block_sizes}, "
+                f"hash_block_size={hash_block_size}"
+            )
+        assert (
+            dcp_world_size == 1
+            or not is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+            or self.disable_prefix_cache_for_dcp_hybrid
+        ), "DCP prefix caching unsupported for the DeepseekV4 MLA/SWA hybrid."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
             # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # state. Sliding-window groups are allowed only when replicated
+            # (DFlash draft KV), and the DeepseekV4 MLA/SWA hybrid is handled
+            # via disable_prefix_cache_for_dcp_hybrid above.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                assert (
+                    isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                    or getattr(g.kv_cache_spec, "dcp_replicated", False)
+                    or is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, Mamba, and dcp_replicated groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
@@ -712,37 +741,59 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
 
-    def _align_cacheable(self, num_tokens: int) -> int:
-        """Largest prefix of ``num_tokens`` a future cache hit could match.
-
-        Hits are ``scheduler_block_size``-aligned (see
-        ``find_longest_cache_hit``) unless fine-grained partial hash hits are
-        enabled, in which case no rounding applies -- rounding even to
-        ``hash_block_size`` would re-register a privatized Mamba tail.
-        """
-        if self.enable_partial_hash_hits:
-            return num_tokens
-        return round_down(num_tokens, self.scheduler_block_size)
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        if (
+            self.dcp_world_size > 1
+            and self.pcp_world_size == 1
+            and self.has_dcp_replicated_group
+        ):
+            # This value drives cascade attention metadata, not prefix-cache
+            # lookup. A DFlash hybrid has sharded target KV plus replicated
+            # sliding-window draft KV. Reporting target common-prefix blocks
+            # while the draft group reports zero can enable cascade attention
+            # for only part of the hybrid execution. Prefix-cache reuse remains
+            # handled by find_longest_cache_hit(), where each group returns the
+            # concrete blocks it can safely replay (including draft tail blocks
+            # and null padding for evicted context).
+            return [0] * len(self.kv_cache_config.kv_cache_groups)
+        return super().get_num_common_prefix_blocks(running_request_id)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        if self.disable_prefix_cache_for_dcp_hybrid:
+            return
+
+        if self.enable_partial_hash_hits:
+            aligned_num_computed_tokens = num_computed_tokens
+        else:
+            # Cache hits in this coordinator are always a multiple of
+            # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
+            # Within an aligned region, SWA groups may only consult a subset of
+            # blocks per ``scheduler_block_size``-segment so the unused blocks
+            # also stay out of the prefix-cache hash map.
+            aligned_num_computed_tokens = (
+                num_computed_tokens
+                // self.scheduler_block_size
+                * self.scheduler_block_size
+            )
         for manager in self.single_type_managers:
-            num_tokens_to_cache = cached_num_computed_tokens
+            num_tokens_to_cache = aligned_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
             # it, so make that lookahead block eligible to be cached.
-            if manager.use_eagle and cached_num_computed_tokens > 0:
+            if manager.use_eagle and aligned_num_computed_tokens > 0:
                 # Only cache tokens with finalized KV. The last
                 # num_reprefillable_tokens tokens can be re-prefilled during
                 # multi-module MTP.
                 num_finalized_computed_tokens = max(
                     0, num_computed_tokens - self.num_reprefillable_tokens
                 )
-                cached_num_finalized_computed_tokens = self._align_cacheable(
+                aligned_num_finalized_computed_tokens = (
                     num_finalized_computed_tokens
+                    // self.scheduler_block_size
+                    * self.scheduler_block_size
                 )
                 num_tokens_to_cache = min(
                     num_finalized_computed_tokens,
-                    cached_num_finalized_computed_tokens + manager.block_size,
+                    aligned_num_finalized_computed_tokens + manager.block_size,
                 )
             # The manager already knows the fine hit granularity
             # (``scheduler_block_size``); retention is passed separately so it
@@ -778,6 +829,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - ``num_uncached_common_prefix_tokens``: a shared prefix that a
                   sparse-retention group has not cached yet (0 unless hybrid).
         """
+        if self.disable_prefix_cache_for_dcp_hybrid:
+            blocks: tuple[list[KVCacheBlock], ...] = tuple(
+                [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
+            )
+            return blocks, 0, 0
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length

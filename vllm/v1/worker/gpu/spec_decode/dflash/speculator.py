@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DFlash block-diffusion speculator for the V2 model runner.
+
+DFlash drafts a whole block of tokens in one draft forward: the block is
+[bonus_token, MASK, MASK, ...] and every mask slot predicts the token at
+its own position. Context comes from the target model's auxiliary hidden
+states, which are fc-combined, normed, projected to K/V by every draft
+layer, and written into the draft KV cache.
+"""
+
 import copy
 from collections.abc import Mapping
 from typing import Any
@@ -23,7 +32,10 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    load_dflash_model,
+    maybe_load_mask_embedding,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -36,6 +48,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        # DCP is supported by replicating the draft KV cache on every DCP
+        # rank (the draft spec sets dcp_replicated): every rank writes the
+        # full context KV and the block forward attends over it locally.
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -46,6 +61,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
+        max_query_tokens = self.max_num_reqs * self.num_query_per_req
+        assert max_query_tokens <= self.max_num_tokens, (
+            "max_num_batched_tokens is too small for the DFlash draft block "
+            f"({max_query_tokens} > {self.max_num_tokens})."
+        )
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -160,7 +180,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model = load_dflash_model(target_model, self.vllm_config)
+        maybe_load_mask_embedding(
+            model,
+            self.draft_model_config.model,
+            self.parallel_drafting_token_id,
+        )
+        return model
 
     def set_attn(
         self,
@@ -598,8 +624,9 @@ def _prepare_dflash_inputs_kernel(
         mask=is_query,
         other=0,
     ).to(tl.int64)
-    # A null block is never a writable cache slot. This can occur when a
-    # sliding-window block table contains evicted/global padding entries.
+    # Prefix-cache hits for DCP-replicated DFlash replay a resident
+    # sliding-window tail with null padding for evicted/global positions.
+    # Do not treat the null block as a real writable cache slot.
     q_resident = is_query & (q_block_id != 0)
     local_q_slot = cp_local_slot(
         query_pos,

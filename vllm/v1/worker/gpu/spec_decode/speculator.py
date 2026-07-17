@@ -99,6 +99,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
         self.draft_max_seq_len = self.max_model_len
+        self.rebuild_prefill_attn_metadata = False
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
@@ -246,6 +247,14 @@ class DraftModelSpeculator(BaseSpeculator):
         # builders and buffers.
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
+        self.rebuild_prefill_attn_metadata = block_tables.cp_size > 1 and any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            and any(
+                layer_name in self.draft_attn_layer_names
+                for layer_name in group.layer_names
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
 
     def _build_draft_attn_metadata(
         self,
@@ -256,6 +265,7 @@ class DraftModelSpeculator(BaseSpeculator):
         step: int,
         num_query_per_req: int = 1,
         causal: bool | Mapping[int, bool] = True,
+        max_seq_len_upper_bound: int | None = None,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
@@ -267,8 +277,17 @@ class DraftModelSpeculator(BaseSpeculator):
                 query_start_loc_np[: num_reqs + 1]
             )
             query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-            max_query_len = int(
-                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()
+            max_query_len = (
+                int(
+                    (
+                        query_start_loc_cpu[1 : num_reqs + 1]
+                        - query_start_loc_cpu[:num_reqs]
+                    )
+                    .max()
+                    .item()
+                )
+                if num_reqs > 0
+                else num_query_per_req
             )
         else:
             # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
@@ -292,9 +311,9 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
-            # Draft steps advance and rewind their own global sequence lengths,
-            # so the target model's DCP-local lengths may already be stale.
+        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        dcp_local_seq_lens = None
+        if self.block_tables.cp_size > 1:
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,
@@ -303,7 +322,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_rank,
                 self.block_tables.cp_interleave,
             )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
         with record_function_or_nullcontext("vllm:v2/speculator/build_attn_metadata"):
             attn_metadata = build_attn_metadata(
                 attn_groups=self.attn_groups,
@@ -314,18 +333,15 @@ class DraftModelSpeculator(BaseSpeculator):
                 ],
                 query_start_loc_cpu=query_start_loc_cpu,
                 max_query_len=max_query_len,
-                seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
-                dcp_local_seq_lens=(
-                    None
-                    if dcp_local_seq_lens is None
-                    else dcp_local_seq_lens[:num_reqs_padded]
-                ),
+                seq_lens=seq_lens,
                 max_seq_len=self.draft_max_seq_len,
                 block_tables=block_tables,
                 slot_mappings=slot_mappings,
                 kv_cache_config=self.kv_cache_config,
                 causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
                 seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+                max_seq_len_upper_bound=max_seq_len_upper_bound,
             )
         return attn_metadata
 
