@@ -948,6 +948,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
         use_mha = True
+        is_sparse_impl = self.impl.is_sparse
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             use_mha = self._use_sparse_mha(attn_metadata)
