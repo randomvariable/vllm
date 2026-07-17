@@ -26,10 +26,7 @@ from vllm.config.compilation import CompilationMode, PassConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import (
-    _is_torch_equal_or_newer,
-    is_torch_equal,
-)
+from vllm.utils.torch_utils import _is_torch_equal_or_newer, is_torch_equal
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
 # This import automatically registers `torch.ops.silly.attention`
@@ -936,6 +933,38 @@ def test_default_cudagraph_capture_size_still_clamped_by_token_budget():
         == compilation_config.cudagraph_capture_sizes[-1]
     )
     assert 544 not in compilation_config.cudagraph_capture_sizes
+
+
+def test_spec_decode_cudagraph_sizes_keep_small_full_decode_batches_exact():
+    config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=[
+            1,
+            2,
+            4,
+            8,
+            16,
+            24,
+            32,
+            40,
+            48,
+            56,
+            64,
+            72,
+            80,
+            88,
+            96,
+        ],
+        max_cudagraph_capture_size=96,
+    )
+
+    config.adjust_cudagraph_sizes_for_spec_decode(
+        uniform_decode_query_len=3,
+        tensor_parallel_size=1,
+    )
+
+    for num_reqs in range(1, 33):
+        assert 3 * num_reqs in config.cudagraph_capture_sizes
 
 
 @pytest.mark.skipif(
