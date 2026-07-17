@@ -16,10 +16,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import (
-    build_attn_metadata,
-    init_attn_backend,
-)
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, init_attn_backend
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
@@ -75,6 +73,7 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
@@ -305,28 +304,29 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
-        attn_metadata = build_attn_metadata(
-            attn_groups=self.attn_groups,
-            num_reqs=num_reqs_padded,
-            num_tokens=num_tokens_padded,
-            query_start_loc_gpu=self.input_buffers.query_start_loc[
-                : num_reqs_padded + 1
-            ],
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
-            dcp_local_seq_lens=(
-                None
-                if dcp_local_seq_lens is None
-                else dcp_local_seq_lens[:num_reqs_padded]
-            ),
-            max_seq_len=self.draft_max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=self.kv_cache_config,
-            causal=causal,
-            seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
-        )
+        with record_function_or_nullcontext("vllm:v2/speculator/build_attn_metadata"):
+            attn_metadata = build_attn_metadata(
+                attn_groups=self.attn_groups,
+                num_reqs=num_reqs_padded,
+                num_tokens=num_tokens_padded,
+                query_start_loc_gpu=self.input_buffers.query_start_loc[
+                    : num_reqs_padded + 1
+                ],
+                query_start_loc_cpu=query_start_loc_cpu,
+                max_query_len=max_query_len,
+                seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+                dcp_local_seq_lens=(
+                    None
+                    if dcp_local_seq_lens is None
+                    else dcp_local_seq_lens[:num_reqs_padded]
+                ),
+                max_seq_len=self.draft_max_seq_len,
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                kv_cache_config=self.kv_cache_config,
+                causal=causal,
+                seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            )
         return attn_metadata
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:

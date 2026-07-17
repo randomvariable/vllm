@@ -836,9 +836,11 @@ def _resample_kernel(
         0,  # logits_cache_stride_0
         0,  # logits_cache_stride_1
         None,  # logits_cache_col_ptr
+        None,  # logits_cache_active_rows_ptr
         vocab_size,
         IS_DRAFTING=False,
         APPLY_TEMPERATURE=False,
+        HAS_ACTIVE_ROW_LIMIT=False,
         USE_FP64=USE_FP64,
     )
     token_id = block_idx * BLOCK_SIZE + idx
@@ -1088,7 +1090,7 @@ def rejection_sample(
 
     # Sample up until the first rejected/bonus token, and store
     # the step.
-    sampled = draft_sampled.new_empty(
+    sampled = draft_sampled.new_zeros(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
