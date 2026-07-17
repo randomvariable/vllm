@@ -548,7 +548,7 @@ def make_nvfp4_moe_quant_config(
             gemm1_beta=swiglu_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif backend == NvFp4MoeBackend.EMULATION:
+    if backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
