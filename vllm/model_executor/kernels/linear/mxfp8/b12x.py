@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import torch
-
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -19,6 +18,10 @@ from vllm.utils.b12x import (
 from vllm.utils.torch_utils import current_stream
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+def _b12x_mxfp8_expected_m(tokens: int) -> int:
+    return max(1, int(tokens))
+
 
 
 def _apply_b12x_mxfp8_packed_linear(
@@ -37,9 +40,79 @@ def _apply_b12x_mxfp8_packed_linear(
         input_2d,
         packed_weight,
         bias=bias,
-        expected_m=max(1, int(input_2d.shape[0])),
+        expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
+
     )
     return output.view(*output_shape)
+
+
+
+def warmup_b12x_mxfp8_linear(
+    model: torch.nn.Module,
+    *,
+    max_tokens: int,
+    cudagraph_capture_sizes: Iterable[int] = (),
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+
+    if not current_platform.is_cuda():
+        return 0
+    if not current_platform.is_device_capability_family(120):
+        return 0
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        output_dtype = torch.bfloat16
+
+    layer_map: dict[tuple[Any, ...], Any] = {}
+    for layer in model.modules():
+        packed_weight = getattr(layer, "b12x_mxfp8_packed_weight", None)
+        if packed_weight is None:
+            continue
+        device = torch.device(packed_weight.weight.values.device)
+        signature = (
+            device,
+            int(packed_weight.in_features),
+            int(packed_weight.padded_in_features),
+            int(packed_weight.out_features),
+            output_dtype,
+        )
+        layer_map.setdefault(signature, packed_weight)
+    if not layer_map:
+        return 0
+
+    mxfp8 = _import_b12x_mxfp8()
+    if mxfp8 is None:
+        return 0
+
+    token_counts = b12x_warmup_token_counts(
+        max_tokens=max_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+    )
+    warmed = 0
+    last_device: torch.device | None = None
+
+    with torch.inference_mode():
+        for signature, packed_weight in layer_map.items():
+            device = signature[0]
+            last_device = device
+            for tokens in token_counts:
+                source = torch.zeros(
+                    (tokens, int(packed_weight.in_features)),
+                    dtype=output_dtype,
+                    device=device,
+                )
+                mxfp8.mm(
+                    source,
+                    packed_weight,
+                    expected_m=_b12x_mxfp8_expected_m(tokens),
+                    stream=current_stream().cuda_stream,
+                )
+                warmed += 1
+
+        if warmed > 0 and last_device is not None and last_device.type == "cuda":
+            torch.accelerator.synchronize(last_device)
+
+    return warmed
+
 
 
 class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -65,6 +138,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
         del c
+
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -148,4 +222,5 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+
         return _apply_b12x_mxfp8_packed_linear(layer, x, bias)

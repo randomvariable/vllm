@@ -1,0 +1,16 @@
+sync:
+  defaults:
+    flushOnCreate: true
+    ignore:
+      vcs: true
+  code:
+    alpha: "."
+    beta: "192.168.192.17:/home/naadir/go/src/github.com/randomvariable/vllm/main"
+    mode: "two-way-resolved"
+    ignore:
+      paths:
+        - "/.deps"
+        - "/.venv"
+        - "/__pycache__"
+        - "/vllm.egg-info"
+        - "uv.lock"
