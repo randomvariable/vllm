@@ -385,8 +385,10 @@ class StructuredOutputManager:
                 # is an independent code path, it is kept for now.
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
-                structured_req.reasoning_ended = reasoner.is_reasoning_end(
-                    request.prompt_token_ids or []
+                structured_req.reasoning_ended = (
+                    reasoner.is_reasoning_end_for_prompt(
+                        request.prompt_token_ids or []
+                    )
                 )
             return structured_req.reasoning_ended
         return True
