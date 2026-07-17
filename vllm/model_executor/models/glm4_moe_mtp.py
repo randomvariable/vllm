@@ -195,6 +195,7 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = Glm4MoeMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -219,6 +220,20 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
             self.model.layers.values(),
             Glm4MoE,
             "mtp_block.mlp",
+        )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        return (
+            "lm_head.",
+            "model.embed_tokens.",
+            *(
+                f"model.layers.{layer_idx}."
+                for layer_idx in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + self.config.num_nextn_predict_layers,
+                )
+            ),
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
