@@ -390,6 +390,26 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     supports_draft_decode_metadata_update = True
     supports_exact_metadata_reuse: bool = True
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.use_dspark()
+            and spec_config.dspark_capacity_verification_mode == "varlen"
+            and (
+                spec_config.dspark_confidence_threshold > 0.0
+                or spec_config.dspark_budget_frac < 1.0
+                or spec_config.dspark_sps_curve is not None
+            )
+        ):
+            return AttentionCGSupport.ALWAYS
+        return cls._cudagraph_support
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)

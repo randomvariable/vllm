@@ -466,10 +466,13 @@ class DeepSeekV32IndexerDecodeMetadata:
     global_seq_lens: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     # Live scorer window (max compressed context across the batch) in cache
-    # tokens, computed host-side in build() — a metadata tensor read by the
+    # tokens, computed host-side in build(); a metadata tensor read by the
     # captured indexer kernel, never an in-kernel reduction. None => b12x uses
     # the capacity cap.
     active_width: torch.Tensor | None = None
+    # Per-flattened-row request id for the SM100 varlen paged kernel; None
+    # selects the non-varlen paged path.
+    indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -505,6 +508,14 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
+    if (
+        envs.VLLM_USE_B12X_SPARSE_INDEXER
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        # B12X consumes the already-flattened rank-1 seq_lens and repeated
+        # block-table rows directly, so it does not need DeepGEMM's indices.
+        return True
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
@@ -544,6 +555,44 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _uses_varlen_dspark_capacity(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    return bool(
+        spec_config is not None
+        and spec_config.use_dspark()
+        and spec_config.dspark_capacity_verification_mode == "varlen"
+        and (
+            spec_config.dspark_confidence_threshold > 0.0
+            or spec_config.dspark_budget_frac < 1.0
+            or spec_config.dspark_sps_curve is not None
+        )
+    )
+
+
+def _needs_varlen_decode(
+    use_varlen_decode: bool,
+    all_uniform_width: bool,
+    max_decode_len: int,
+    max_query_len: int,
+) -> bool:
+    """Use the compact scorer only when verification is actually ragged.
+
+    Args:
+        use_varlen_decode: Whether the active backend supports varlen decode.
+        all_uniform_width: Whether every request has the same query width.
+        max_decode_len: Largest decode width in the batch.
+        max_query_len: Largest query width in the batch.
+
+    Returns:
+        Whether this batch requires the varlen decode path.
+    """
+    return (
+        use_varlen_decode
+        and not all_uniform_width
+        and (max_decode_len > 1 or max_query_len > 1)
+    )
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # The indexer opts out of the shared reorder-threshold vote (see __init__),
     # so this is None; its own split uses self.decode_threshold.
@@ -556,7 +605,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        if _supports_varlen_paged_mqa_logits() or _use_flattening(vllm_config):
+        if (
+            _supports_varlen_paged_mqa_logits()
+            and _uses_varlen_dspark_capacity(vllm_config)
+        ) or _use_flattening(vllm_config):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
@@ -592,11 +644,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.reorder_batch_threshold = None
         self.use_flattening = _use_flattening(self.vllm_config)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
+        # Only compact spec-decode verification batches opt into varlen;
+        # uniform DFlash draft proposal should keep the native path.
+        self.use_varlen = (
+            _supports_varlen_paged_mqa_logits()
+            and _uses_varlen_dspark_capacity(self.vllm_config)
+        )
         logger.info_once(
-            "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
-            "(next_n=%d, use_fp4_cache=%s)",
+            "DSA indexer decode path: use_flattening=%s use_varlen=%s "
+            "(next_n=%d, use_fp4_indexer_cache=%s)",
             self.use_flattening,
-            self.supports_varlen,
+            self.use_varlen,
             next_n,
             self.use_fp4_indexer_cache,
         )
@@ -625,6 +683,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # Per-row request ids for the SM100 varlen paged kernel.
         self.decode_indices_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -722,12 +781,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         use_native: bool,
         next_n: int,
         max_decode_len: int,
+        force_flatten: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Prepare native or per-token flattened decode tensors."""
         spec_config = self.vllm_config.speculative_config
         adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
         min_decode_len = int(decode_lens_cpu.min().item())
-        if not use_native:
+        if not use_native and (max_decode_len > 1 or force_flatten):
             assert self.decode_seq_lens_buffer.dim() == 1
             if (
                 not self.supports_varlen
@@ -779,7 +839,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.decode_seq_lens_buffer[:actual_expanded] = (
                     expanded_offsets + self.arange_buffer[:actual_expanded] + 1
                 )
-                self.decode_seq_lens_buffer[actual_expanded:] = 0
+                # FULL graphs may pad the compact varlen token batch past the
+                # final real row. B12X paged scoring cannot launch a zero-K
+                # row, so point graph-only rows at one safe compressed token;
+                # their slot mappings stay padded and their outputs are ignored.
+                padding_seq_len = (
+                    self.compress_ratio
+                    if force_flatten and envs.VLLM_USE_B12X_SPARSE_INDEXER
+                    else 0
+                )
+                self.decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = (
+                    padding_seq_len
+                )
+                self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
@@ -959,6 +1031,68 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             out=self.scheduler_metadata_buffer,
         )
 
+    def _build_varlen_decode_indices(
+        self,
+        decode_lens: torch.Tensor,
+        decode_lens_cpu: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        max_decode_len: int,
+    ) -> torch.Tensor:
+        """Per-flattened-row request id for the SM100 varlen paged kernel.
+
+        Rows are in request-then-token order (matching the per-token expansion
+        in ``_prepare_decode_tensors``); adjacent equal ids form one run. The
+        result always has ``num_decode_tokens`` rows so it matches the
+        (possibly cudagraph-padded) context_lens rows.
+        ``decode_lens`` must be the original per-request counts, read before the
+        expansion overwrites the buffer.
+
+        Args:
+            decode_lens: Device tensor with each request's decode width.
+            decode_lens_cpu: CPU mirror of ``decode_lens``.
+            num_decodes: Number of decode requests.
+            num_decode_tokens: Number of flattened decode rows.
+            max_decode_len: Largest decode width in the batch.
+
+        Returns:
+            A persistent tensor mapping each flattened row to its request id.
+        """
+        indices = self.decode_indices_buffer[:num_decode_tokens]
+        if max_decode_len <= 1:
+            # One query token per request: row r is request r, and any
+            # qsl-padded rows past the last real request naturally form
+            # singleton runs. Copy into the persistent buffer: captured CUDA
+            # graphs bake this buffer's address, so returning arange_buffer
+            # directly would leave the graph reading stale ids.
+            indices.copy_(self.arange_buffer[:num_decode_tokens])
+            return indices
+
+        min_decode_len = int(decode_lens_cpu.min().item())
+        if (
+            min_decode_len == max_decode_len
+            and num_decodes * max_decode_len == num_decode_tokens
+        ):
+            # Uniform with no token padding: row r belongs to request
+            # r // max_decode_len. Static closed form, no device sync.
+            indices.copy_(self.arange_buffer[:num_decode_tokens] // max_decode_len)
+        else:
+            # Variable (eager only): repeat each request id by its decode_len.
+            # Pad the tail with non-merging trailing ids so masked pad rows form
+            # singleton runs instead of extending the last real request's run.
+            actual_expanded = int(decode_lens_cpu.sum().item())
+            indices[:actual_expanded] = torch.repeat_interleave(
+                self.arange_buffer[:num_decodes],
+                decode_lens,
+                output_size=actual_expanded,
+            )
+            if actual_expanded < num_decode_tokens:
+                pad = num_decode_tokens - actual_expanded
+                indices[actual_expanded:num_decode_tokens] = (
+                    num_decodes + self.arange_buffer[:pad]
+                )
+        return indices
+
     def build(
         self,
         common_prefix_len: int,
@@ -974,11 +1108,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
         use_dcp_local_kv = self.dcp_world_size > 1 and dcp_local_seq_lens is not None
+        use_varlen_decode = self.use_varlen and common_attn_metadata.max_req_tokens > 0
+
+        # Short extends ride the decode path (default): their per-token causal
+        # context is the same shape as spec-verify rows, and the boundary must
+        # agree with the other DSv4 builders (sparse_swa/sparse_mla) so that
+        # varlen FULL cudagraphs, which are captured all-decode, stay valid.
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                require_uniform=not (self.use_flattening or self.supports_varlen),
+                require_uniform=not (self.use_flattening or use_varlen_decode),
                 treat_short_extends_as_decodes=not self.use_pcp,
             )
         )
@@ -1106,14 +1246,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             next_n = 1 + self.num_speculative_tokens
-            # The kernel sees max_decode_len Q rows, not the configured next_n,
-            # so legality is per-step: on SM90 a uniformly 3-deep batch has no
-            # native kernel. max_decode_len <= 1 always has one.
+            use_varlen = _needs_varlen_decode(
+                use_varlen_decode=use_varlen_decode,
+                all_uniform_width=bool(
+                    (decode_lens_cpu == max_decode_len).all().item()
+                ),
+                max_decode_len=max_decode_len,
+                max_query_len=common_attn_metadata.max_query_len,
+            )
+            # Native-kernel legality is determined by the width seen during
+            # this step, which can differ from the configured speculative width.
             step_next_n_ok = max_decode_len <= 1 or _supports_native_decode(
                 max_decode_len
             )
             use_native = (
-                not (self.use_flattening or self.supports_varlen)
+                not (self.use_flattening or use_varlen)
                 and max_decode_len <= next_n
                 and step_next_n_ok
             )
@@ -1128,12 +1275,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 max_decode_len=max_decode_len,
             )
 
+            # Build the varlen per-row request ids from the original per-request
+            # decode_lens, before _prepare_decode_tensors overwrites the buffer.
             decode_indices = None
-            if self.supports_varlen:
+            if use_varlen:
                 decode_indices = self._build_varlen_decode_indices(
                     decode_lens=decode_lens,
                     decode_lens_cpu=decode_lens_cpu,
+                    num_decodes=num_decodes,
                     num_decode_tokens=num_decode_tokens,
+                    max_decode_len=max_decode_len,
                 )
 
             seq_lens, block_table, decode_lens, batch_size, requires_padding = (
@@ -1148,10 +1299,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     use_native=use_native,
                     next_n=next_n,
                     max_decode_len=max_decode_len,
+                    force_flatten=use_varlen,
                 )
             )
 
-            seq_lens_is_buffer_view = not use_native or next_n > 1
+            seq_lens_is_buffer_view = (use_native and next_n > 1) or (
+                not use_native and (max_decode_len > 1 or use_varlen)
+            )
 
             # Uncompressed DCP localizes after per-token expansion. Compressed
             # DCP must first convert global logical lengths to compressed-token

@@ -115,7 +115,7 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
 class DeepseekV4SparseMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(
         self,

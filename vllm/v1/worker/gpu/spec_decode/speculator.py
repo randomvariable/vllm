@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,6 +26,9 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.utils import AttentionGroup
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
+
 logger = init_logger(__name__)
 
 
@@ -43,6 +46,18 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 
 
 class BaseSpeculator(ABC):
+    # Draft-token capacity surface, implemented by speculators with a
+    # confidence head (see DSparkSpeculator).
+    use_draft_token_capacity: bool = False
+    online_sts: "DSparkOnlineSTS | None" = None
+    wants_auto_sps_curve: bool = False
+
+    def warmup_capacity_kernels(self) -> None:  # noqa: B027
+        pass
+
+    def set_sps_curve(self, sps_curve: list[tuple[int, float]]) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -81,6 +96,9 @@ class BaseSpeculator(ABC):
         is_profile: bool = False,
     ) -> torch.Tensor:
         pass
+
+    def compute_capacities(self, input_batch: InputBatch) -> torch.Tensor | None:
+        return None
 
 
 class DraftModelSpeculator(BaseSpeculator):

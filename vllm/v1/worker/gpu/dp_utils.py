@@ -41,6 +41,7 @@ def sync_cudagraph_and_dp_padding(
     num_tokens: int,
     num_reqs: int,
     uniform_token_count: int | None,
+    max_req_tokens: int | None,
     dp_size: int,
     dp_rank: int,
     max_query_len: int | None = None,
@@ -53,17 +54,19 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(4, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(5, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+    tensor[4][dp_rank] = max_req_tokens or 0  # (0 means None)
     dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
     uniform_token_counts_across_dp = tensor[2]
     max_query_lens_across_dp = tensor[3]
+    max_req_tokens_across_dp = tensor[4]
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -101,6 +104,9 @@ def sync_cudagraph_and_dp_padding(
         "where synced_cg_mode must be NONE across all DP ranks"
     )
     synced_num_tokens = int(num_tokens_across_dp.max().item())
+    synced_max_req_tokens: int | None = int(max_req_tokens_across_dp.max())
+    if synced_max_req_tokens == 0:
+        synced_max_req_tokens = None
 
     # Varlen decode graphs are selected by the query-length bound, so ranks must agree
     # on it or they pad to different token counts below.
@@ -117,6 +123,7 @@ def sync_cudagraph_and_dp_padding(
         synced_uniform_token_count,
         num_active_loras=num_active_loras,
         max_query_len=synced_max_query_len,
+        max_req_tokens=synced_max_req_tokens or 0,
     )
 
     # Update num_tokens_across_dp to reflect padded size.
@@ -134,6 +141,7 @@ def dispatch_cg_and_sync_dp(
     num_reqs: int,
     num_tokens: int,
     uniform_token_count: int | None,
+    max_req_tokens: int | None,
     dp_size: int,
     dp_rank: int,
     max_query_len: int | None = None,
@@ -180,6 +188,7 @@ def dispatch_cg_and_sync_dp(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            max_req_tokens=max_req_tokens or None,
             num_active_loras=num_active_loras,
         )
     else:
@@ -193,6 +202,7 @@ def dispatch_cg_and_sync_dp(
             dp_sync.uniform_token_count if dp_sync is not None else uniform_token_count,
             num_active_loras=num_active_loras,
             max_query_len=max_query_len,
+            max_req_tokens=max_req_tokens or 0,
         )
 
     if dp_size == 1:
@@ -223,6 +233,7 @@ def dispatch_cg_and_sync_dp(
         num_tokens,
         num_reqs,
         uniform_token_count,
+        max_req_tokens,
         dp_size,
         dp_rank,
         max_query_len=max_query_len,
