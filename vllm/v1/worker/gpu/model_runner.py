@@ -1303,6 +1303,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_scheduled_tokens_upper_bound,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
+        max_seq_len_upper_bound = int(seq_lens_cpu_upper_bound_np[:num_reqs].max())
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
         max_seq_len_np = None
@@ -1332,6 +1333,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=max_seq_len_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=batch_req_state.prefill_len_np,
