@@ -1121,7 +1121,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # global top-k instead of retaining each rank's local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
         os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
-    )
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.
