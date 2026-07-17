@@ -83,11 +83,73 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 
+# Architectures that default to V1 on ROCm: the V2 runner faults during the
+# profile run. VLLM_USE_V2_MODEL_RUNNER=1 still forces V2.
+# TODO: fix V2 enablement
+ROCM_EXCLUDED_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+    }
+)
+
+AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
 
 @lru_cache
 def default_v2_model_runner_architectures() -> frozenset[str]:
     """Architectures defaulting to the V2 model runner on this platform."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        return (
+            DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+            - ROCM_EXCLUDED_V2_MODEL_RUNNER_ARCHITECTURES
+        )
     return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+
+
+def _should_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") is not None:
+        return False
+    if model_config is None:
+        return False
+    return any(
+        arch in AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES
+        for arch in model_config.architectures
+    )
+
+
+def _maybe_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if not _should_auto_enable_breakable_cudagraph(model_config):
+        return False
+
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    if envs.VLLM_USE_AOT_COMPILE:
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        logger.warning_once(
+            "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for this "
+            "architecture, disabling VLLM_USE_AOT_COMPILE=1."
+        )
+    logger.info_once(
+        "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
+        "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+    )
+    return True
 
 
 class OptimizationLevel(IntEnum):
@@ -1314,33 +1376,9 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
-        if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "KimiK3ForConditionalGeneration",
-                    "KimiK3MTPModel",
-                    "KimiLinearForCausalLM",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
+        # These architectures prefer breakable cudagraphs unless the caller
+        # explicitly chooses a different compile path.
+        _maybe_auto_enable_breakable_cudagraph(self.model_config)
 
         from vllm.compilation.breakable_cudagraph import (
             is_breakable_cudagraph_enabled,
