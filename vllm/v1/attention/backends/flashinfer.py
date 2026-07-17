@@ -1291,15 +1291,39 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
-        route_decode = causal or self.use_dedicated_xqa
-        if route_decode:
-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(
+        uses_spec_reorder = self.reorder_batch_threshold > 1
+        force_prefill = False
+        if causal or self.use_dedicated_xqa:
+            decode_threshold = self.reorder_batch_threshold
+            if decode_threshold > 1:
+                query_lens = (
+                    common_attn_metadata.query_start_loc_cpu[1:]
+                    - common_attn_metadata.query_start_loc_cpu[:-1]
+                )
+                has_compact_spec_decode = torch.any(
+                    (query_lens > 0)
+                    & (query_lens != common_attn_metadata.max_query_len)
+                )
+                if has_compact_spec_decode:
+                    decode_threshold = 1
+                    uses_spec_reorder = False
+                    force_prefill = True
+            if force_prefill:
+                num_decodes = 0
+                num_prefills = num_reqs
+                num_decode_tokens = 0
+                num_prefill_tokens = num_actual_tokens
+            else:
+                (
+                    num_decodes,
+                    num_prefills,
+                    num_decode_tokens,
+                    num_prefill_tokens,
+                ) = split_decodes_and_prefills(
                     common_attn_metadata,
-                    decode_threshold=self.reorder_batch_threshold,
+                    decode_threshold=decode_threshold,
                     require_uniform=not self.use_dedicated_xqa,
                 )
-            )
         else:
             num_decodes = 0
             num_prefills = num_reqs
@@ -1318,7 +1342,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         use_cascade = common_prefix_len > 0
-        uses_spec_reorder = self.reorder_batch_threshold > 1
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
@@ -1527,9 +1550,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # use_trtllm_attention never selects it when DCP is enabled.
                 assert not self.use_dcp
                 # Create GPU versions
-                qo_indptr_prefill_gpu = (
-                    qo_indptr[prefill_start:] - qo_indptr[prefill_start]
-                )
+                if prefill_start == 0:
+                    qo_indptr_prefill_gpu = qo_indptr[: num_prefills + 1]
+                else:
+                    qo_indptr_prefill_gpu = (
+                        qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                    )
                 # Compute cum_seq_lens_kv on GPU to avoid CPU sync.
                 # This is the cumulative sum of the number of KV cache
                 # blocks per prefill request.
@@ -2165,6 +2191,15 @@ class FlashInferImpl(AttentionImpl):
                 workspace_buffer = _get_trtllm_workspace_buffer()
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
+                cum_seq_lens_kv = attn_metadata.prefill.cum_seq_lens_kv
+                cum_seq_lens_kv[:1] = 0
+                page_size = kv_cache_permute.shape[-2]
+                num_blocks_per_req = (seq_lens_prefill + page_size - 1) // page_size
+                torch.cumsum(
+                    num_blocks_per_req,
+                    dim=0,
+                    out=cum_seq_lens_kv[1:],
+                )
 
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
                 assert get_kv_cache_layout() == "HND"

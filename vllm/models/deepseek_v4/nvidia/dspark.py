@@ -443,10 +443,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
-    ) -> torch.Tensor:
-        """Per-position acceptance probability for each drafted token."""
-        assert self.model.confidence_head is not None
-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+    ) -> torch.Tensor | None:
+        if self.model.confidence_head is None:
+            return None
+        return self.model.confidence_head(head_hidden, markov_embed)
 
     # --- Weight loading ----------------------------------------------------
 
