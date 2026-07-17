@@ -72,6 +72,7 @@ class InputBatch:
     seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
     seq_lens_cpu_upper_bound: torch.Tensor
+    max_seq_len_upper_bound: int
     # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
     # [num_reqs]
@@ -188,6 +189,7 @@ class InputBatch:
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=int(num_scheduled_tokens.max()),
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
