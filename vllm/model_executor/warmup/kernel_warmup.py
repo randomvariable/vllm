@@ -17,6 +17,10 @@ from torch import nn
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
+from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
+from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
+    warmup_b12x_sparse_indexer,
+)
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
@@ -194,6 +198,73 @@ def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
     ) or _uses_flashinfer_model_kernels(worker.get_model())
 
 
+def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
+    if not envs.VLLM_USE_B12X_DCP_A2A:
+        return 0
+    parallel_config = getattr(worker.vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return 0
+    dcp_world_size = parallel_config.decode_context_parallel_size
+    if dcp_world_size <= 1 or parallel_config.dcp_comm_backend != "a2a":
+        return 0
+
+    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.models.deepseek_v4.nvidia.b12x import (
+        DeepseekV4B12xMLAAttention,
+    )
+    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+
+    model = worker.get_model()
+    candidates = list(model.modules())
+    candidates.extend(
+        worker.vllm_config.compilation_config.static_forward_context.values()
+    )
+    seen_modules: set[int] = set()
+    warmed_signatures: set[tuple[torch.device, torch.dtype, int, int, int]] = set()
+    for module in candidates:
+        if id(module) in seen_modules:
+            continue
+        seen_modules.add(id(module))
+
+        dtype = worker.model_config.dtype
+        if isinstance(module, DeepseekV4B12xMLAAttention):
+            device = module.attn_sink.device
+            total_heads = int(module.n_local_heads) * dcp_world_size
+            query_head_dim = int(module.head_dim)
+            output_head_dim = int(module.head_dim)
+        elif isinstance(module, MLAAttention) and module.dcp_b12x:
+            device = next(module.parameters()).device
+            total_heads = int(module.num_heads) * dcp_world_size
+            query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        else:
+            continue
+
+        signature = (
+            device,
+            dtype,
+            total_heads,
+            query_head_dim,
+            output_head_dim,
+        )
+        if signature in warmed_signatures:
+            continue
+
+        warmup_b12x_dcp_a2a(
+            get_dcp_group(),
+            device=device,
+            dtype=dtype,
+            max_batch_size=worker.scheduler_config.max_num_batched_tokens,
+            total_heads=total_heads,
+            head_dim=output_head_dim,
+            query_head_dim=query_head_dim,
+        )
+        warmed_signatures.add(signature)
+
+    return len(warmed_signatures)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if not worker.use_v2_model_runner:
         # The KV-block zeroing kernel is driven by the scheduler's
@@ -222,6 +293,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    compile_sizes = [
+        size
+        for size in (getattr(compilation_config, "compile_sizes", None) or [])
+        if isinstance(size, int)
+    ]
     mhc_warmup_token_sizes = list(cudagraph_capture_sizes)
     max_num_scheduled_tokens = getattr(
         worker.scheduler_config, "max_num_scheduled_tokens", None
@@ -229,9 +305,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if max_num_scheduled_tokens is not None:
         mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
 
-    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
-    # layer per token; warm them across token sizes first so the first real
-    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    # DSv4 mHC kernels run every decoder layer per token; warm them across
+    # token sizes first so the first real request doesn't pay JIT cost. No-op
+    # for non-DSv4 models (gated inside); still warms the boundary TileLang
+    # kernels used by the b12x mHC forward path.
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
@@ -258,6 +335,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if process_local_only:
         return
 
+    warmed_dcp_a2a = _warmup_b12x_dcp_a2a(worker)
+    if warmed_dcp_a2a:
+        logger.info(
+            "Warmed up %d B12X DCP collective signature(s).",
+            warmed_dcp_a2a,
+        )
+
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
@@ -271,6 +355,23 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         deep_gemm_warmup(model, max_tokens)
 
     b12x_warmup(worker, cudagraph_capture_sizes)
+
+    warmed_indexer = warmup_b12x_sparse_indexer(worker)
+    if warmed_indexer:
+        logger.info("Warmed up %d B12X sparse-indexer decode variants.", warmed_indexer)
+
+    moe_token_counts = [
+        worker.scheduler_config.max_num_batched_tokens,
+        *cudagraph_capture_sizes,
+        *compile_sizes,
+    ]
+    if max_num_scheduled_tokens is not None:
+        moe_token_counts.append(max_num_scheduled_tokens)
+    warmup_b12x_moe_dynamic(
+        worker.get_model(),
+        max_tokens=max(moe_token_counts),
+        token_counts=moe_token_counts,
+    )
 
     minimax_m3_msa_warmup(worker)
 

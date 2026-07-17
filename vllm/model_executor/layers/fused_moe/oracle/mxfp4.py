@@ -609,6 +609,15 @@ def select_deepseek_v4_mxfp4_moe_backend(
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
     runner_backend = config.moe_backend
+    if runner_backend == "auto" and envs.VLLM_USE_B12X_MOE:
+        return _return_or_raise(
+            Mxfp4MoeBackend.B12X,
+            config,
+            kMxfp4Static,
+            None,
+            activation_format,
+            scope="local",
+        )
     if runner_backend != "auto":
         requested_backends = _get_requested_backends(runner_backend, None)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
@@ -741,6 +750,16 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     torch.Tensor | None,
 ]:
     """Convert loaded weights into backend-specific kernel format."""
+
+    if mxfp4_backend == Mxfp4MoeBackend.B12X:
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+            w13_bias,
+            w2_bias,
+        )
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(

@@ -411,6 +411,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.reorder_batch_threshold = None
+        self._skip_tile_scheduler_platform = (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(120)
+        )
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
@@ -778,12 +783,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-            or current_platform.is_device_capability_family(120)
-        ):
+        # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which does not
+        # use the FlashMLA tile scheduler; skip the planner (and its _flashmla_C
+        # dependency, which is not built for sm_120a).
+        if num_decode_tokens == 0 or self._skip_tile_scheduler_platform:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that

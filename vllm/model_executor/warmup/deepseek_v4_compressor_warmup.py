@@ -45,7 +45,7 @@ def _kv_cache_last_dim(spec: MLAAttentionSpec) -> int:
 def _make_dummy_kv_cache(spec: MLAAttentionSpec, device: torch.device) -> torch.Tensor:
     dtype_size = get_dtype_size(spec.dtype)
     page_elements = spec.page_size_bytes // dtype_size
-    block_size = spec.storage_block_size
+    block_size = spec.num_states
     last_dim = _kv_cache_last_dim(spec)
     raw = torch.empty(page_elements, dtype=spec.dtype, device=device)
     return torch.as_strided(
@@ -170,7 +170,7 @@ def deepseek_v4_compressor_triton_warmup(
             int(compressor._quant_block),
             int(compressor._token_stride),
             int(compressor._scale_dim),
-            spec.storage_block_size,
+            spec.num_states,
             spec.page_size_bytes // get_dtype_size(spec.dtype),
             spec.head_size,
             spec.cache_dtype_str,

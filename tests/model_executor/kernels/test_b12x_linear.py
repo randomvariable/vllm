@@ -16,7 +16,19 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP4_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
-    _POSSIBLE_NVFP4_KERNELS,
+    init_fp8_linear_kernel,
+    init_mxfp8_linear_kernel,
+)
+from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+    B12xMxfp8LinearKernel,
+    _b12x_mxfp8_expected_m,
+
+    warmup_b12x_mxfp8_linear,
+)
+from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+    Mxfp8LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
     B12xFp8BlockScaledMMKernel,
     B12xMxFp4LinearKernel,
     B12xMxfp8LinearKernel,
@@ -360,6 +372,26 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
     assert out_dtype == torch.bfloat16
     assert expected_m == 6
 
+def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear as linear_mod
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
+    monkeypatch.setattr(
+        B12xMxfp8LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    monkeypatch.setattr(
+        B12xMxfp8LinearKernel,
+        "can_implement",
+        classmethod(lambda cls, c: (True, None)),
+    )
+
+    kernel = init_mxfp8_linear_kernel()
+
+    assert isinstance(kernel, B12xMxfp8LinearKernel)
+
 
 def test_b12x_mxfp8_can_implement_supported_config() -> None:
     can_implement, reason = B12xMxfp8LinearKernel.can_implement(
@@ -368,6 +400,91 @@ def test_b12x_mxfp8_can_implement_supported_config() -> None:
 
     assert can_implement
     assert reason is None
+
+
+def test_b12x_mxfp8_expected_m_uses_live_m() -> None:
+    assert _b12x_mxfp8_expected_m(0) == 1
+    assert _b12x_mxfp8_expected_m(1) == 1
+    assert _b12x_mxfp8_expected_m(2) == 2
+    assert _b12x_mxfp8_expected_m(8) == 8
+    assert _b12x_mxfp8_expected_m(9) == 9
+    assert _b12x_mxfp8_expected_m(128) == 128
+    assert _b12x_mxfp8_expected_m(129) == 129
+    assert _b12x_mxfp8_expected_m(2048) == 2048
+
+
+
+def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
+    monkeypatch,
+) -> None:
+    import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
+
+    calls = []
+
+    def mm(
+        source: torch.Tensor,
+        packed_weight,
+        *,
+        bias: torch.Tensor | None = None,
+        expected_m: int | None = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        del stream
+        calls.append((source.shape, packed_weight, bias, expected_m))
+        return source.new_empty((source.shape[0], packed_weight.out_features))
+
+    platform = types.SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 120,
+    )
+    monkeypatch.setattr(b12x_mod, "current_platform", platform)
+    monkeypatch.setattr(
+        b12x_mod,
+        "_import_b12x_mxfp8",
+        lambda: types.SimpleNamespace(mm=mm),
+    )
+    monkeypatch.setattr(
+        b12x_mod,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=object()),
+    )
+
+    def packed(in_features: int, padded_in_features: int, out_features: int):
+        return types.SimpleNamespace(
+            in_features=in_features,
+            padded_in_features=padded_in_features,
+            out_features=out_features,
+            weight=types.SimpleNamespace(values=torch.empty(1)),
+        )
+
+    packed_a = packed(128, 128, 256)
+    packed_b = packed(128, 128, 512)
+    modules = [
+        types.SimpleNamespace(b12x_mxfp8_packed_weight=packed_a),
+        types.SimpleNamespace(b12x_mxfp8_packed_weight=packed_a),
+        types.SimpleNamespace(b12x_mxfp8_packed_weight=packed_b),
+        types.SimpleNamespace(),
+    ]
+    model = types.SimpleNamespace(modules=lambda: iter(modules))
+
+    warmed = warmup_b12x_mxfp8_linear(
+        model,
+        max_tokens=2048,
+        cudagraph_capture_sizes=[1, 2],
+    )
+
+    assert warmed == 6
+    assert [call[0] for call in calls] == [
+        torch.Size([1, 128]),
+        torch.Size([2, 128]),
+        torch.Size([2048, 128]),
+        torch.Size([1, 128]),
+        torch.Size([2, 128]),
+        torch.Size([2048, 128]),
+    ]
+    assert [call[3] for call in calls] == [1, 2, 2048, 1, 2, 2048]
+    assert calls[0][1] is packed_a
+    assert calls[3][1] is packed_b
 
 
 def test_b12x_mxfp8_support_check_reports_missing_import(monkeypatch) -> None:
@@ -443,7 +560,7 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     kernel.process_weights_after_loading(layer)
 
     assert layer.b12x_mxfp8_packed_weight is packed
-    assert layer.b12x_warmup_provider is kernel
+
     assert len(calls) == 1
     weight, weight_scale = calls[0]
     assert weight.shape == (48, 128)

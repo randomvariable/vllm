@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 
 import torch
@@ -8,6 +9,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
@@ -23,6 +25,7 @@ from vllm.model_executor.layers.quantization.utils.b12x_moe import (
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
+    prepare_nvfp4_moe_layer_for_b12x,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
@@ -46,6 +49,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
     FLASHINFER_B12X = "FLASHINFER_B12X"
+    B12X = "B12X"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
@@ -59,6 +63,13 @@ FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
     NvFp4MoeBackend.FLASHINFER_B12X,
 ]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
@@ -117,6 +128,12 @@ def backend_to_kernel_cls(
 
         return [FlashInferB12xExperts]
 
+    elif backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_ep_moe import B12xEPExperts
+        from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
+
+        return [B12xEPExperts, B12xExperts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
@@ -161,6 +178,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
+        "b12x": NvFp4MoeBackend.B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,
@@ -215,9 +233,17 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.HUMMING,
     }
 
+    def _backend_supports_clamp(backend: NvFp4MoeBackend) -> bool:
+        if backend in NVFP4_BACKENDS_WITH_CLAMP:
+            return True
+        return backend == NvFp4MoeBackend.B12X and (
+            activation_key is None
+            or config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        )
+
     if config.swiglu_limit is not None:
         AVAILABLE_BACKENDS = [
-            b for b in AVAILABLE_BACKENDS if b in NVFP4_BACKENDS_WITH_CLAMP
+            b for b in AVAILABLE_BACKENDS if _backend_supports_clamp(b)
         ]
 
     use_batched = config.moe_parallel_config.use_batched_activation_format
@@ -229,6 +255,8 @@ def select_nvfp4_moe_backend(
 
     def _make_log_backend(backend: NvFp4MoeBackend):
         available_backend_strs = [b.value for b in AVAILABLE_BACKENDS]
+        if backend not in AVAILABLE_BACKENDS:
+            available_backend_strs.append(backend.value)
         return (
             f"Using '{backend.value}' NvFp4 MoE backend out "
             f"of potential backends: {available_backend_strs}."
@@ -275,9 +303,8 @@ def select_nvfp4_moe_backend(
             and requested_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
         ):
             requested_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED
-        if (
-            config.swiglu_limit is not None
-            and requested_backend not in NVFP4_BACKENDS_WITH_CLAMP
+        if config.swiglu_limit is not None and not _backend_supports_clamp(
+            requested_backend
         ):
             raise ValueError(
                 f"Model sets swiglu_limit={config.swiglu_limit}, but the "
@@ -288,6 +315,29 @@ def select_nvfp4_moe_backend(
             )
         return _return_or_raise(
             requested_backend, config, weight_key, activation_key, activation_format
+        )
+
+    if envs.VLLM_USE_B12X_MOE:
+        if config.swiglu_limit is not None and not _backend_supports_clamp(
+            NvFp4MoeBackend.B12X
+        ):
+            raise ValueError(
+                f"Model sets swiglu_limit={config.swiglu_limit}, but "
+                "VLLM_USE_B12X_MOE=1 requested B12X for a native NVFP4 "
+                "activation form that does not apply the SwiGLU clamp."
+            )
+        return _return_or_raise(
+            NvFp4MoeBackend.B12X,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+
+    if envs.VLLM_TEST_FORCE_FP8_MARLIN:
+        backend = NvFp4MoeBackend.MARLIN
+        return _return_or_raise(
+            backend, config, weight_key, activation_key, activation_format
         )
 
     # Select kernels in order of backend.
