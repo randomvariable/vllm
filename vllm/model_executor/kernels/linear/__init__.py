@@ -13,7 +13,7 @@ or kernel implementation, add it to this __init__.py to maintain
 import stability.
 """
 
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import torch
 
@@ -103,6 +103,7 @@ from vllm.model_executor.kernels.linear.mxfp6.emulation import (
     EmulationMxfp6LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8 import (
+    B12xMxfp8LinearKernel,
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
@@ -431,6 +432,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        B12xFp8BlockScaledMMKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
@@ -503,6 +505,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxfp8LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
@@ -645,8 +648,25 @@ def choose_scaled_mm_linear_kernel(
 
     platform_kernels = possible_kernels.get(current_platform._enum, [])
 
-    # Apply --linear-backend filtering when set.
-    platform_kernels = _resolve_backend_kernels(platform_kernels, "scaled-mm")
+    # Apply --linear-backend filtering when set, while honoring the B12X
+    # compatibility override as a hard requirement.
+    linear_backend = _get_linear_backend()
+    b12x_candidates = _filter_kernels_by_backend("b12x", platform_kernels)
+    b12x_fp8_gemm_required = envs.VLLM_USE_B12X_FP8_GEMM and bool(b12x_candidates)
+    if b12x_fp8_gemm_required:
+        if force_kernel is not None and force_kernel not in b12x_candidates:
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires a B12X kernel for this "
+                f"linear layer, got {force_kernel.__name__}."
+            )
+        if linear_backend not in ("auto", "b12x"):
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
+                f"for FP8 linear layers, got {linear_backend}."
+            )
+        platform_kernels = [cast(type[_KernelT], kernel) for kernel in b12x_candidates]
+    else:
+        platform_kernels = _resolve_backend_kernels(platform_kernels, "scaled-mm")
 
     for kernel in platform_kernels:
         is_supported_and_can_implement, failure_reason = (
@@ -844,8 +864,19 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
     platform = current_platform._enum
     possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 
-    # Apply --linear-backend filtering when set.
-    possible = _resolve_backend_kernels(possible, "MXFP8")
+    # Apply --linear-backend filtering when set, while honoring the B12X
+    # compatibility override as a hard requirement.
+    linear_backend = _get_linear_backend()
+    b12x_fp8_gemm_required = envs.VLLM_USE_B12X_FP8_GEMM
+    if b12x_fp8_gemm_required:
+        if linear_backend not in ("auto", "b12x"):
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
+                f"for MXFP8 linear layers, got {linear_backend}."
+            )
+        possible = [B12xMxfp8LinearKernel]
+    else:
+        possible = _resolve_backend_kernels(possible, "MXFP8")
 
     failure_reasons = []
     for kernel_cls in possible:

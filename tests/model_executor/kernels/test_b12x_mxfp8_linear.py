@@ -20,6 +20,7 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.mxfp8.b12x import (
     B12xMxfp8LinearKernel,
     _b12x_mxfp8_expected_m,
+
     warmup_b12x_mxfp8_linear,
 )
 from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
@@ -504,7 +505,6 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
     assert out_dtype == torch.bfloat16
     assert expected_m == 6
 
-
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
 
@@ -544,6 +544,7 @@ def test_b12x_mxfp8_expected_m_uses_live_m() -> None:
     assert _b12x_mxfp8_expected_m(128) == 128
     assert _b12x_mxfp8_expected_m(129) == 129
     assert _b12x_mxfp8_expected_m(2048) == 2048
+
 
 
 def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
@@ -692,6 +693,7 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     kernel.process_weights_after_loading(layer)
 
     assert layer.b12x_mxfp8_packed_weight is packed
+
     assert len(calls) == 1
     weight, weight_scale = calls[0]
     assert weight.shape == (48, 128)

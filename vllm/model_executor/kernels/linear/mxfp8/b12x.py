@@ -7,7 +7,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -26,9 +25,9 @@ from vllm.utils.torch_utils import current_stream
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
-
 def _b12x_mxfp8_expected_m(tokens: int) -> int:
     return max(1, int(tokens))
+
 
 
 def _apply_b12x_mxfp8_packed_linear(
@@ -53,8 +52,10 @@ def _apply_b12x_mxfp8_packed_linear(
         packed_weight,
         bias=bias,
         expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
+
     )
     return output.view(*output_shape)
+
 
 
 def warmup_b12x_mxfp8_linear(
@@ -64,6 +65,7 @@ def warmup_b12x_mxfp8_linear(
     cudagraph_capture_sizes: Iterable[int] = (),
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> int:
+
     if not current_platform.is_cuda():
         return 0
     if not current_platform.is_device_capability_family(120):
@@ -123,6 +125,7 @@ def warmup_b12x_mxfp8_linear(
     return warmed
 
 
+
 class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
     """ModelOpt MXFP8 linear through the native b12x SM120 dense GEMM path."""
 
@@ -146,6 +149,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
         del c
+
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -190,4 +194,5 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+
         return _apply_b12x_mxfp8_packed_linear(layer, x, bias)
