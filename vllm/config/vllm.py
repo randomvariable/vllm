@@ -72,6 +72,15 @@ ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
     {"DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"}
 )
 
+# Architectures that default to V1 on ROCm: the V2 runner faults during the
+# profile run. VLLM_USE_V2_MODEL_RUNNER=1 still forces V2.
+# TODO: fix V2 enablement
+ROCM_EXCLUDED_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+    }
+)
+
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -103,6 +112,39 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
             "DeepseekV32MTPModel",
         }
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
+
+
+def _should_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") is not None:
+        return False
+    if model_config is None:
+        return False
+    return any(
+        arch in default_breakable_cudagraph_architectures()
+        for arch in model_config.architectures
+    )
+
+
+def _maybe_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if not _should_auto_enable_breakable_cudagraph(model_config):
+        return False
+
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    if envs.VLLM_USE_AOT_COMPILE:
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        logger.warning_once(
+            "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for this "
+            "architecture, disabling VLLM_USE_AOT_COMPILE=1."
+        )
+    logger.info_once(
+        "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
+        "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+    )
+    return True
 
 
 class OptimizationLevel(IntEnum):
@@ -1399,7 +1441,17 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        breakable_cudagraph_enabled = self._maybe_enable_breakable_cudagraph()
+        # These architectures prefer breakable cudagraphs unless the caller
+        # explicitly chooses a different compile path.
+        _maybe_auto_enable_breakable_cudagraph(self.model_config)
+
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        breakable_cudagraph_enabled = is_breakable_cudagraph_enabled()
+        if breakable_cudagraph_enabled:
+            self.compilation_config.mode = CompilationMode.NONE
 
         if not breakable_cudagraph_enabled and (
             self.compilation_config.backend == "eager"
