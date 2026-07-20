@@ -22,8 +22,8 @@ class B12xWarmupUnit:
 
 @functools.cache
 def has_b12x() -> bool:
-    """Return whether the B12X package is installed."""
-    return importlib.util.find_spec("b12x") is not None
+    """Return whether the B12X (sparkinfer) package is installed."""
+    return importlib.util.find_spec("sparkinfer") is not None
 
 
 @functools.cache
@@ -37,19 +37,19 @@ def _get_submodule(module_name: str) -> ModuleType | None:
 
 
 def get_b12x_blockscaled() -> ModuleType | None:
-    return _get_submodule("b12x.gemm.blockscaled")
+    return _get_submodule("sparkinfer.gemm.blockscaled")
 
 
 def get_b12x_intrinsics() -> ModuleType | None:
-    return _get_submodule("b12x._lib.intrinsics")
+    return _get_submodule("sparkinfer._lib.intrinsics")
 
 
 def get_b12x_mxfp8_linear() -> ModuleType | None:
-    return _get_submodule("b12x.gemm.mxfp8_linear")
+    return _get_submodule("sparkinfer.gemm.mxfp8_linear")
 
 
 def get_b12x_tensor_fp8_linear() -> ModuleType | None:
-    return _get_submodule("b12x.gemm.tensor_fp8_linear")
+    return _get_submodule("sparkinfer.gemm.tensor_fp8_linear")
 
 
 def b12x_warmup_token_counts(
