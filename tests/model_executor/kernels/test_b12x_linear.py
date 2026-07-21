@@ -350,7 +350,6 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
     assert called_bias is bias
     assert out_dtype == torch.bfloat16
     assert expected_m == 6
-
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
 

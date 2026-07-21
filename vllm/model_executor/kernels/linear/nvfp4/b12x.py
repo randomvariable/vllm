@@ -71,6 +71,7 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
     @classmethod
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
         del config
+
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
