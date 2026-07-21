@@ -37,7 +37,6 @@ def test_b12x_mxfp4_fallback_priority() -> None:
         < names.index("EmulationMxfp4LinearKernel")
     )
 
-
 def test_b12x_mxfp4_explicit_backend_selects_native_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
 

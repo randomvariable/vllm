@@ -47,6 +47,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.platforms import PlatformEnum
 from vllm.utils.b12x import b12x_warmup_token_counts
 
@@ -504,7 +510,6 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
     assert called_bias is bias
     assert out_dtype == torch.bfloat16
     assert expected_m == 6
-
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
 

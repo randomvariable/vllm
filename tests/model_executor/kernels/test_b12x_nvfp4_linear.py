@@ -23,6 +23,7 @@ from vllm.model_executor.kernels.linear.nvfp4.marlin import (
 from vllm.platforms import PlatformEnum
 
 
+
 def test_b12x_backend_maps_nvfp4_kernel() -> None:
     assert B12xNvFp4LinearKernel in _LINEAR_BACKEND_KERNEL_MAP["b12x"]
     assert B12xNvFp4LinearKernel in _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]
@@ -37,7 +38,6 @@ def test_b12x_nvfp4_fallback_priority() -> None:
         < names.index("B12xNvFp4LinearKernel")
         < names.index("EmulationNvFp4LinearKernel")
     )
-
 
 def test_b12x_nvfp4_explicit_backend_selects_native_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
