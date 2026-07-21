@@ -238,7 +238,11 @@ def _get_linear_backend() -> str:
     return "auto"
 
 
-# Kernel classes covered by each --linear-backend value.
+# Mapping from linear_backend name to the set of kernel classes it covers.
+# When a user sets --linear-backend <name>, only kernels in the corresponding
+# set are considered candidates. A backend with no kernel for the layer family
+# falls back to automatic selection. A matching backend kernel that cannot
+# implement the layer config remains an error.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
@@ -533,6 +537,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xNvFp4LinearKernel,
         FlashInferCuteDslNvFp4LinearKernel,
         FlashInferCutlassNvFp4LinearKernel,
         FlashInferB12xNvFp4LinearKernel,
@@ -561,6 +566,7 @@ _POSSIBLE_MXFP6_KERNELS: dict[PlatformEnum, list[type[MxFp6LinearKernel]]] = {
 
 _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxFp4LinearKernel,
         FlashInferMxFp4LinearKernel,
         MarlinMxFp4LinearKernel,
         HummingMxFp4LinearKernel,
