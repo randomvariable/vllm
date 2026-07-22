@@ -686,7 +686,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
         self.reorder_batch_threshold = None
-        self.use_flattening = not _supports_native_decode(next_n)
+        # B12X / SparkInfer supports native next_n > 2 on SM120. Use the
+        # canonical backend predicate so this also works when selected through
+        # --attention-backend with the environment flag unset.
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer,
+        )
+
+        self.use_flattening = not (
+            _supports_native_decode(next_n) or use_b12x_sparse_indexer()
+        )
         # Only compact spec-decode verification batches opt into varlen;
         # uniform DFlash draft proposal should keep the native path.
         self.use_varlen = (
