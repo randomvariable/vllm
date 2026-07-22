@@ -6767,7 +6767,6 @@ class GPUModelRunner(
                         )
                         torch.accelerator.synchronize()
                         free_after, _ = get_device_memory_info(self.device)
-                        # On UMA, free memory can rise during capture.
                         mem_samples.append(max(mem_before - free_after, 0))
 
                     first_capture = mem_samples[0]
