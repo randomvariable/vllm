@@ -1077,9 +1077,17 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state.encoder_runner.clear()
     # Detach profiling KV tensors held by attention layers. The layers live
     # in the static forward context for compiled models.
-    layers: Iterable[Any] = runner.compilation_config.static_forward_context.values()
+    layers: list[Any] = list(
+        runner.compilation_config.static_forward_context.values()
+    )
     if (model := getattr(runner, "model", None)) is not None:
-        layers = itertools.chain(layers, model.modules())
+        layers = list(itertools.chain(layers, model.modules()))
+    for layer in layers:
+        # Backends may retain pointers derived from the temporary profiling cache.
+        impl = getattr(layer, "impl", None)
+        reset_binding_state = getattr(impl, "reset_kv_cache_binding_state", None)
+        if reset_binding_state is not None:
+            reset_binding_state()
     clear_layer_kv_caches(layers)
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
