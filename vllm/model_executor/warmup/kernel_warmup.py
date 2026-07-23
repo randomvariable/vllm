@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
     warmup_b12x_mla_mxfp8_bmm,
-    warmup_mxfp8_mla_query,
+    warmup_fused_mla_query,
 )
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
@@ -364,13 +364,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             *(size for size in cudagraph_capture_sizes if 1 <= size <= 32),
         }
     )
-    warmed_mla_query = warmup_mxfp8_mla_query(
+    warmed_mla_query = warmup_fused_mla_query(
         worker.get_model(),
         m_values=mla_query_warmup_sizes,
     )
     if warmed_mla_query:
         logger.info(
-            "Warmed up %d fused MLA MXFP8 query variants.",
+            "Warmed up %d fused MLA BF16/MXFP8 query variants.",
             warmed_mla_query,
         )
 
