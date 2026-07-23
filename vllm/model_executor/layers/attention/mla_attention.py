@@ -325,6 +325,35 @@ _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
 
+def _run_mla_query_bmm(
+    query: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    use_safe_op: bool,
+) -> None:
+    if (
+        use_safe_op
+        and query.is_cuda
+        and weight.is_cuda
+        and output.is_cuda
+        and query.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+    ):
+        try:
+            safe_bmm = torch.ops._C.safe_mla_query_bmm
+        except AttributeError:
+            safe_bmm = None
+        if safe_bmm is not None:
+            safe_bmm(query, weight, output)
+            return
+
+    # Fallback for CPU tests, non-BF16 paths, and builds without the CUDA op.
+    # The copy keeps tight DCP/custom-allocation query views out of torch.bmm.
+    torch.bmm(query.contiguous() if use_safe_op else query, weight, out=output)
+
+
 @functools.cache
 def _b12x_absorb_bmm_enabled() -> bool:
     return envs.VLLM_B12X_ABSORB_BMM
@@ -754,11 +783,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
-        self.is_amx_bmm_enabled = getattr(self.impl, "uses_amx_bmm", False)
-        # AMX reads kv_b_proj's weight directly and never calls it live; the
-        # reference CPU MLA backend calls it but isn't perf-critical. Skip
-        # the packed-kernel dispatch either way.
-        kv_b_proj._cpu_skip_gemm_dispatch = True
+        self.use_safe_mla_query_bmm = getattr(
+            self.impl, "use_safe_mla_query_bmm", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -1274,20 +1301,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     group_size=128,
                     transpose_bm=True,
                 )
-            elif self.is_amx_bmm_enabled:
-                # bmm_cpu computes out[n] = mat1[n] @ mat2[n]^T against
-                # AMXMLAImpl's own (N, L, P) packed W_UK -- same as prefill.
-                N, B, P = mqa_q_nope.shape
-                L = self.kv_lora_rank
-                mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-                ops.bmm_cpu(
-                    mqa_ql_nope,
-                    mqa_q_nope,
-                    self.impl._w_uk_packed,  # type: ignore[attr-defined]
-                    True,
-                    None,
-                )
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
@@ -1319,14 +1332,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             b_major="n",
                         )
                     else:
-                        torch.bmm(
+                        _run_mla_query_bmm(
                             mqa_q_nope,
                             self._dequant_b12x_absorbed_pair()[0],
-                            out=mqa_ql_nope,
+                            mqa_ql_nope,
+                            use_safe_op=self.use_safe_mla_query_bmm,
                         )
                 else:
                     assert W_UK_T is not None
-                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                    _run_mla_query_bmm(
+                        mqa_q_nope,
+                        W_UK_T,
+                        mqa_ql_nope,
+                        use_safe_op=self.use_safe_mla_query_bmm,
+                    )
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -1721,14 +1740,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # unless overridden), mirroring Attention.process_weights_after_loading.
         self.impl.process_weights_after_loading(act_dtype)
 
-        if self.is_amx_bmm_enabled:
-            # AMXMLAImpl already packed its own W_UK/W_UV above, for both
-            # prefill and decode. Release the now-unused raw weight.
-            self.kv_b_proj.weight = torch.nn.Parameter(
-                torch.empty(0), requires_grad=False
-            )
-            return
-
     def _prepare_b12x_absorb_bmm(self, act_dtype: torch.dtype) -> bool:
         for name in ("_b12x_absorb_uk_rhs", "_b12x_absorb_uv_rhs"):
             if hasattr(self, name):
@@ -2073,16 +2084,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             x = rocm_aiter_ops.triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
-            )
-        elif self.is_amx_bmm_enabled:
-            # bmm_cpu computes out[n] = mat1[n] @ mat2[n]^T against
-            # AMXMLAImpl's own (N, V, L) packed W_UV -- same as prefill.
-            ops.bmm_cpu(
-                out.transpose(0, 1),
-                x,
-                self.impl._w_uv_packed,  # type: ignore[attr-defined]
-                True,
-                None,
             )
         elif getattr(self, "_use_b12x_absorb_bmm", False):
             if x.shape[1] <= _B12X_ABSORB_BMM_MAX_M:
