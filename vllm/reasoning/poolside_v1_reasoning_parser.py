@@ -48,6 +48,23 @@ class PoolsideV1ReasoningParser(DeepSeekV3ReasoningParser):
             self._start_of_assistant_message
         ]
 
+    @property
+    def reasoning_start_str(self) -> str | None:
+        # Expose the reasoning delimiter unconditionally so that
+        # ``ReasoningConfig.initialize_token_ids`` (which instantiates the
+        # parser *without* ``chat_template_kwargs`` and therefore falls back
+        # to the Identity inner parser, whose ``reasoning_start_str`` is
+        # ``None``) can still auto-initialize the reasoning token IDs.
+        # These are the DeepSeekR1 inner parser's ``<think>``/``</think>``
+        # markers used whenever thinking is enabled.
+        inner_start = self._parser.reasoning_start_str
+        return inner_start if inner_start is not None else "<think>"
+
+    @property
+    def reasoning_end_str(self) -> str | None:
+        inner_end = self._parser.reasoning_end_str
+        return inner_end if inner_end is not None else "</think>"
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # IdentityReasoningParser always returns True: no reasoning to parse.
         if isinstance(self._parser, IdentityReasoningParser):
