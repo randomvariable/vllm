@@ -1,0 +1,33 @@
+.claude/skills/_upstream-cohere-vllm-skills/README.md
+  s_efa7ecf0d91146::t_fb2db5516cbe5a 1-67
+.claude/skills/_upstream-cohere-vllm-skills/auto-fork-maintenance.md
+  s_efa7ecf0d91146::t_c5980337d74a96 1-261
+.claude/skills/_upstream-cohere-vllm-skills/skill-edit-checklist.mdc
+  s_efa7ecf0d91146::t_e9632b0ec65201 1-28
+.claude/skills/auto-rebase/SKILL.md
+  s_efa7ecf0d91146::t_53db8b74ceebcd 1-139
+.claude/skills/detect-upstream-base/SKILL.md
+  s_efa7ecf0d91146::t_8634e08edf6f64 1-47
+.claude/skills/install-vllm/SKILL.md
+  s_efa7ecf0d91146::t_fb11c1103fff1c 1-207
+.claude/skills/local-test-runner/SKILL.md
+  s_efa7ecf0d91146::t_bae353f56a2ccb 1-210
+.claude/skills/rebase-assistant/SKILL.md
+  s_efa7ecf0d91146::t_c6aa175c0fd946 1-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "eca6cfdf7c8724b206ba062e36cdc46629aac57c",
+  "prompts": {},
+  "sessions": {
+    "s_efa7ecf0d91146": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06f119df4ffeDF4252jvyA2SmT",
+        "model": "laguna-s-2.1"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
