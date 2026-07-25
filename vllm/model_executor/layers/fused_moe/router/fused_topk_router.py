@@ -7,6 +7,7 @@ import torch
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.platforms import current_platform
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import (
@@ -66,6 +67,15 @@ def dispatch_topk_softmax_func(
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     if use_rocm_aiter:
         return rocm_aiter_ops.topk_softmax
+    if current_platform.is_rocm():
+        # The CUDA-only _moe_C.topk_softmax op is not built for ROCm; when AITER
+        # is unavailable (e.g. gfx1151 / Strix Halo) route through the Triton
+        # kernel so MoE expert routing still works.
+        from vllm.model_executor.layers.fused_moe.router.triton_topk_softmax import (
+            triton_topk_softmax,
+        )
+
+        return triton_topk_softmax
     return vllm_topk_softmax
 
 
