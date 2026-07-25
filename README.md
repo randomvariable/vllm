@@ -1,78 +1,120 @@
-# vLLM — homelabs fork
+# vLLM for Homelabs
 
-This is a [vLLM](https://github.com/vllm-project/vllm) fork whose default branch
-**`homelabs-main`** is the union of everything needed to build and run a
-**super-optimised vLLM on homelab hardware**. It deliberately diverges from
-upstream `main`; the upstream README is preserved at [`VLLM.md`](VLLM.md).
-
-## Targets
+A [vLLM](https://github.com/vllm-project/vllm) fork tuned to serve large
+language models fast on homelab GPUs. The default branch **`homelabs-main`**
+builds one serving stack for two hardware targets and ships the optimisations
+that make each of them run well.
 
 | Target | GPU | Backend | Runtime image |
 |---|---|---|---|
-| **DGX Spark** | Grace Blackwell, sm_121a (arm64) | CUDA 13 | `vllm-spark-runtime` |
-| **Strix Halo** | AMD Radeon 8060S, gfx1151 / RDNA3.5 (x86_64, 40 CU, UMA) | ROCm 7.14 | `vllm-strix-runtime` |
+| **NVIDIA DGX Spark** | Grace Blackwell, `sm_121a` (arm64) | CUDA 13 | `vllm-spark-runtime` |
+| **AMD Strix Halo** | Radeon 8060S, `gfx1151` / RDNA3.5 (x86_64, 40 CU, 96 GB UMA) | ROCm 7.14 | `vllm-strix-runtime` |
 
-One branch builds both. The build recipes live in [`homelab/`](homelab/):
+The upstream vLLM README is preserved at [`VLLM.md`](VLLM.md).
 
-- [`homelab/spark.Dockerfile`](homelab/spark.Dockerfile) — CUDA 13 / sm_121a
-- [`homelab/strix.Dockerfile`](homelab/strix.Dockerfile) — ROCm 7.14 / gfx1151
+## Quick Start
 
-Both are BuildKit-cache-optimised, two-stage `builder → runtime` Dockerfiles that
-`COPY` this source tree (no inner clone) and carry **no infrastructure specifics**
-— the source ref and the (strix) ROCm base image are `ARG`s.
+Build the image for your hardware straight from a checkout of this branch, then
+serve a model. The Dockerfiles `COPY` this source tree (no inner clone) and are
+BuildKit-cache-optimised two-stage `builder → runtime` builds.
 
-## Building
+### Step 1: Build the Runtime Image
 
-The Dockerfiles build straight from a checkout of this branch:
+DGX Spark (CUDA):
 
 ```sh
-# DGX Spark (CUDA)
 docker build -f homelab/spark.Dockerfile -t vllm-spark-runtime:local .
+```
 
-# Strix Halo (ROCm) -- needs /dev/kfd + /dev/dri at *run* time, not build time
+Strix Halo (ROCm). The build is host-agnostic; the GPU (`/dev/kfd`, `/dev/dri`)
+is only needed at *run* time:
+
+```sh
 docker build -f homelab/strix.Dockerfile -t vllm-strix-runtime:local .
 ```
 
-Automated builds run from the private
-[`vllm-runtime`](https://github.com/randomvariable/vllm-runtime) repo, whose
-Tekton pipelines pull this branch and push the images to the homelab registry.
+### Step 2: Serve a Model
 
-## What's carried (vs upstream)
+```sh
+docker run --rm -it \
+  --device /dev/kfd --device /dev/dri \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  vllm-strix-runtime:local \
+  serve Qwen/Qwen3-8B --host 0.0.0.0 --port 8000
+```
 
-**gfx1151 / Strix Halo enablement & tuning** (the bulk of the divergence):
+Query the OpenAI-compatible endpoint:
 
-- RDNA3 W4A16 GPTQ GEMM kernels enabled on gfx1151 (`#46186`), with the scalar
-  W4A16 path dispatched to gfx1151 (WMMA prefill stays gfx1100-only — its kernel
-  is tuned for 96 CU, gfx1151 is 40 CU).
-- AITER enabled on gfx1151 (Triton flash-attention — explicitly Strix-Halo-tuned,
-  ~1.5–1.9× decode — unified-attention, RMSNorm/RoPE, BF16 MoE). FP8/FP4 and MLA
-  stay gated off per-op (gfx1151 has no FP8 tensor cores).
-- A pure-Triton `topk_softmax` fallback so MoE routing works on AITER-less ROCm
-  (gfx1151), where the only other implementations are AITER (disabled) and the
-  CUDA-only `_moe_C` op.
-- gfx1151 fused_moe autotuned configs, `-ffast-math` on the HIP build, AMD APU
-  UMA VRAM reporting from sysfs, KFD-topology GPU detection, consumer-RDNA
-  encoder-cache-profiling skip, and the AITER LDS-overflow → Triton fallback.
-- ROCm build requirements bumped to 7.14 / torch 2.12.0+rocm7.14.0 (the release
-  HSA runtime initialises the 8060S cleanly; the nightly HSA segfaults in
-  `GpuAgent::InitDma`).
-- The FlashInfer + serving runtime set (incl. the cu130 JIT cache, nixl, ray,
-  tiktoken) inlined into `requirements/cuda.txt` so the spark image installs
-  straight from the file with no build-time patching.
+```sh
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
 
-**GB10 / laguna / poolside** fork work (the original `gb10-main` lineage) is
-retained.
+## Served Models
 
-## Branch strategy
+Any model vLLM supports will run; these are validated and tuned on both targets
+as representative examples:
 
-- **`homelabs-main`** (default) — the consolidated, easy-to-build homelab branch.
-  Diverges from upstream by design.
-- **Upstream contributions** — individual patches are kept upstream-compliant and
-  proposed from their own branches based off `upstream/main`, not from
-  `homelabs-main`.
+- **Qwen 3.6** (GDN hybrid MoE — interleaved full + Gated DeltaNet linear
+  attention) — dense 27B and 35B-A3B, BF16 and quantised.
+- **GPT-OSS** — MoE with SwiGLU activation (MXFP4 on CUDA, W4A16/BF16 on ROCm).
+- **GGUF models** via the bundled [GGUF plugin](#gguf).
 
-## Provenance
+## Optimizations
 
-`homelabs-main` was formerly `gb10-main` (renamed once it covered both DGX Spark
-and Strix Halo). Each carried change is a granular commit citing its source
-(upstream PR or llama.cpp/kyuz0 optimisation) with AI-assistance attribution.
+What `homelabs-main` adds over upstream, framed by the benefit:
+
+**Strix Halo (gfx1151) enablement and tuning** — the bulk of the divergence:
+
+- **AITER on gfx1151** — AMD's Strix-Halo-tuned Triton flash-attention
+  (~1.5–1.9× decode), unified-attention, RMSNorm/RoPE, and BF16 MoE. FP8/FP4 and
+  MLA stay off (gfx1151 has no FP8 tensor cores).
+- **Working MoE routing** — a pure-Triton `topk_softmax` so MoE serves on
+  AITER-less ROCm builds.
+- **W4A16 GPTQ on gfx1151** — native HIP scalar W4A16 GEMM for quantised dense
+  models.
+- **Autotuned fused-MoE configs, `-ffast-math` HIP build, APU UMA VRAM
+  reporting, KFD-topology GPU detection** — and other RDNA3.5 build/runtime
+  fixes so the 8060S initialises and serves cleanly.
+
+**Speculative decoding and runtime knobs** (opt-in):
+
+- DSpark confidence-scheduled verification, online INT8 W8A8 MoE, GDN FLA
+  prefill fusions, and runtime tuning env vars (NUMA binding, mmap control,
+  parallel weight loading). Each is gated behind an env var and off by default.
+
+**GGUF:**
+
+- The [vLLM GGUF plugin](https://github.com/vllm-project/vllm-gguf-plugin) is
+  bundled with the runtime images, so GGUF checkpoints serve out of the box.
+
+Optimisation kernels ported from [ROCm/ATOM](https://github.com/ROCm/ATOM) are
+kept (attributed, MIT) under [`homelab/atom_reference/`](homelab/atom_reference/)
+as reference material.
+
+## Documentation
+
+- [`homelab/`](homelab/) — the build recipes (`spark.Dockerfile`,
+  `strix.Dockerfile`) and ATOM reference kernels.
+- [`docs/`](docs/) — upstream vLLM documentation (usage, serving, contributing).
+- Automated builds run from the private
+  [`vllm-runtime`](https://github.com/randomvariable/vllm-runtime) repo, whose
+  Tekton pipelines pull this branch and push the images to the homelab registry.
+
+## For Contributors
+
+`homelabs-main` deliberately diverges from upstream `main` — it is the union of
+everything needed for an easy, fast homelab build. Individual optimisations are
+kept upstream-compliant and proposed to `vllm-project/vllm` from their own
+branches based off `upstream/main`, never from `homelabs-main`.
+
+`homelabs-main` was formerly `gb10-main`, renamed once it covered both DGX Spark
+and Strix Halo. Each carried change is a granular commit citing its source
+(upstream PR, llama.cpp, ATOM, or ROCmFPX) with AI-assistance attribution.
+
+## License
+
+Apache 2.0, as upstream vLLM. Bundled ATOM reference kernels are MIT
+(© Advanced Micro Devices). See [`LICENSE`](LICENSE).
