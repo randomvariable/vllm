@@ -253,6 +253,15 @@ _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 # RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
 _ON_RDNA = _ON_GFX1X and not _ON_CDNA
 _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
+_CONSUMER_RDNA_ARCHES = (
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+)
+_ON_CONSUMER_RDNA = any(arch in _GCN_ARCH for arch in _CONSUMER_RDNA_ARCHES)
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -392,6 +401,11 @@ def get_cdna_version() -> int:
     if on_gfx1250():
         return 5
     return 0
+
+
+def on_consumer_rdna() -> bool:
+    """Return True for consumer RDNA 3 / 3.5 GPUs that lack MIOpen solver DBs."""
+    return _ON_CONSUMER_RDNA
 
 
 # Enable HIP online tuning early, before hipBLASLt initializes.

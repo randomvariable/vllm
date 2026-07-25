@@ -6478,40 +6478,57 @@ class GPUModelRunner(
                             "enable_mm_embeds=True).",
                         )
                     else:
-                        # NOTE: Currently model is profiled with a single
-                        # non-text modality with the max possible input
-                        # tokens even when it supports multiple.
-                        dummy_modality = mm_budget.get_modality_with_max_tokens()
-                        max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[
-                            dummy_modality
-                        ]
+                        skip_encoder_profiling = False
+                        if current_platform.is_rocm():
+                            from vllm.platforms.rocm import on_consumer_rdna
+                            if on_consumer_rdna():
+                                try:
+                                    device_name = current_platform.get_device_name()
+                                except Exception:
+                                    device_name = "unknown"
+                                logger.warning(
+                                    "Skipping encoder cache profiling on "
+                                    "consumer RDNA GPU (%s): MIOpen has no "
+                                    "pre-compiled solver database, so the "
+                                    "profiling convolution would hang.",
+                                    device_name,
+                                )
+                                skip_encoder_profiling = True
+                        if not skip_encoder_profiling:
+                            # NOTE: Currently model is profiled with a single
+                            # non-text modality with the max possible input
+                            # tokens even when it supports multiple.
+                            dummy_modality = mm_budget.get_modality_with_max_tokens()
+                            max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[
+                                dummy_modality
+                            ]
 
-                        logger.info_once(
-                            "Encoder cache will be initialized with a "
-                            "budget of %s tokens, and profiled with "
-                            "%s %s items of the maximum feature size.",
-                            encoder_budget,
-                            max_mm_items_per_batch,
-                            dummy_modality,
-                        )
+                            logger.info_once(
+                                "Encoder cache will be initialized with a "
+                                "budget of %s tokens, and profiled with "
+                                "%s %s items of the maximum feature size.",
+                                encoder_budget,
+                                max_mm_items_per_batch,
+                                dummy_modality,
+                            )
 
-                        # Create dummy batch of multimodal inputs.
-                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                            dummy_modality,
-                            max_mm_items_per_batch,
-                        )
+                            # Create dummy batch of multimodal inputs.
+                            batched_dummy_mm_inputs = self._get_mm_dummy_batch(
+                                dummy_modality,
+                                max_mm_items_per_batch,
+                            )
 
-                        # Run multimodal encoder.
-                        dummy_encoder_outputs = self.model.embed_multimodal(
-                            **batched_dummy_mm_inputs
-                        )
+                            # Run multimodal encoder.
+                            dummy_encoder_outputs = self.model.embed_multimodal(
+                                **batched_dummy_mm_inputs
+                            )
 
-                        sanity_check_mm_encoder_outputs(
-                            dummy_encoder_outputs,
-                            expected_num_items=max_mm_items_per_batch,
-                        )
-                        for i, output in enumerate(dummy_encoder_outputs):
-                            self.encoder_cache[f"tmp_{i}"] = output
+                            sanity_check_mm_encoder_outputs(
+                                dummy_encoder_outputs,
+                                expected_num_items=max_mm_items_per_batch,
+                            )
+                            for i, output in enumerate(dummy_encoder_outputs):
+                                self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(
