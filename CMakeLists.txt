@@ -271,6 +271,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND
   list(APPEND VLLM_GPU_FLAGS "--compress-mode=size")
 endif()
 
+# Enable -ffast-math for HIP (ROCm) kernels. Allows the compiler to perform
+# floating-point contractions, use fast intrinsics, and relax IEEE compliance.
+# Proven +4-7% on AMD attention/activation kernels (see llama.cpp #23862).
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  list(APPEND VLLM_GPU_FLAGS "-ffast-math")
+endif()
+
 #
 # Set CUDA include flags for CXX compiler.
 #
