@@ -15,6 +15,15 @@ import ray
 import torch
 from ray.experimental.tqdm_ray import tqdm
 
+# Load the MoE C++ extension BEFORE the vllm fused_moe imports below. Those
+# imports touch torch.ops._moe_C, creating an empty op namespace; if the
+# extension is not loaded first, the namespace stays empty (and forked Ray
+# workers inherit the broken state). Guarded for non-ROCm / partial builds.
+try:
+    import vllm._moe_C_stable_libtorch  # noqa: F401
+except ImportError:
+    pass
+
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -519,6 +528,95 @@ def merge_unique_dicts(list1, list2):
     return result
 
 
+def _tune_search_space(
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,
+    topk: int,
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    search_space: list[dict[str, int]],
+    block_quant_shape: list[int],
+    use_deep_gemm: bool,
+    device_id: int,
+) -> dict[str, int]:
+    """Sweep the config search space for one batch size, return the best config.
+
+    Runs in the calling process (no Ray actor), so the MoE C++ extension loaded
+    at module import stays registered. Used by --single-process tuning, which is
+    the reliable path on single-GPU ROCm boxes where Ray actor processes fail to
+    register the _moe_C ops.
+    """
+    from vllm.platforms import current_platform
+
+    # benchmark_config creates tensors without an explicit device; the Ray worker
+    # sets this in __init__, so mirror it here for the in-process path.
+    torch.set_default_device("cuda")
+
+    best_config = None
+    best_time = float("inf")
+    if current_platform.is_rocm():
+        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        search_space = prune_rocm_search_space(
+            num_tokens,
+            shard_intermediate_size,
+            hidden_size,
+            search_space,
+            is_fp16,
+            topk,
+        )
+
+    need_device_guard = False
+    if current_platform.is_rocm():
+        visible_device = os.environ.get("ROCR_VISIBLE_DEVICES", None)
+        if visible_device != f"{device_id}":
+            need_device_guard = True
+
+    with (
+        torch.accelerator.device_index(0) if need_device_guard else nullcontext()
+    ):
+        for idx, config in enumerate(tqdm(search_space)):
+            try:
+                kernel_time = benchmark_config(
+                    config,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    num_iters=20,
+                    block_quant_shape=block_quant_shape,
+                    use_deep_gemm=use_deep_gemm,
+                )
+            except triton.runtime.autotuner.OutOfResources:
+                # Some configurations may be invalid and fail to compile.
+                continue
+
+            if kernel_time < best_time:
+                best_time = kernel_time
+                best_config = config
+
+            if (
+                TRITON_CACHE_CLEAR_INTERVAL > 0
+                and idx > 0
+                and idx % TRITON_CACHE_CLEAR_INTERVAL == 0
+            ):
+                clear_triton_cache()
+
+    clear_triton_cache()
+    now = datetime.now()
+    print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+    assert best_config is not None
+    return best_config
+
+
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
     def __init__(self, seed: int) -> None:
@@ -817,12 +915,20 @@ def get_model_params(config):
         # recurse to get their parameters
         return get_model_params(config.get_text_config())
     else:
-        # Support for llama4
+        # Support for llama4 and custom MoE configs (e.g. Laguna) that use
+        # alternate attribute names. Fall back across common naming variants.
         config = config.get_text_config()
-        # Default: Mixtral.
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
+        E = (
+            getattr(config, "num_local_experts", None)
+            or getattr(config, "num_experts", None)
+            or getattr(config, "n_routed_experts", None)
+        )
+        topk = getattr(config, "num_experts_per_tok", None) or getattr(
+            config, "top_k_experts", 8
+        )
+        intermediate_size = getattr(
+            config, "moe_intermediate_size", None
+        ) or getattr(config, "intermediate_size", None)
         hidden_size = config.hidden_size
     return E, topk, intermediate_size, hidden_size
 
@@ -946,7 +1052,14 @@ def main(args: argparse.Namespace):
         del os.environ["HIP_VISIBLE_DEVICES"]
 
     ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
+    available = ray.available_resources()
+    if "GPU" not in available:
+        # Ray's ROCm GPU auto-detection can fail when rocm-smi is absent;
+        # fall back to the torch-visible device count.
+        ray.shutdown()
+        ray.init(num_gpus=torch.cuda.device_count())
+        available = ray.available_resources()
+    num_gpus = int(available["GPU"])
     workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
 
     def _distribute(method: str, inputs: list[Any]) -> list[Any]:
@@ -982,10 +1095,11 @@ def main(args: argparse.Namespace):
                 "kernels. Please remove the flag."
             )
         start = time.time()
-        configs = _distribute(
-            "tune",
-            [
-                (
+        if args.single_process:
+            # Run the tuning loop in-process (no Ray actors) — the reliable
+            # path on single-GPU ROCm where actor processes lose the _moe_C ops.
+            configs = [
+                _tune_search_space(
                     batch_size,
                     E,
                     shard_intermediate_size,
@@ -998,10 +1112,31 @@ def main(args: argparse.Namespace):
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
+                    0,
                 )
                 for batch_size in batch_sizes
-            ],
-        )
+            ]
+        else:
+            configs = _distribute(
+                "tune",
+                [
+                    (
+                        batch_size,
+                        E,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_w4a16,
+                        search_space,
+                        block_quant_shape,
+                        use_deep_gemm,
+                    )
+                    for batch_size in batch_sizes
+                ],
+            )
         best_configs = {
             M: sort_config(config) for M, config in zip(batch_sizes, configs)
         }
@@ -1068,6 +1203,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Tune in the main process without Ray actors. Reliable on "
+        "single-GPU ROCm boxes where Ray worker processes fail to register "
+        "the _moe_C ops. Implies single-GPU.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()
