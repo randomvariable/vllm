@@ -232,10 +232,17 @@ class KVCacheSpec:
         # Keep DCP-replicated layers (DFlash draft) out of a shared group with
         # DCP-sharded layers (MLA target): one group carries a single cp_size.
         # group_and_unify_kv_cache_specs then routes them as separate groups.
-        self_repl = getattr(self, "dcp_replicated", False)
+        self_layout = (
+            getattr(self, "dcp_replicated", False),
+            getattr(self, "dcp_kv_shard_count", None),
+        )
         return all(
             isinstance(spec, uniform_type_base_spec)
-            and getattr(spec, "dcp_replicated", False) == self_repl
+            and (
+                getattr(spec, "dcp_replicated", False),
+                getattr(spec, "dcp_kv_shard_count", None),
+            )
+            == self_layout
             for spec in kv_cache_specs.values()
         )
 
@@ -433,10 +440,10 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = (
-            1
-            if getattr(self, "dcp_replicated", False)
-            else parallel_config.decode_context_parallel_size
+        kv_shard_count = get_kv_cache_cp_shard_count(
+            self,
+            parallel_config.decode_context_parallel_size,
+            parallel_config.prefill_context_parallel_size,
         )
         return cdiv(max_len, self.block_size * kv_shard_count)
 
@@ -473,11 +480,22 @@ class FullAttentionSpec(AttentionSpec):
     backend cannot reduce across DCP ranks (e.g. the DFlash draft); every
     rank then stores and attends over the full context."""
 
+    dcp_kv_shard_count: int | None = None
+    """Optional number of unique KV shards inside the configured DCP group.
+
+    ``None`` uses every configured DCP/PCP rank. A proper divisor creates
+    replicated shard groups; for example, four shards under DCP8 stores the
+    same shard on ranks ``r`` and ``r + 4``. Full replication continues to use
+    ``dcp_replicated=True``.
+    """
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1 and not self.dcp_replicated:
-            max_model_len = cdiv(max_model_len, dcp_world_size)
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        cp_shards = get_kv_cache_cp_shard_count(self, dcp_world_size, pcp_world_size)
+        if cp_shards > 1:
+            max_model_len = cdiv(max_model_len, cp_shards)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -514,9 +532,14 @@ class FullAttentionSpec(AttentionSpec):
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
         dcp_replicated = {spec.dcp_replicated for spec in specs}
+        dcp_kv_shard_count = {spec.dcp_kv_shard_count for spec in specs}
         assert len(dcp_replicated) == 1, (
             "All attention layers in the same KV cache group must use the same "
             "DCP replication mode."
+        )
+        assert len(dcp_kv_shard_count) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "DCP KV shard count."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -535,6 +558,7 @@ class FullAttentionSpec(AttentionSpec):
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
             dcp_replicated=dcp_replicated.pop(),
+            dcp_kv_shard_count=dcp_kv_shard_count.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -549,6 +573,48 @@ class FullAttentionSpec(AttentionSpec):
             "layers is not supported."
         )
         return merged_spec
+
+
+def get_kv_cache_cp_shard_count(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    """Return the number of unique token-position shards for a cache group."""
+    configured_cp = int(dcp_world_size) * int(pcp_world_size)
+    if configured_cp < 1:
+        raise ValueError(
+            f"Configured context-parallel size must be positive: {configured_cp}"
+        )
+    replicated = bool(getattr(spec, "dcp_replicated", False))
+    override = getattr(spec, "dcp_kv_shard_count", None)
+    if replicated:
+        if override not in (None, 1):
+            raise ValueError(
+                f"dcp_replicated cannot be combined with dcp_kv_shard_count={override}"
+            )
+        return 1
+    if override is None:
+        return configured_cp
+    override = int(override)
+    if pcp_world_size != 1:
+        raise ValueError("Partial KV replication currently requires PCP1")
+    if override < 1 or override > configured_cp or configured_cp % override != 0:
+        raise ValueError(
+            "dcp_kv_shard_count must be a positive divisor of the configured "
+            f"DCP size, got shards={override}, DCP={configured_cp}"
+        )
+    return override
+
+
+def has_nondefault_kv_cp_layout(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> bool:
+    return get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size) != int(
+        dcp_world_size
+    ) * int(pcp_world_size)
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -587,6 +653,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
+        dcp_kv_shard_count_set = set(spec.dcp_kv_shard_count for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -594,6 +661,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(dcp_replicated_set) == 1
+            and len(dcp_kv_shard_count_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "dtype, quantization method, tokens per state, model version, and "
@@ -620,6 +688,7 @@ class MLAAttentionSpec(FullAttentionSpec):
                 spec.non_causal_multi_token_decode for spec in specs
             ),
             dcp_replicated=dcp_replicated_set.pop(),
+            dcp_kv_shard_count=dcp_kv_shard_count_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -676,6 +745,7 @@ class RSWASpec(FullAttentionSpec):
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
             dcp_replicated=base.dcp_replicated,
+            dcp_kv_shard_count=base.dcp_kv_shard_count,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1049,6 +1119,18 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             getattr(spec, "dcp_replicated", False)
             for spec in self.kv_cache_specs.values()
         )
+
+    @property
+    def dcp_kv_shard_count(self) -> int | None:
+        shard_counts = {
+            getattr(spec, "dcp_kv_shard_count", None)
+            for spec in self.kv_cache_specs.values()
+        }
+        if len(shard_counts) != 1:
+            raise ValueError(
+                f"A uniform KV cache group cannot mix DCP shard counts: {shard_counts}"
+            )
+        return shard_counts.pop()
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
