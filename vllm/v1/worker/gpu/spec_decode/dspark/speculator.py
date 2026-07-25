@@ -29,9 +29,16 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.confidence_scheduler import (
+    VerifyScheduler,
+    is_confidence_scheduling_enabled,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -75,6 +82,28 @@ class DSparkSpeculator(DFlashSpeculator):
         self._draft_topk: int | None = getattr(
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
+
+        # Confidence-scheduled verification (ATOM DSpark §3.2.2, gated).
+        # When enabled, a VerifyScheduler picks per-request verify length ell
+        # from draft confidence + an SPS throughput profile. Default OFF = Phase-1
+        # static verify length = num_speculative_steps.
+        self._confidence_scheduler: VerifyScheduler | None = None
+        if is_confidence_scheduling_enabled():
+            logger.info(
+                "DSpark confidence scheduling enabled (VLLM_DSPARK_CONFIDENCE_SCHEDULING=1). "
+                "Per-request verify length ell will be computed from draft confidence."
+            )
+            # TODO(gb10): Wire real SPS calibration from CUDA-graph profiling.
+            # TODO(gb10): Wire STS temperature calibration from held-out grid search.
+            # TODO(gb10): Wire async_copy_stream from runner's tokenID_processor.
+            self._confidence_scheduler = VerifyScheduler(
+                sps_table=None,  # synthetic stub until calibration lands
+                sts_temperatures=None,  # no calibration until wired in
+                async_copy_stream=None,  # sync fallback until async stream wired
+            )
+        # Per-request ell from the last propose(), keyed by batch position.
+        # Used by the variable-length verify path (Level B) when wired in.
+        self._last_ell: torch.Tensor | None = None
 
     def load_draft_model(
         self,
@@ -221,3 +250,36 @@ class DSparkSpeculator(DFlashSpeculator):
             cudagraph_runtime_mode,
         )
         self._sample_sequential(num_reqs, head_hidden)
+
+        # Confidence-scheduled verification: compute per-request ell from draft
+        # confidence. Only runs when VLLM_DSPARK_CONFIDENCE_SCHEDULING=1.
+        # The draft_logits are populated during _sample_sequential when
+        # draft_sample_method == "probabilistic". For argmax drafting, we
+        # compute confidence from the final logits_i (not stored by default).
+        # TODO(gb10): For argmax path, compute confidence from logits_i in
+        # _sample_sequential's last iteration and store in a buffer.
+        if (
+            self._confidence_scheduler is not None
+            and self.draft_logits is not None
+            and num_reqs > 0
+            and cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            # Compute per-position confidence: max softmax prob per step.
+            # draft_logits is [max_num_reqs, num_speculative_steps, vocab_size].
+            logits = self.draft_logits[:num_reqs]  # [R, gamma, V]
+            probs = torch.softmax(logits.float(), dim=-1)  # [R, gamma, V]
+            confidence = probs.max(dim=-1).values  # [R, gamma]
+            ell = self._confidence_scheduler.compute_ell(confidence)
+            self._last_ell = ell
+            self._confidence_scheduler.set_last_ell(ell)
+            # TODO(gb10): Wire record_ell with req_ids from input_batch.
+            # TODO(gb10): Wire ell into the variable-length verify path (Level B).
+            # For now, just log the mean ell for debugging.
+            if logger.logger.isEnabledFor(10):  # DEBUG
+                mean_ell = ell.float().mean().item()
+                logger.debug(
+                    "DSpark confidence scheduler: mean ell=%.2f, min=%d, max=%d",
+                    mean_ell,
+                    ell.min().item(),
+                    ell.max().item(),
+                )
