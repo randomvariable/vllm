@@ -2,15 +2,8 @@
 
 ARG CUDA_TAG=13.0.2
 ARG UBUNTU_TAG=ubuntu24.04
-ARG VLLM_BRANCH=homelabs-main
-# Optional source pin verified after COPY (the Tekton harness passes the trigger
-# revision). Empty by default: build from whatever the build context is checked
-# out to, since this Dockerfile lives in the vllm fork itself.
-ARG VLLM_COMMIT=
 
 FROM nvidia/cuda:${CUDA_TAG}-devel-${UBUNTU_TAG} AS builder
-ARG VLLM_BRANCH
-ARG VLLM_COMMIT
 ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=6 \
     CMAKE_BUILD_PARALLEL_LEVEL=6 \
@@ -34,15 +27,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3-dev python3-venv python3-pip
 
 # This Dockerfile lives in the vllm fork (homelab/), so the build context IS
-# the source -- copy it instead of cloning. .git comes along so setuptools-scm
-# can derive the version. When VLLM_COMMIT is supplied (the Tekton harness
-# passes the trigger revision) the checked-out source is verified against it.
+# the source -- a straight copy, no clone. The builder (the private vllm-runtime
+# Tekton harness) owns which commit is checked out. .git comes along so
+# setuptools-scm can derive the version; the built commit is recorded for
+# image provenance.
 COPY . /src/vllm
-RUN cd /src/vllm && \
-    git rev-parse HEAD > /src/vllm-build-commit && \
-    if [ -n "$VLLM_COMMIT" ]; then \
-      test "$(cat /src/vllm-build-commit)" = "$VLLM_COMMIT"; \
-    fi
+RUN cd /src/vllm && git rev-parse HEAD > /src/vllm-build-commit
 
 # Rust vllm-rs frontend (experimental, opt-in via VLLM_USE_RUST_FRONTEND=1 at
 # runtime -- our production serving path uses the default Python frontend and
@@ -82,41 +72,16 @@ RUN --mount=type=cache,target=/root/.ccache \
     /opt/venv/bin/pip install --index-url https://download.pytorch.org/whl/cu130 \
       'torch==2.11.0' && \
     cd /src/vllm && \
-    sed -E '/^[[:space:]]*flashinfer-(python|cubin)==/d' requirements/build/cuda.txt > requirements/build/cuda-build.txt && \
-    /opt/venv/bin/pip install -r requirements/build/cuda-build.txt --extra-index-url https://download.pytorch.org/whl/cu130 && \
+    /opt/venv/bin/pip install -r requirements/build/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu130 && \
     ccache --version | head -1 && ccache -z && \
     /opt/venv/bin/pip wheel -v --no-build-isolation --no-deps --wheel-dir /wheels . && \
     ccache -s && \
     python3 -c "import glob, sys, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); sys.exit(0) if any(n.endswith('vllm/vllm-rs') for n in names) else (print('FATAL: vllm-rs binary missing from wheel -- rust build did not bundle', file=sys.stderr), sys.exit(1))"
 
-# Replace only stale FlashInfer metadata; keep the fork's other requirements intact.
-RUN python3 - <<'PYCODE'
-import base64, hashlib, pathlib, re, tempfile, zipfile
-wheel = next(pathlib.Path('/wheels').glob('vllm-*.whl'))
-with zipfile.ZipFile(wheel) as source:
-    files = {name: source.read(name) for name in source.namelist()}
-metadata_name = next(name for name in files if name.endswith('.dist-info/METADATA'))
-metadata = files[metadata_name].decode()
-metadata, count = re.subn(r'(?m)^(Requires-Dist: flashinfer-(?:python|cubin))==[0-9][^\n]*$', r'\1>=0.6.15.post1', metadata)
-if count < 1:
-    raise SystemExit(f'expected at least one stale FlashInfer requirement (flashinfer-python; flashinfer-cubin is excluded from install_requires since 0.6.14 per requirements/cuda.txt), found {count}')
-files[metadata_name] = metadata.encode()
-record_name = next(name for name in files if name.endswith('.dist-info/RECORD'))
-records = []
-for line in files[record_name].decode().splitlines():
-    name = line.split(',', 1)[0]
-    if name == metadata_name:
-        digest = base64.urlsafe_b64encode(hashlib.sha256(files[name]).digest()).rstrip(b'=').decode()
-        line = f'{name},sha256={digest},{len(files[name])}'
-    records.append(line)
-files[record_name] = ('\n'.join(records) + '\n').encode()
-with tempfile.NamedTemporaryFile(dir=wheel.parent, suffix='.whl', delete=False) as output:
-    replacement = pathlib.Path(output.name)
-with zipfile.ZipFile(replacement, 'w', zipfile.ZIP_DEFLATED) as target:
-    for name, content in files.items():
-        target.writestr(name, content)
-replacement.replace(wheel)
-PYCODE
+# The wheel is installed --no-deps in the runtime stage, so its Requires-Dist
+# metadata never drives dependency resolution here -- no FlashInfer metadata
+# patching is needed. The fork's requirements/cuda.txt carries the full
+# FlashInfer set (incl. the cu130 JIT cache) for the runtime install below.
 
 RUN mkdir -p /runtime-requirements && \
     cp /src/vllm/requirements/cuda.txt /runtime-requirements/cuda.txt && \
@@ -132,8 +97,6 @@ RUN mkdir -p /runtime-requirements && \
 
 FROM nvidia/cuda:${CUDA_TAG}-runtime-${UBUNTU_TAG} AS runtime
 ARG CUDA_TAG
-ARG VLLM_BRANCH
-ARG VLLM_COMMIT
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_BREAK_SYSTEM_PACKAGES=1 \
     VLLM_TARGET_DEVICE=cuda \
@@ -170,106 +133,16 @@ COPY --from=builder /wheels /wheels
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 
+# requirements/cuda.txt carries the full runtime set (FlashInfer incl. the cu130
+# JIT cache, nixl, ray, tiktoken) with the needed extra index URLs, so install
+# straight from it -- no sed stripping or explicit per-package pins here.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    sed -i -E '/^[[:space:]]*flashinfer-(python|cubin)==/d' /runtime-requirements/cuda.txt && \
-    uv pip install --system \
-    -r /runtime-requirements/cuda.txt \
-    'flashinfer-python==0.6.15.post1' \
-    'flashinfer-cubin==0.6.15.post1' \
-    'flashinfer-jit-cache==0.6.15.post1+cu130' \
-    'nixl>=1.3.1' 'nixl-cu13>=1.3.1' \
-    'ray[default]' 'tiktoken>=0.9.0' \
-    --extra-index-url https://download.pytorch.org/whl/cu130 \
-    --extra-index-url https://flashinfer.ai/whl/ \
-    --extra-index-url https://flashinfer.ai/whl/cu130/ \
+    uv pip install --system -r /runtime-requirements/cuda.txt \
     --index-strategy unsafe-best-match && \
     uv pip install --system --no-deps /wheels/*.whl
 
-# cutlass-dsl sm_121a arch guard: NOT applied. eugr's spark-vllm-docker sed
-# patches (run.sh 55-83) target CuTe DSL Python source (warp/mma.py,
-# tcgen05/mma.py, tcgen05/copy.py) present in nvidia-cutlass-dsl 4.4.2. In the
-# pinned 4.6.0 (requirements/cuda.txt), those modules ship compiled into
-# libcute_dsl_runtime.so / _cutlass_ir.*.so inside nvidia-cutlass-dsl-libs-*;
-# no `.py` file contains `if not arch == Arch.sm_120a:`, `admissible_archs`, or
-# `is_family_of(Arch.sm_110f)`. There is nothing to sed, so the patch is a
-# no-op here and is intentionally omitted (arch selection is instead forced
-# via CUTE_DSL_ARCH=sm_121a in the ENV block above -- validated on-box:
-# FlashInferB12xExperts grouped GEMM matches BF16 reference with this env var
-# set and cutlass-dsl 4.6.0 unmodified. The pod manifest may still set it
-# explicitly for clarity but the image default is now load-bearing, not a
-# placeholder.)
-
-# NVFP4 profiler workspace fix (FlashInfer PR #3738 regression): native SM100+
-# NVFP4 MoE uses FP4 activations AND FP4 weights, but PR #3738 narrowed the
-# profiler workspace allocation to the FP8-activation family, so autotune
-# allocates null quant workspaces and fails in prepareQuantParams(). This only
-# affects the TRT-LLM grouped-GEMM backend (FLASHINFER_CUTLASS), which is
-# excluded from auto-selection (oracle/nvfp4.py) and unreachable via our
-# production --moe-backend flashinfer_b12x flag -- b12x is a separate CuteDSL
-# kernel (flashinfer.fused_moe.b12x_fused_moe) that never touches this file's
-# GemmProfilerBackend. Confirmed on-box: flashinfer-python==0.6.15.post1 does
-# not even ship the isNativeWfp4Afp8Family predicate this patch targets, so
-# the pattern-not-found case below is expected and must be a no-op, not a
-# build failure. Retained only as forward-looking defense-in-depth in case a
-# future flashinfer release reintroduces the unfixed predicate. Ported
-# verbatim from eugr's spark-vllm-docker Dockerfile (215-259); target path is
-# self-located under the installed flashinfer package.
-RUN python3 - <<'PY'
-import flashinfer, pathlib
-
-pkg_dir = pathlib.Path(flashinfer.__file__).parent
-target = pkg_dir / "data" / "csrc" / "fused_moe" / "cutlass_backend" / "cutlass_fused_moe_kernels.cuh"
-old_predicate = (
-    "  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();\n"
-)
-fixed_predicates = """  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
-  // Native Blackwell NVFP4 uses FP4 activations and FP4 weights.
-  bool const is_native_wfp4afp4_family =
-      mSM >= 100 &&
-      (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
-"""
-old_branch = "  if (is_native_wfp4afp8_family) {"
-fixed_branch = (
-    "  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {"
-)
-
-if not target.exists():
-    raise SystemExit(f"{target} not found; cannot apply NVFP4 profiler patch")
-
-text = target.read_text()
-already_fixed = fixed_predicates in text and fixed_branch in text
-if already_fixed:
-    print("FlashInfer native NVFP4 profiler workaround already present; skipping")
-else:
-    if text.count(old_predicate) != 1 or text.count(old_branch) != 1:
-        # b12x (our production MoE backend) never touches this file. Newer
-        # flashinfer releases (validated: 0.6.15.post1) have already dropped
-        # or rewritten this predicate outside our target pattern -- skip
-        # gracefully rather than fail the build over a defense-in-depth patch
-        # for an unreachable code path.
-        print(
-            "FlashInfer PR #3738 profiler pattern not found (predicate="
-            f"{text.count(old_predicate)}, branch={text.count(old_branch)}); "
-            "not applicable to this flashinfer version, skipping patch"
-        )
-    else:
-        text = text.replace(old_predicate, fixed_predicates, 1)
-        text = text.replace(old_branch, fixed_branch, 1)
-        target.write_text(text)
-        print("Applied FlashInfer native NVFP4 profiler workspace workaround")
-        patched = target.read_text()
-        if fixed_predicates not in patched or fixed_branch not in patched:
-            raise SystemExit("FlashInfer native NVFP4 profiler patch verification failed")
-PY
 RUN rm -rf /wheels
 
-# No source patches are applied here. UMA wedge protection (PR #46932
-# negative-cudagraph clamp) is compiled into the wheel from the fork's SM121 +
-# UMA-clamp commits (homelabs-main). instanttensor is deliberately excluded: it
-# causes hard power-cycle-requiring lockups on DGX Spark GB10 UMA
-# (NV_ERR_NO_MEMORY during CUDA graph compile); fastsafetensors is the
-# GB10-safe loader.
 RUN python3 -m compileall -q "$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" || true
 
 RUN mkdir -p /opt/vllm/tiktoken_encodings "$HF_HOME" "$VLLM_CACHE_ROOT" && \
@@ -285,8 +158,6 @@ LABEL org.opencontainers.image.title="vllm-spark-runtime" \
       org.opencontainers.image.description="Stock model-neutral vLLM runtime for DGX Spark sm_121a" \
       org.opencontainers.image.source="https://github.com/randomvariable/vllm/tree/homelabs-main/homelab" \
       org.randomvariable.vllm.cuda="13.0.2" \
-      org.randomvariable.vllm.source-branch="homelabs-main" \
-      org.randomvariable.vllm.source-commit="a7617c3e0ea7" \
       org.randomvariable.vllm.patch-policy="UMA clamp (PR #46932) compiled into fork source; no runtime patch" \
       org.randomvariable.vllm.distributed-executor-backend="ray"
 

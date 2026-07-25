@@ -20,11 +20,6 @@
 # rocm7.14, arch list includes gfx1151, GPU enumerates as "AMD Radeon 8060S").
 
 ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
-ARG VLLM_BRANCH=homelabs-main
-# Optional source pin verified after COPY (the Tekton harness passes the trigger
-# revision). Empty by default: build from the local checkout, since this
-# Dockerfile lives in the vllm fork itself.
-ARG VLLM_COMMIT=
 
 # Coherent TheRock nightly used for the BUILD toolchain (hipcc/cmake) and the
 # build-time torch. Runtime keeps the base image's release torch.
@@ -43,8 +38,6 @@ ARG GGUF_PLUGIN_REF=1df60c43f1f1274681bb957e5bb9b8f5c44d2f4d
 
 # ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS builder
-ARG VLLM_BRANCH
-ARG VLLM_COMMIT
 ARG ROCM_NIGHTLY
 ARG ROCM_INDEX
 ARG BUILD_TORCH
@@ -85,15 +78,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "setuptools-rust>=1.9.0" "cmake>=3.26.1,<4" pybind11
 
 # --- acquire the source: this Dockerfile lives in the vllm fork (homelab/), ---
-# so the build context IS the source -- copy it instead of cloning. .git comes
-# along so setuptools-scm can derive the version. When VLLM_COMMIT is supplied
-# (the Tekton harness passes the trigger revision) the source is verified.
+# so the build context IS the source -- a straight copy, no clone. The builder
+# (the private vllm-runtime Tekton harness) owns which commit is checked out.
+# .git comes along so setuptools-scm can derive the version; the built commit is
+# recorded for image provenance.
 COPY . /src/vllm
-RUN cd /src/vllm && \
-    git rev-parse HEAD > /src/vllm-build-commit && \
-    if [ -n "$VLLM_COMMIT" ]; then \
-      test "$(cat /src/vllm-build-commit)" = "$VLLM_COMMIT"; \
-    fi
+RUN cd /src/vllm && git rev-parse HEAD > /src/vllm-build-commit
 
 # --- build the gfx1151 wheel --------------------------------------------------
 # amdclang as HOST compiler (kyuz0 segfault fix: aligns vLLM-ext ABI with torch;
@@ -142,8 +132,6 @@ RUN mkdir -p /runtime-requirements \
 
 # ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS runtime
-ARG VLLM_BRANCH
-ARG VLLM_COMMIT
 ARG PYTORCH_ROCM_ARCH
 
 # Runtime env for Strix Halo / gfx1151 (kyuz0-validated knobs). NO
@@ -205,8 +193,6 @@ LABEL org.opencontainers.image.title="vllm-strix-runtime" \
       org.opencontainers.image.source="https://github.com/randomvariable/vllm/tree/homelabs-main/homelab" \
       org.randomvariable.vllm.rocm="7.14" \
       org.randomvariable.vllm.gpu-arch="gfx1151" \
-      org.randomvariable.vllm.source-branch="homelabs-main" \
-      org.randomvariable.vllm.source-commit="a7617c3e0ea7" \
       org.randomvariable.vllm.build-policy="nightly TheRock SDK builds; release ROCm 7.14 runtime (InitDma-safe); no source patches"
 
 WORKDIR /opt/vllm
