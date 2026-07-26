@@ -73,6 +73,7 @@ from vllm.model_executor.layers.rotary_embedding import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
+    ensure_model_supports_weight_reload,
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
@@ -5591,6 +5592,7 @@ class GPUModelRunner(
             )
 
         model = self.get_model()
+        ensure_model_supports_weight_reload(model)
         weights_to_load = {
             name.replace(".base_layer.", ".") if self.lora_config else name
             for name, _ in model.named_parameters()

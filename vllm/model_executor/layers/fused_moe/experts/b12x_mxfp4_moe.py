@@ -90,7 +90,7 @@ def _replace_parameter_with_empty(
         return None
     empty = torch.empty((0,), dtype=param.dtype, device=param.device)
     replace_parameter(layer, param_name, empty)
-    return getattr(layer, param_name)
+    return param
 
 
 def _set_quant_config_weight_scale(
@@ -234,6 +234,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Prepare b12x-owned W4A16 weights and release one-way sources."""
+        if self._experts is not None:
+            raise RuntimeError(
+                "B12X weights have already been prepared; rebuild the engine to "
+                "load new weights"
+            )
+
         w13_weight = cast(torch.Tensor, layer.w13_weight)
         w2_weight = cast(torch.Tensor, layer.w2_weight)
         device = w13_weight.device

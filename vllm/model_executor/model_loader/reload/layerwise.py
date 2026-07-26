@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "get_layerwise_info",
+    "ensure_model_supports_weight_reload",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -80,6 +81,26 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info.restore_device = torch.get_default_device()
 
 
+def ensure_model_supports_weight_reload(model: torch.nn.Module) -> None:
+    """Validate that every quantized layer supports in-place weight reloads."""
+    unsupported = []
+    for layer_path, layer in model.named_modules():
+        quant_method = getattr(layer, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase) and not (
+            quant_method.supports_weight_reload()
+        ):
+            unsupported.append(
+                f"{layer_path or '<root>'} ({type(quant_method).__name__})"
+            )
+
+    if unsupported:
+        layers = ", ".join(unsupported)
+        raise NotImplementedError(
+            "In-place weight reload is not supported for: "
+            f"{layers}. Rebuild the engine to load new weights."
+        )
+
+
 @torch.no_grad()
 def initialize_layerwise_reload(model: torch.nn.Module):
     """
@@ -96,6 +117,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    ensure_model_supports_weight_reload(model)
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False

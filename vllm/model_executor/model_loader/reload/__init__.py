@@ -19,6 +19,7 @@ Limitations:
 
 __all__ = [
     "record_metadata_for_reloading",
+    "ensure_model_supports_weight_reload",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
@@ -27,6 +28,7 @@ __all__ = [
 ]
 
 from .layerwise import (
+    ensure_model_supports_weight_reload,
     finalize_layerwise_processing,
     finalize_layerwise_reload,
     initialize_layerwise_reload,

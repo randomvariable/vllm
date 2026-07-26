@@ -12,6 +12,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.experts.b12x_mxfp4_moe as b12x
 import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as oracle
+import vllm.model_executor.layers.quantization.mxfp4 as mxfp4_quant
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
@@ -104,6 +105,73 @@ def test_explicit_b12x_oracle_selection_is_fail_closed(monkeypatch):
         oracle.select_deepseek_v4_mxfp4_moe_backend(config)
 
 
+def test_b12x_processes_canonical_weights_without_generic_conversion(monkeypatch):
+    process_weights = Mock()
+    kernel = SimpleNamespace(
+        fused_experts=SimpleNamespace(process_weights_after_loading=process_weights)
+    )
+    make_kernel = Mock(return_value=kernel)
+    convert_weights = Mock(side_effect=AssertionError("generic converter called"))
+    monkeypatch.setattr(mxfp4_quant, "make_mxfp4_moe_kernel", make_kernel)
+    monkeypatch.setattr(
+        mxfp4_quant,
+        "convert_weight_to_mxfp4_moe_kernel_format",
+        convert_weights,
+    )
+
+    method = cast(Any, object.__new__(mxfp4_quant.Mxfp4MoEMethod))
+    method.mxfp4_backend = Mxfp4MoeBackend.B12X_MXFP4
+    method.num_experts = 2
+    method.intermediate_size = 32
+    method.hidden_size = 32
+    method._cache_permute_indices = {}
+    method.moe_quant_config = None
+    method.moe_kernel = None
+    method.moe = SimpleNamespace()
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = Mock(return_value=SimpleNamespace())
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(torch.zeros(2, 64, 16, dtype=torch.uint8), False),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        torch.nn.Parameter(torch.zeros(2, 32, 16, dtype=torch.uint8), False),
+    )
+    layer.register_parameter(
+        "w13_weight_scale",
+        torch.nn.Parameter(torch.zeros(2, 64, 1, dtype=torch.uint8), False),
+    )
+    layer.register_parameter(
+        "w2_weight_scale",
+        torch.nn.Parameter(torch.zeros(2, 32, 1, dtype=torch.uint8), False),
+    )
+    layer._expert_routing_tables = Mock(return_value=None)
+
+    canonical_tensors = dict(layer.named_parameters())
+    setup_kernel = Mock(wraps=method._setup_kernel)
+    method._setup_kernel = setup_kernel
+    method.process_weights_after_loading(layer)
+
+    convert_weights.assert_not_called()
+    setup_kernel.assert_called_once()
+    make_kernel.assert_called_once()
+    process_weights.assert_called_once_with(layer)
+    assert dict(layer.named_parameters()).keys() == canonical_tensors.keys()
+    assert all(
+        tensor is canonical_tensors[name] for name, tensor in layer.named_parameters()
+    )
+
+
+def test_b12x_does_not_support_weight_reload():
+    method = cast(Any, object.__new__(mxfp4_quant.Mxfp4MoEMethod))
+    method.mxfp4_backend = Mxfp4MoeBackend.B12X_MXFP4
+
+    assert not method.supports_weight_reload()
+
+
 def test_preparation_retains_owner_and_plans_persistent_scratch(monkeypatch):
     weight_plan = SimpleNamespace()
     owner = SimpleNamespace()
@@ -159,6 +227,14 @@ def test_preparation_retains_owner_and_plans_persistent_scratch(monkeypatch):
     assert caps.call_args.kwargs["weight_plan"] is weight_plan
     assert caps.call_args.kwargs["max_tokens"] == 32
     assert tuple(t.shape for t in experts._scratch) == ((3,), (2,))
+
+
+def test_b12x_rejects_repeated_weight_preparation():
+    experts = cast(Any, object.__new__(b12x.B12xExperts))
+    experts._experts = object()
+
+    with pytest.raises(RuntimeError, match="rebuild the engine"):
+        experts.process_weights_after_loading(torch.nn.Module())
 
 
 def test_apply_binds_owner_without_planning_or_allocation(monkeypatch):

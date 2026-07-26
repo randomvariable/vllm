@@ -575,6 +575,30 @@ class _RecordingQuantMethod(QuantizeMethodBase):
         self.bias_at_process = layer.bias.detach().clone()
 
 
+class _UnsupportedReloadMethod(_RecordingQuantMethod):
+    def supports_weight_reload(self) -> bool:
+        return False
+
+
+def test_unsupported_reload_fails_before_model_mutation():
+    layer = torch.nn.Linear(2, 2, bias=False)
+    layer.quant_method = _UnsupportedReloadMethod()
+    layer.weight.weight_loader = default_weight_loader
+    model = torch.nn.Sequential(layer)
+    parameter = layer.weight
+    pointer = parameter.data_ptr()
+    value = parameter.detach().clone()
+    loader = parameter.weight_loader
+
+    with pytest.raises(NotImplementedError, match="0 \\(_UnsupportedReloadMethod\\)"):
+        initialize_layerwise_reload(model)
+
+    assert layer.weight is parameter
+    assert layer.weight.data_ptr() == pointer
+    assert torch.equal(layer.weight, value)
+    assert layer.weight.weight_loader is loader
+
+
 class _LateBiasLayer(torch.nn.Module):
     """Mimics an online-quantized linear: `weight` is created on meta by
     `create_weights()`, which wraps the loaders, and the linear base registers

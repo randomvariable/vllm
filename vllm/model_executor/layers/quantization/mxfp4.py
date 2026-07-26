@@ -537,6 +537,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def supports_eplb(self) -> bool:
         return True
 
+    def supports_weight_reload(self) -> bool:
+        return self.mxfp4_backend != Mxfp4MoeBackend.B12X_MXFP4
+
     @property
     def skip_forward_padding(self) -> bool:
         # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
@@ -722,7 +725,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13, w2, w13_scale, w2_scale = (
                 self._convert_k3_situ_weight_to_kernel_format(layer)
             )
-        else:
+        # B12X prepares kernel weights directly from canonical checkpoint tensors.
+        elif self.mxfp4_backend != Mxfp4MoeBackend.B12X_MXFP4:
             w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
                 convert_weight_to_mxfp4_moe_kernel_format(
                     mxfp4_backend=self.mxfp4_backend,
@@ -744,16 +748,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         uses_triton_weight_format = self.mxfp4_backend in TRITON_BACKENDS or (
             self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
         )
-        if not uses_triton_weight_format:
-            replace_parameter(layer, "w13_weight", w13)
-            replace_parameter(layer, "w2_weight", w2)
-            replace_parameter(layer, "w13_weight_scale", w13_scale)
-            replace_parameter(layer, "w2_weight_scale", w2_scale)
-        else:
-            layer.w13_weight = w13
-            layer.w2_weight = w2
-            self.w13_precision_config = w13_scale
-            self.w2_precision_config = w2_scale
+        if self.mxfp4_backend != Mxfp4MoeBackend.B12X_MXFP4:
+            if not uses_triton_weight_format:
+                replace_parameter(layer, "w13_weight", w13)
+                replace_parameter(layer, "w2_weight", w2)
+                replace_parameter(layer, "w13_weight_scale", w13_scale)
+                replace_parameter(layer, "w2_weight_scale", w2_scale)
+            else:
+                layer.w13_weight = w13
+                layer.w2_weight = w2
+                self.w13_precision_config = w13_scale
+                self.w2_precision_config = w2_scale
 
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
