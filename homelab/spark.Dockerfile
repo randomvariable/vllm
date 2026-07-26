@@ -3,7 +3,16 @@
 ARG CUDA_TAG=13.0.2
 ARG UBUNTU_TAG=ubuntu24.04
 
+# GGUF quantization plugin (out-of-tree; CUDA supported). Its extension is
+# compiled in the builder and the resulting wheel is installed into the runtime.
+ARG GGUF_PLUGIN_REPOSITORY=https://github.com/vllm-project/vllm-gguf-plugin.git
+# Pinned SHA. Unpinned `main` on an out-of-tree repo is non-reproducible; bump
+# deliberately.
+ARG GGUF_PLUGIN_REF=1df60c43f1f1274681bb957e5bb9b8f5c44d2f4d
+
 FROM nvidia/cuda:${CUDA_TAG}-devel-${UBUNTU_TAG} AS builder
+ARG GGUF_PLUGIN_REPOSITORY
+ARG GGUF_PLUGIN_REF
 ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=6 \
     CMAKE_BUILD_PARALLEL_LEVEL=6 \
@@ -27,8 +36,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3-dev python3-venv python3-pip
 
 # This Dockerfile lives in the vllm fork (homelab/), so the build context IS
-# the source -- a straight copy, no clone. The builder (the private vllm-runtime
-# Tekton harness) owns which commit is checked out. .git comes along so
+# the source -- a straight copy, no clone. An external CI harness owns which
+# commit is checked out. .git comes along so
 # setuptools-scm can derive the version; the built commit is recorded for
 # image provenance.
 COPY . /src/vllm
@@ -61,6 +70,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     cd /src/vllm && \
     ./build_rust.sh && \
     test -x /src/vllm/vllm/vllm-rs && \
+    ls /src/vllm/vllm/_rust_tool_parser*.so >/dev/null 2>&1 && \
     cp /src/vllm/vllm/vllm-rs /tmp/vllm-rs.built
 
 RUN --mount=type=cache,target=/root/.ccache \
@@ -76,7 +86,20 @@ RUN --mount=type=cache,target=/root/.ccache \
     ccache --version | head -1 && ccache -z && \
     /opt/venv/bin/pip wheel -v --no-build-isolation --no-deps --wheel-dir /wheels . && \
     ccache -s && \
-    python3 -c "import glob, sys, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); sys.exit(0) if any(n.endswith('vllm/vllm-rs') for n in names) else (print('FATAL: vllm-rs binary missing from wheel -- rust build did not bundle', file=sys.stderr), sys.exit(1))"
+    python3 -c "import glob, sys, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); missing = [artifact for artifact, present in [('vllm-rs', any(n.endswith('vllm/vllm-rs') for n in names)), ('_rust_tool_parser', any(n.startswith('vllm/_rust_tool_parser') and n.endswith('.so') for n in names))] if not present]; sys.exit(0) if not missing else (print(f'FATAL: {\", \".join(missing)} missing from wheel -- rust build did not bundle', file=sys.stderr), sys.exit(1))"
+
+# GGUF plugin wheel is built here with the CUDA toolchain and installed into the
+# runtime later. Kept non-fatal so plugin-side breakage never blocks core vLLM.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eux; \
+    git init -q /src/gguf-plugin; \
+    git -C /src/gguf-plugin remote add origin "${GGUF_PLUGIN_REPOSITORY}"; \
+    git -C /src/gguf-plugin fetch --depth 1 origin "${GGUF_PLUGIN_REF}"; \
+    git -C /src/gguf-plugin checkout -q FETCH_HEAD; \
+    /opt/venv/bin/pip wheel --no-build-isolation --no-deps \
+        --wheel-dir /wheels-gguf /src/gguf-plugin \
+      || { echo "WARN: GGUF plugin wheel build failed; core image continues"; \
+           mkdir -p /wheels-gguf; }
 
 # The wheel is installed --no-deps in the runtime stage, so its Requires-Dist
 # metadata never drives dependency resolution here -- no FlashInfer metadata
@@ -100,6 +123,7 @@ ARG CUDA_TAG
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_BREAK_SYSTEM_PACKAGES=1 \
     VLLM_TARGET_DEVICE=cuda \
+    VLLM_USE_RUST_FRONTEND=1 \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     CUTE_DSL_ARCH=sm_121a \
@@ -130,18 +154,26 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN python3 -m pip install --no-cache-dir --break-system-packages uv
 
 COPY --from=builder /wheels /wheels
+COPY --from=builder /wheels-gguf /wheels-gguf
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 
 # requirements/cuda.txt carries the full runtime set (FlashInfer incl. the cu130
 # JIT cache, nixl, ray, tiktoken) with the needed extra index URLs, so install
 # straight from it -- no sed stripping or explicit per-package pins here.
+# xxhash128 prefix-cache support (--prefix-caching-hash-algo xxhash)
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /runtime-requirements/cuda.txt \
     --index-strategy unsafe-best-match && \
-    uv pip install --system --no-deps /wheels/*.whl
+    uv pip install --system xxhash && \
+    uv pip install --system --no-deps /wheels/*.whl && \
+    if ls /wheels-gguf/*.whl >/dev/null 2>&1; then \
+        uv pip install --system --no-deps /wheels-gguf/*.whl && \
+        uv pip install --system "gguf>=0.17.0" && \
+        echo "GGUF plugin installed"; \
+    else echo "GGUF plugin wheel absent; skipping"; fi
 
-RUN rm -rf /wheels
+RUN rm -rf /wheels /wheels-gguf
 
 RUN python3 -m compileall -q "$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" || true
 

@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # vllm-strix-runtime -- vLLM runtime for AMD Strix Halo (gfx1151 / Ryzen AI Max /
-# Radeon 8060S) APUs, built from the same private fork branch (homelabs-main) as the
-# CUDA DGX Spark runtime. Sibling of vllm-spark-runtime; same clone-and-build,
-# secret-handling, and two-stage builder->runtime contract, retargeted to ROCm.
+# Radeon 8060S) APUs, built from the same branch as the CUDA DGX Spark runtime.
+# Sibling of vllm-spark-runtime; same source-build and two-stage builder->runtime
+# contract, retargeted to ROCm.
 #
 # WHY TWO STAGES (load-bearing, do not collapse):
 #   * The BUILDER needs the TheRock *nightly* ROCm SDK (rocm-sdk-devel) to get
@@ -79,11 +79,33 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # --- acquire the source: this Dockerfile lives in the vllm fork (homelab/), ---
 # so the build context IS the source -- a straight copy, no clone. The builder
-# (the private vllm-runtime Tekton harness) owns which commit is checked out.
+# (an external CI harness) owns which commit is checked out.
 # .git comes along so setuptools-scm can derive the version; the built commit is
 # recorded for image provenance.
 COPY . /src/vllm
 RUN cd /src/vllm && git rev-parse HEAD > /src/vllm-build-commit
+
+# --- Rust vllm-rs frontend ----------------------------------------------------
+# Must run before the wheel build: setup.py's optional Rust extensions otherwise
+# allow a wheel with no vllm-rs or _rust_tool_parser to build silently.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.rustup,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/vllm/target,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        curl perl make build-essential protobuf-compiler libprotobuf-dev && \
+    /opt/venv/bin/pip install "setuptools-rust>=1.9.0" && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+      sh -s -- -y --default-toolchain none && \
+    . "$HOME/.cargo/env" && \
+    cd /src/vllm && \
+    ./build_rust.sh && \
+    test -x /src/vllm/vllm/vllm-rs && \
+    ls /src/vllm/vllm/_rust_tool_parser*.so >/dev/null 2>&1
 
 # --- build the gfx1151 wheel --------------------------------------------------
 # amdclang as HOST compiler (kyuz0 segfault fix: aligns vLLM-ext ABI with torch;
@@ -103,7 +125,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     BC="$(find "$ROOT" -type d -name bitcode -print -quit 2>/dev/null || true)"; \
     [ -n "$BC" ] && export HIP_DEVICE_LIB_PATH="$BC"; \
     export CMAKE_ARGS="-DROCM_PATH=$ROOT -DHIP_PATH=$ROOT -DAMDGPU_TARGETS=${PYTORCH_ROCM_ARCH} -DHIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH}"; \
-    /opt/venv/bin/pip wheel -v --no-build-isolation --no-deps --wheel-dir /wheels .
+    /opt/venv/bin/pip wheel -v --no-build-isolation --no-deps --wheel-dir /wheels .; \
+    /opt/venv/bin/python -c "import glob, sys, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); missing = [artifact for artifact, present in [('vllm-rs', any(n.endswith('vllm/vllm-rs') for n in names)), ('_rust_tool_parser', any(n.startswith('vllm/_rust_tool_parser') and n.endswith('.so') for n in names))] if not present]; sys.exit(0) if not missing else (print(f'FATAL: {\", \".join(missing)} missing from wheel -- rust build did not bundle', file=sys.stderr), sys.exit(1))"
 
 # --- build the GGUF plugin wheel (compiles _C_gguf HIP kernel for gfx1151) -----
 # Built here where hipcc lives; installed into the release runtime later. Kept
@@ -140,6 +163,7 @@ ARG PYTORCH_ROCM_ARCH
 # crash, so the nightly SDK is deliberately absent here.
 ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_TARGET_DEVICE=rocm \
+    VLLM_USE_RUST_FRONTEND=1 \
     PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     HIP_VISIBLE_DEVICES=0 \
     ROCBLAS_USE_HIPBLASLT=1 \
@@ -161,6 +185,7 @@ COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 # Install runtime deps from the fork's ROCm requirements MINUS torch/triton/
 # vision/audio (the base image already provides the working release rocm build);
 # then the vLLM wheel --no-deps, then the GGUF plugin wheel if it built.
+# xxhash128 prefix-cache support (--prefix-caching-hash-algo xxhash)
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eux; \
     grep -vhiE '^[[:space:]]*(-r|#|$)' \
@@ -168,6 +193,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       | grep -viE '^[[:space:]]*(torch|pytorch-triton-rocm|triton|torchvision|torchaudio|rocm[-_]?sdk[-_a-z]*)([[:space:]]|==|>|<|~|;|\[|$)' \
       | sort -u > /tmp/runtime-reqs.txt; \
     /opt/venv/bin/pip install --no-cache-dir -r /tmp/runtime-reqs.txt; \
+    /opt/venv/bin/pip install --no-cache-dir xxhash; \
     /opt/venv/bin/pip install --no-cache-dir --no-deps /wheels/vllm-*.whl; \
     if ls /wheels-gguf/*.whl >/dev/null 2>&1; then \
         /opt/venv/bin/pip install --no-cache-dir --no-deps /wheels-gguf/*.whl \

@@ -99,9 +99,8 @@ as reference material.
 - [`homelab/`](homelab/) — the build recipes (`spark.Dockerfile`,
   `strix.Dockerfile`) and ATOM reference kernels.
 - [`docs/`](docs/) — upstream vLLM documentation (usage, serving, contributing).
-- Automated builds run from the private
-  [`vllm-runtime`](https://github.com/randomvariable/vllm-runtime) repo, whose
-  Tekton pipelines pull this branch and push the images to the homelab registry.
+- Automated builds are produced by an external CI harness that pulls this
+  branch.
 
 ## For Contributors
 
