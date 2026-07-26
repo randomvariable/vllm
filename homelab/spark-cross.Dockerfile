@@ -186,7 +186,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_BREAK_SYSTEM_PACKAGES=1 \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_USE_RUST_FRONTEND=1 \
-    VLLM_USE_FLASHINFER_SAMPLER=0 \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     CUTE_DSL_ARCH=sm_121a \
@@ -212,15 +211,13 @@ COPY --from=builder /wheels-gguf /wheels-gguf
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 
-# FlashInfer 0.6.15 is incompatible with torch 2.13/cu130. Remove its three
-# requirements until a CUDA 13-compatible FlashInfer release is available.
+# FlashInfer 0.6.15.post1 IS compatible with torch 2.13/cu130 (resolves via the
+# flashinfer.ai cu130 index declared in requirements/cuda.txt; cubin/jit-cache
+# are NOT on PyPI). It is mandatory: the DGX Spark production deployments
+# (deepseek-v4-flash sparse MLA, hy3-nvfp4, laguna) run on FlashInfer sm_12x
+# kernels -- a FlashInfer-less image is pointless for them. Never strip it.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    sed -E '/^[[:space:]]*flashinfer-(python|cubin|jit-cache)/d' \
-      /runtime-requirements/cuda.txt \
-      > /runtime-requirements/cuda-no-flashinfer.txt && \
-    ! grep -Eq '^[[:space:]]*flashinfer-(python|cubin|jit-cache)' \
-      /runtime-requirements/cuda-no-flashinfer.txt && \
-    uv pip install --system -r /runtime-requirements/cuda-no-flashinfer.txt \
+    uv pip install --system -r /runtime-requirements/cuda.txt \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       --index-strategy unsafe-best-match && \
     uv pip install --system xxhash && \
