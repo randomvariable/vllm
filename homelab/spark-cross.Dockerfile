@@ -61,6 +61,27 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     file /tmp/t.o | grep -qi aarch64 && \
     rm -f /tmp/t.cu /tmp/t.o
 
+# The aarch64 cross compiler defines __aarch64__, so the multiarch wrapper at
+# /usr/include/python3.12/pyconfig.h does
+#   #include <aarch64-linux-gnu/python3.12/pyconfig.h>
+# resolving via the cross multiarch dir /usr/include/aarch64-linux-gnu. Only x86
+# python3-dev is installed, so that arch-specific pyconfig.h is absent. Python.h
+# etc. are arch-neutral (already present); only pyconfig.h must come from the
+# arm64 libpython3.12-dev. Pull just that .deb from ports.ubuntu.com and extract
+# its arch-specific include dir. Version is read from the host's installed
+# libpython3.12-dev so the arm64 headers always match the host python3.12 (same
+# noble source package) -- no hardcoded point version, no multiarch apt state.
+RUN set -eux; \
+    ver="$(dpkg-query -W -f='${Version}' libpython3.12-dev)"; \
+    curl -fsSL -o /tmp/libpython3.12-dev-arm64.deb \
+      "https://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/libpython3.12-dev_${ver}_arm64.deb"; \
+    dpkg-deb -x /tmp/libpython3.12-dev-arm64.deb /tmp/pyarm64; \
+    mkdir -p /usr/include/aarch64-linux-gnu; \
+    cp -a /tmp/pyarm64/usr/include/aarch64-linux-gnu/python3.12 \
+          /usr/include/aarch64-linux-gnu/python3.12; \
+    test -f /usr/include/aarch64-linux-gnu/python3.12/pyconfig.h; \
+    rm -rf /tmp/pyarm64 /tmp/libpython3.12-dev-arm64.deb
+
 COPY requirements/build/cuda.txt requirements/build/rust.txt /tmp/build-requirements/
 # Builder Python imports native x86 torch for setup probes. CMake links only the
 # separately extracted aarch64 torch tree below.
