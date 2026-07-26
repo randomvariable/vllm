@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12X modular fused-MoE backend for DeepSeek V4 native MXFP4 weights."""
 
-import functools
 import importlib
+import importlib.metadata
+import inspect
 from typing import Any, cast
 
 import torch
@@ -29,96 +30,47 @@ from vllm.platforms import current_platform
 def _run_b12x_moe_fp4(
     *,
     a: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
+    experts: Any,
+    scratch_plan: Any,
+    scratch: tuple[torch.Tensor, ...],
     output: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    apply_router_weight_on_input: bool,
-    input_scales_are_reciprocal: bool,
     input_scales_static: bool,
-    activation: str,
-    quant_mode: str,
     unit_scale_contract: bool,
-    source_format: str,
-    w13_layout: str,
-    prepared_w4a16: Any,
-    swiglu_limit: float | None,
 ) -> None:
-    """Call b12x MoE with caller-owned live scratch."""
+    """Call b12x MoE with preplanned, expert-owned scratch."""
     from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
-        TPMoEScratchCaps,
         b12x_moe_fp4,
-        plan_tp_moe_scratch,
     )
 
-    weight_E = int(prepared_w4a16.num_experts)
-    n = int(prepared_w4a16.intermediate_size)
-    tokens = int(a.shape[0])
-    plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            max_tokens=tokens,
-            weight_E=weight_E,
-            k=int(a.shape[1]),
-            n=n,
-            num_topk=int(topk_ids.shape[1]),
-            device=a.device,
-            dtype=a.dtype,
-            core_token_counts=(tokens,),
-            route_num_experts=0,
-            quant_mode=quant_mode,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            source_format=source_format,
-            w13_layout=w13_layout,
-            frozen=True,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=a.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-    binding = plan.bind(
+    binding = scratch_plan.bind(
         scratch=scratch,
         a=a,
-        a1_gscale=a1_gscale,
-        w1_fp4=w1_fp4,
-        w1_blockscale=w1_blockscale,
-        w1_alphas=w1_alphas,
-        a2_gscale=a2_gscale,
-        w2_fp4=w2_fp4,
-        w2_blockscale=w2_blockscale,
-        w2_alphas=w2_alphas,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        apply_router_weight_on_input=apply_router_weight_on_input,
         output=output,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
-        activation=activation,
-        quant_mode=quant_mode,
         unit_scale_contract=unit_scale_contract,
-        source_format=source_format,
-        w13_layout=w13_layout,
-        prepared_w4a16=prepared_w4a16,
-        swiglu_limit=swiglu_limit,
     )
     b12x_moe_fp4(binding=binding)
 
 
 def _b12x_activation_name(activation: MoEActivation) -> str:
-    if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
+    if activation == MoEActivation.SILU:
         return "silu"
     if activation == MoEActivation.RELU2:
         return "relu2"
     return activation.value
+
+
+def _plan_b12x_fp4_moe_weights(**kwargs):
+    from b12x.integration import (  # type: ignore[import-not-found]
+        plan_b12x_fp4_moe_weights,
+    )
+
+    return plan_b12x_fp4_moe_weights(**kwargs)
 
 
 def _prepare_b12x_fp4_moe_weights(**kwargs):
@@ -208,17 +160,36 @@ def _normalize_b12x_moe_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor
     return topk_weights
 
 
-@functools.cache
 def has_b12x_moe() -> bool:
-    """Return whether the optional b12x MXFP4 MoE integration is available."""
+    """Return whether b12x 0.30.2 exposes the API used by this backend."""
     try:
+        if importlib.metadata.version("b12x") != "0.30.2":
+            return False
         integration = importlib.import_module("b12x.integration")
         tp_moe = importlib.import_module("b12x.integration.tp_moe")
-    except (ImportError, AttributeError):
+        expected = {
+            integration.plan_b12x_fp4_moe_weights: {
+                "quant_modes",
+                "num_experts",
+                "hidden_size",
+                "intermediate_size",
+            },
+            integration.prepare_b12x_fp4_moe_weights: {"plan"},
+            integration.B12XFP4ExpertWeights: {
+                "plan",
+                "w1_fp4",
+                "w1_blockscale",
+                "w2_fp4",
+                "w2_blockscale",
+            },
+            tp_moe.TPMoEScratchCaps: {"weight_plan", "max_tokens"},
+            tp_moe.TPMoEScratchPlan.bind: {"experts", "scratch"},
+        }
+    except (ImportError, AttributeError, importlib.metadata.PackageNotFoundError):
         return False
-    return hasattr(integration, "prepare_b12x_fp4_moe_weights") and all(
-        hasattr(tp_moe, name)
-        for name in ("TPMoEScratchCaps", "b12x_moe_fp4", "plan_tp_moe_scratch")
+    return hasattr(integration, "B12XFP4ExpertWeights") and all(
+        required <= set(inspect.signature(obj).parameters)
+        for obj, required in expected.items()
     )
 
 
@@ -237,7 +208,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             f"{quant_config.weight_quant_dtype}"
         )
 
-        self._prepared_fp4_moe_by_dtype: dict[torch.dtype, Any] = {}
+        self._experts: Any | None = None
+        self._weight_plan: Any | None = None
+        self._scratch_plan: Any | None = None
+        self._scratch: tuple[torch.Tensor, ...] = ()
         self._released_w4a16_source_scales = False
         self._unit_scale_by_device: dict[torch.device, torch.Tensor] = {}
 
@@ -276,6 +250,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=activation,
             params_dtype=params_dtype,
         )
+        self._assert_owner_aliases_source(w13_weight, w2_weight)
         self._release_w4a16_source_scales(layer)
         self._release_w4a16_source_weights(layer)
         _maybe_release_cuda_cache(device)
@@ -302,7 +277,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        return activation == MoEActivation.SILU
 
     @staticmethod
     def _supports_parallel_config(
@@ -345,18 +320,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         params_dtype: torch.dtype,
     ):
-        prepared = self._prepared_fp4_moe_by_dtype.get(params_dtype)
-        if prepared is not None and getattr(prepared, "w4a16", None) is not None:
-            return prepared
+        if self._experts is not None:
+            return self._experts
 
         if self._released_w4a16_source_scales:
-            prepared_dtypes = ", ".join(
-                str(dtype) for dtype in self._prepared_fp4_moe_by_dtype
-            )
             raise RuntimeError(
                 "B12X W4A16 source block scales were already released; "
-                f"cannot prepare FP4 MoE weights for dtype {params_dtype}. "
-                f"Prepared dtypes: {prepared_dtypes or 'none'}."
+                f"cannot prepare FP4 MoE weights for dtype {params_dtype}."
             )
 
         if w1.device.type == "cuda" and _is_current_stream_capturing():
@@ -369,9 +339,18 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         unit_scale = self._unit_expert_scale(w1.device, int(w1.shape[0]))
-        prepared = _prepare_b12x_fp4_moe_weights(
+        self._weight_plan = _plan_b12x_fp4_moe_weights(
+            quant_modes="w4a16",
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),
+            activation=_b12x_activation_name(activation),
+            params_dtype=params_dtype,
+            num_experts=int(w1.shape[0]),
+            hidden_size=int(self.moe_config.hidden_dim),
+            intermediate_size=int(self.moe_config.intermediate_size_per_partition),
+        )
+        self._experts = _prepare_b12x_fp4_moe_weights(
+            plan=self._weight_plan,
             w1_fp4=w1,
             w1_blockscale=self.w1_scale,
             w1_global_scale=unit_scale,
@@ -380,21 +359,67 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_blockscale=self.w2_scale,
             w2_global_scale=unit_scale,
             a2_gscale=unit_scale,
-            activation=_b12x_activation_name(activation),
             params_dtype=params_dtype,
-            prepare_runtime_alphas=False,
-            prepare_w4a16=True,
-            reuse_input_storage=True,
         )
-        self._prepared_fp4_moe_by_dtype[params_dtype] = prepared
-        return prepared
+        self._allocate_scratch(w1.device)
+        return self._experts
 
     def _lookup_prepared_w4a16(self) -> Any | None:
-        for prepared in self._prepared_fp4_moe_by_dtype.values():
-            w4a16 = getattr(prepared, "w4a16", None)
-            if w4a16 is not None:
-                return w4a16
-        return None
+        return self._experts
+
+    def _allocate_scratch(self, device: torch.device) -> None:
+        from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
+            TPMoEScratchCaps,
+            plan_tp_moe_scratch,
+        )
+
+        max_tokens = max(
+            1,
+            int(self.moe_config.max_num_tokens) * int(self.moe_config.dp_size),
+            int(self.moe_config.max_capture_size),
+        )
+        scratch_plan = plan_tp_moe_scratch(
+            TPMoEScratchCaps(
+                max_tokens=max_tokens,
+                num_topk=int(self.moe_config.experts_per_token),
+                device=device,
+                weight_plan=self._weight_plan,
+                quant_mode="w4a16",
+                core_token_counts=(max_tokens,),
+                route_num_experts=0,
+                apply_router_weight_on_input=False,
+                swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
+                frozen=True,
+            )
+        )
+        self._scratch_plan = scratch_plan
+        self._scratch = tuple(
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype in scratch_plan.shapes_and_dtypes()
+        )
+
+    def _assert_owner_aliases_source(
+        self, w1: torch.Tensor, w2: torch.Tensor
+    ) -> None:
+        assert self._experts is not None
+        assert self.w1_scale is not None and self.w2_scale is not None
+        w1_scale = self.w1_scale
+        w2_scale = self.w2_scale
+        aliases = (
+            self._experts.w1_fp4.untyped_storage().data_ptr()
+            == w1.untyped_storage().data_ptr()
+            and self._experts.w2_fp4.untyped_storage().data_ptr()
+            == w2.untyped_storage().data_ptr()
+            and self._experts.w1_blockscale.untyped_storage().data_ptr()
+            == w1_scale.untyped_storage().data_ptr()
+            and self._experts.w2_blockscale.untyped_storage().data_ptr()
+            == w2_scale.untyped_storage().data_ptr()
+        )
+        if not aliases:
+            raise RuntimeError(
+                "B12X prepared owner does not alias canonical source storage; "
+                "refusing to release source parameters"
+            )
 
     def _release_w4a16_source_scales(self, layer: torch.nn.Module) -> None:
         if self._released_w4a16_source_scales:
@@ -423,8 +448,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if w1.numel() != 0 and w2.numel() != 0:
             return super().moe_problem_size(a1, w1, w2, topk_ids)
 
-        prepared_w4a16 = self._lookup_prepared_w4a16()
-        if prepared_w4a16 is None:
+        experts = self._lookup_prepared_w4a16()
+        if experts is None:
             return super().moe_problem_size(a1, w1, w2, topk_ids)
 
         if a1.dim() == 2:
@@ -434,10 +459,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             assert a1.dim() == 3
             m = a1.size(1)
 
-        intermediate_size = int(prepared_w4a16.intermediate_size)
+        intermediate_size = int(experts.plan.intermediate_size)
         n = intermediate_size * 2
         return (
-            int(prepared_w4a16.num_experts),
+            int(experts.plan.num_experts),
             m,
             n,
             a1.size(-1),
@@ -455,7 +480,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return (0,), (0,), (M, K)
+        # Scratch has heterogeneous dtypes and is persistently expert-owned.
+        return (1,), (0,), (M, K)
 
     def apply(
         self,
@@ -475,55 +501,33 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ) -> None:
-        prepared = self._get_or_prepare_fp4_moe_weights(
-            w1=w1,
-            w2=w2,
-            activation=activation,
-            params_dtype=hidden_states.dtype,
-        )
-        prepared_w4a16 = prepared.w4a16
-        assert prepared_w4a16 is not None
-        assert self.w1_scale is not None and self.w2_scale is not None, (
-            "w1_scale and w2_scale must not be None for B12xExperts"
-        )
+        if self._experts is None or self._scratch_plan is None or not self._scratch:
+            raise RuntimeError(
+                "B12X MoE weights and scratch were not prepared before execution"
+            )
 
         if expert_map is not None:
             raise RuntimeError(
                 "B12X MoE does not support expert_map with the current b12x_moe_fp4 API"
             )
+        if apply_router_weight_on_input:
+            raise RuntimeError(
+                "B12X MoE scratch was planned without input router weighting"
+            )
 
-        num_experts = int(prepared_w4a16.num_experts)
-        unit_scale = self._unit_expert_scale(hidden_states.device, num_experts)
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
 
         _run_b12x_moe_fp4(
             a=hidden_states,
-            a1_gscale=unit_scale,
-            w1_fp4=w1,
-            w1_blockscale=self.w1_scale,
-            w1_alphas=unit_scale,
-            a2_gscale=unit_scale,
-            w2_fp4=w2,
-            w2_blockscale=self.w2_scale,
-            w2_alphas=unit_scale,
+            experts=self._experts,
+            scratch_plan=self._scratch_plan,
+            scratch=self._scratch,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            apply_router_weight_on_input=(
-                apply_router_weight_on_input
-                if apply_router_weight_on_input is not None
-                else False
-            ),
             output=output,
-            input_scales_are_reciprocal=True,
             input_scales_static=True,
-            activation=_b12x_activation_name(activation),
-            quant_mode="w4a16",
             unit_scale_contract=True,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
-            swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

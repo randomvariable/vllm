@@ -220,7 +220,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /runtime-requirements/cuda.txt \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       --index-strategy unsafe-best-match && \
-    uv pip install --system b12x && \
+    uv pip install --system b12x==0.30.2 && \
     uv pip install --system xxhash && \
     uv pip install --system --no-deps /wheels/*.whl && \
     if ls /wheels-gguf/*.whl >/dev/null 2>&1; then \

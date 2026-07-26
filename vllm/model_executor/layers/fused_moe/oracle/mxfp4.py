@@ -626,11 +626,6 @@ def select_deepseek_v4_mxfp4_moe_backend(
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.TRITON_UNFUSED,
         ]
-    elif current_platform.is_device_capability_family(120):
-        priority_backends = [
-            Mxfp4MoeBackend.B12X_MXFP4,
-            *_get_priority_backends(),
-        ]
     else:
         priority_backends = _get_priority_backends()
 

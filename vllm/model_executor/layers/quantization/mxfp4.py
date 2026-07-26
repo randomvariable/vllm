@@ -821,6 +821,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        if self.moe_kernel is not None:
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(
         self,
