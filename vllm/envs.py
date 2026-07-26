@@ -304,6 +304,21 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    # --- ATOM-ported APU/NUMA knobs (default off = current behavior) ---
+    # Pin each GPU worker to its GPU-local NUMA node's CPU cores + preferred
+    # memory. Adapted from ROCm/ATOM atom/utils/envs.py ATOM_NUMA_BIND.
+    VLLM_NUMA_BIND: bool = False
+    # Explicit per-rank NUMA node ids (comma-separated), overriding
+    # auto-detection. Adapted from ROCm/ATOM atom/utils/envs.py ATOM_NUMA_NODE.
+    VLLM_NUMA_NODE: str = ""
+    # Kill-switch for mmap-based weight loading. When true, weights are read
+    # fully into RAM (no mmap). Adapted from ROCm/ATOM atom/utils/envs.py
+    # ATOM_DISABLE_MMAP.
+    VLLM_DISABLE_MMAP: bool = False
+    # Worker threads for parallel per-fused-param CPU weight staging + single
+    # H2D copy. >1 enables multithreaded load; 1 = sequential (current default).
+    # Adapted from ROCm/ATOM atom/utils/envs.py ATOM_LOADER_NUM_THREADS.
+    VLLM_LOADER_NUM_THREADS: int = 1
 
 
 def get_default_cache_root():
@@ -2085,6 +2100,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # --- ATOM-ported APU/NUMA knobs (default off = current behavior) ---
+    # Pin each GPU worker to its GPU-local NUMA node's CPU cores + preferred
+    # memory. Adapted from ROCm/ATOM atom/utils/envs.py ATOM_NUMA_BIND.
+    "VLLM_NUMA_BIND":
+    lambda: os.getenv("VLLM_NUMA_BIND", "0") == "1",
+    # Explicit per-rank NUMA node ids (comma-separated), overriding
+    # auto-detection. Adapted from ROCm/ATOM atom/utils/envs.py ATOM_NUMA_NODE.
+    "VLLM_NUMA_NODE":
+    lambda: os.getenv("VLLM_NUMA_NODE", ""),
+    # Kill-switch for mmap-based weight loading. When true, weights are read
+    # fully into RAM (no mmap). Adapted from ROCm/ATOM atom/utils/envs.py
+    # ATOM_DISABLE_MMAP.
+    "VLLM_DISABLE_MMAP":
+    lambda: os.getenv("VLLM_DISABLE_MMAP", "0") == "1",
+    # Worker threads for parallel per-fused-param CPU weight staging + single
+    # H2D copy. >1 enables multithreaded load; 1 = sequential (current default).
+    # Adapted from ROCm/ATOM atom/utils/envs.py ATOM_LOADER_NUM_THREADS.
+    "VLLM_LOADER_NUM_THREADS":
+    lambda: int(os.getenv("VLLM_LOADER_NUM_THREADS", "1")),
 }
 
 

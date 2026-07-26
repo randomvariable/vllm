@@ -113,6 +113,29 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_weights_track", None
         )
 
+        # --- ATOM-ported APU/NUMA knobs (default off = current behavior) ---
+        # VLLM_DISABLE_MMAP: force non-mmap weight loading ("eager" strategy
+        # reads full file into RAM). Adapted from ROCm/ATOM ATOM_DISABLE_MMAP.
+        from vllm.envs import VLLM_DISABLE_MMAP, VLLM_LOADER_NUM_THREADS
+
+        if VLLM_DISABLE_MMAP:
+            load_config.safetensors_load_strategy = "eager"
+            logger.info(
+                "VLLM_DISABLE_MMAP=1: forcing safetensors_load_strategy=\"eager\""
+                " (no mmap).")
+
+        # VLLM_LOADER_NUM_THREADS: >1 enables parallel per-fused-param CPU
+        # staging + single H2D copy. Adapted from ROCm/ATOM
+        # ATOM_LOADER_NUM_THREADS.
+        if VLLM_LOADER_NUM_THREADS > 1:
+            extra_config["enable_multithread_load"] = True
+            extra_config["num_threads"] = VLLM_LOADER_NUM_THREADS
+            logger.info(
+                "VLLM_LOADER_NUM_THREADS=%d: enabling multithread weight load.",
+                VLLM_LOADER_NUM_THREADS,
+            )
+        # --- end ATOM-ported knobs ---
+
         # The multi-thread loader ignores safetensors_load_strategy, so reject
         # the combination instead of silently dropping the requested strategy.
         if extra_config.get("enable_multithread_load") and (

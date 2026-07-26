@@ -365,6 +365,15 @@ class Worker(WorkerBase):
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
+
+            # NUMA bind: pin this worker process to its GPU's local NUMA
+            # node's CPU cores + preferred memory BEFORE any GPU allocation.
+            # No-op unless VLLM_NUMA_BIND=1 (default off). Adapted from
+            # ROCm/ATOM atom/utils/numa_utils.py.
+            from vllm.utils.numa_utils import numa_bind_in_process
+            numa_bind_in_process(visible_device_index,
+                                 label=f"rank={self.rank}")
+
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
 
