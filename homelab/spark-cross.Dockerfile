@@ -18,7 +18,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.0 12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
-    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DPython_EXECUTABLE=/opt/venv/bin/python3 -DPython_INCLUDE_DIRS=/usr/include/python3.12 -DPython_FIND_STRATEGY=LOCATION --debug-find-pkg=Python" \
+    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch" \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     NVCC_THREADS=${NVCC_THREADS} \
@@ -89,7 +89,7 @@ RUN printf '%s\n' \
       'set(CMAKE_C_COMPILER /usr/bin/aarch64-linux-gnu-gcc)' \
       'set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)' \
       'set(CMAKE_CUDA_HOST_COMPILER /usr/bin/aarch64-linux-gnu-g++)' \
-      'set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /opt/torch-aarch64 /usr/include/python3.12)' \
+      'set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /opt/torch-aarch64)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)' \
