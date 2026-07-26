@@ -215,3 +215,31 @@ gate checks in the build path (they fail correct builds on technicalities, e.g.
 `grep -q` on CMakeCache.txt key formats, readelf arch checks, zipfile membership
 checks). Verification is a runtime concern: run it against the deployed image on
 real hardware.
+
+### No performance regression in production migrations
+
+When migrating a production serving deployment to a new image/build, the target
+must **match or beat** the current deployment's performance. A migration that
+boots on a slower fallback path (e.g. Triton instead of the tuned kernel
+backend) is not done — it is a correctness baseline only. Establish the
+performance-parity requirement BEFORE planning the migration, identify exactly
+which kernel/backend delivers the current performance, and gate the swap on
+matching it. (2026-07-26: "i won't accept any regression in performance.")
+
+### Ports must be upstream-compatible
+
+Any code ported into this fork from another fork/overlay (e.g. aidendle94 DSV4,
+bjk110, ATOM) must be written in **upstream-compatible style**: follow the
+target area's existing upstream patterns (oracle enums/mappings, capability
+gating, `is_supported_config`/`_supports_current_device` probes, optional-dependency
+probes, envs.py declarations), so the work could be proposed as an upstream PR.
+No hacky fork-only patches, no divergent one-off wiring. (2026-07-26: "make any
+ports upstream compatible.")
+
+### When a deployment is idle, swap and iterate live
+
+If the user says a production deployment is not in use, treat the migration as
+a live test loop: swap to the new image immediately and iterate on the real
+deployment until it works, rather than staging a separate canary. Rollback is
+the manifest revert. (2026-07-26: "completely swap out and test until we get
+working.")
