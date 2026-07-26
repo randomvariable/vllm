@@ -89,7 +89,7 @@ RUN printf '%s\n' \
       'set(CMAKE_C_COMPILER /usr/bin/aarch64-linux-gnu-gcc)' \
       'set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)' \
       'set(CMAKE_CUDA_HOST_COMPILER /usr/bin/aarch64-linux-gnu-g++)' \
-      'set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /opt/torch-aarch64)' \
+      'set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /opt/torch-aarch64 /usr/include/python3.12)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)' \
       'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)' \
