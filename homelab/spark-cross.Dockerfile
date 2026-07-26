@@ -148,6 +148,9 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     cd /src/vllm && \
+    echo "=== DIAG CMAKE_ARGS: $CMAKE_ARGS" && \
+    echo "=== DIAG sbsa lib dir (unversioned .so symlinks?) ===" && \
+    ls -la /usr/local/cuda-13.0/targets/sbsa-linux/lib/ | grep -E 'libcudart|libnvrtc|libcublas|libcuda\.|libcurand|libcufft|libcusolver|libcusparse|libnvjitlink' && \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
