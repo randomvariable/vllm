@@ -165,8 +165,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
        git -C /src/gguf-plugin remote add origin "${GGUF_PLUGIN_REPOSITORY}" && \
        git -C /src/gguf-plugin fetch --depth 1 origin "${GGUF_PLUGIN_REF}" && \
        git -C /src/gguf-plugin checkout -q FETCH_HEAD && \
+       CXX=aarch64-linux-gnu-g++ CC=aarch64-linux-gnu-gcc \
+       LIBRARY_PATH="/opt/torch-aarch64/torch/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+       TORCH_CUDA_ARCH_LIST="12.1a" \
+       _PYTHON_HOST_PLATFORM=linux-aarch64 \
        python3 -m pip wheel --no-build-isolation --no-deps \
-         --wheel-dir /wheels-gguf /src/gguf-plugin; then \
+          --wheel-dir /wheels-gguf /src/gguf-plugin; then \
       echo "GGUF plugin wheel built"; \
     else \
       echo "WARN: GGUF plugin wheel build failed; core image continues"; \
@@ -182,7 +186,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_BREAK_SYSTEM_PACKAGES=1 \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_USE_RUST_FRONTEND=1 \
-    VLLM_USE_FLASHINFER=0 \
+    VLLM_USE_FLASHINFER_SAMPLER=0 \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     CUTE_DSL_ARCH=sm_121a \
