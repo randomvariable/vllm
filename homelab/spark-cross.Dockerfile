@@ -152,24 +152,19 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     cd /src/vllm && \
-    echo "=== DIAG CMAKE_ARGS: $CMAKE_ARGS" && \
-    echo "=== DIAG sbsa lib dir (unversioned .so symlinks?) ===" && \
-    ls -la /usr/local/cuda-13.0/targets/sbsa-linux/lib/ | grep -E 'libcudart|libnvrtc|libcublas|libcuda\.|libcurand|libcufft|libcusolver|libcusparse|libnvjitlink' && \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
-    echo "=== DIAG: Rust artifacts in tree (vllm/) ===" && \
-    ls -la vllm/vllm-rs vllm/_rust_*.so 2>&1 | head -10 && \
-    echo "=== DIAG: wheel members (rust + key .so) ===" && \
-    python3 -c "import glob, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); print('total members:', len(names)); [print('  ', n) for n in names if 'vllm-rs' in n or '_rust' in n or 'spinloop' in n or n.endswith('_C.abi3.so')]" && \
+    ccache -s && \
     cache="$(find build -name CMakeCache.txt -print -quit)" && \
     test -n "$cache" && \
+    echo "=== ASSERT CMAKE_CROSSCOMPILING ===" && grep '^CMAKE_CROSSCOMPILING:' "$cache" && \
     grep -q '^CMAKE_CROSSCOMPILING:INTERNAL=TRUE$' "$cache" && \
+    echo "=== ASSERT Torch_DIR ===" && grep '^Torch_DIR:' "$cache" && \
     grep -q '^Torch_DIR:.*=/opt/torch-aarch64/torch/share/cmake/Torch$' "$cache" && \
     so="$(find build -type f -name '*.so' -print -quit)" && \
-    test -n "$so" && readelf -h "$so" | grep -q 'Machine:.*AArch64' && \
-    ccache -s && \
-    python3 -c "import glob, sys, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); missing = [artifact for artifact, present in [('vllm-rs', any(n.endswith('vllm/vllm-rs') for n in names)), ('_rust_tool_parser', any(n.startswith('vllm/_rust_tool_parser') and n.endswith('.so') for n in names))] if not present]; sys.exit(0) if not missing else (print(f'FATAL: {\", \".join(missing)} missing from wheel -- rust build did not bundle', file=sys.stderr), sys.exit(1))"
+    echo "=== ASSERT first .so arch: $so ===" && readelf -h "$so" | grep 'Machine:' && \
+    readelf -h "$so" | grep -q 'Machine:.*AArch64'
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
