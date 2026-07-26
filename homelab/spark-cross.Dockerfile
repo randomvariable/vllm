@@ -16,6 +16,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.cargo/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda-13.0 \
     CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.0 \
+    DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++ \
+    DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12 \
+    DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so \
+    DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch \
+    DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/lib \
+    DEEPGEMM_TORCH_CXX11_ABI=1 \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.0 12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
@@ -200,6 +206,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gcc g++ python3-dev \
+      cuda-nvcc-13-0 cuda-cudart-dev-13-0 \
       libibverbs1 librdmacm1 libnuma1 libgomp1 \
       libucx0 python3 python3-pip && \
     useradd --create-home --uid 10001 --shell /usr/sbin/nologin vllm
