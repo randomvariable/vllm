@@ -73,7 +73,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       -r /tmp/build-requirements/rust.txt \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       --index-strategy unsafe-best-match && \
-    rm -rf /tmp/build-requirements
+    rm -rf /tmp/build-requirements && \
+    echo "=== DIAG: torch lib dir ===" && \
+    ls /opt/venv/lib/python3.12/site-packages/torch/lib/ && \
+    echo "=== DIAG: installed torch metadata version ===" && \
+    /opt/venv/bin/python -c "import importlib.metadata as m; print('torch', m.version('torch'))" && \
+    echo "=== DIAG: import torch ===" && \
+    /opt/venv/bin/python -c "import torch; print('IMPORT OK', torch.__version__, 'cuda', torch.version.cuda)"
 
 RUN curl --fail --silent --show-error --location \
       -o /tmp/torch-aarch64.whl \
