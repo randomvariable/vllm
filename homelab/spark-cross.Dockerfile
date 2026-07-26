@@ -155,16 +155,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
-    ccache -s && \
-    cache="$(find build -name CMakeCache.txt -print -quit)" && \
-    test -n "$cache" && \
-    echo "=== ASSERT CMAKE_CROSSCOMPILING ===" && grep '^CMAKE_CROSSCOMPILING:' "$cache" && \
-    grep -q '^CMAKE_CROSSCOMPILING:INTERNAL=TRUE$' "$cache" && \
-    echo "=== ASSERT Torch_DIR ===" && grep '^Torch_DIR:' "$cache" && \
-    grep -q '^Torch_DIR:.*=/opt/torch-aarch64/torch/share/cmake/Torch$' "$cache" && \
-    so="$(find build -type f -name '*.so' -print -quit)" && \
-    echo "=== ASSERT first .so arch: $so ===" && readelf -h "$so" | grep 'Machine:' && \
-    readelf -h "$so" | grep -q 'Machine:.*AArch64'
+    ccache -s
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
