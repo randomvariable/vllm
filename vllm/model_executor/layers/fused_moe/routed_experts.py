@@ -198,7 +198,24 @@ class RoutedExperts(PluggableLayer):
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix)
         if quant_method is None:
-            quant_method = UnquantizedFusedMoEMethod(moe_config)
+            # Check for online INT8 MoE opt-in (ROCm/gfx1151 only).
+            # When enabled, quantize BF16 checkpoint weights to int8 on-the-fly
+            # at load time with per-channel weight scales and per-token
+            # activation quantization. Gated by env var, default OFF.
+            from vllm.model_executor.layers.quantization.online_int8_moe import (
+                _is_online_int8_moe_enabled,
+                _is_rocm_gfx1151,
+                OnlineInt8MoEMethod,
+            )
+
+            if _is_online_int8_moe_enabled() and _is_rocm_gfx1151():
+                logger.info_once(
+                    "Using OnlineInt8MoEMethod: online INT8 W8A8 MoE on ROCm "
+                    "(VLLM_ROCM_USE_AITER_ONLINE_INT8_MOE=1)"
+                )
+                quant_method = OnlineInt8MoEMethod(moe_config)
+            else:
+                quant_method = UnquantizedFusedMoEMethod(moe_config)
         assert isinstance(quant_method, FusedMoEMethodBase)
         return quant_method
 

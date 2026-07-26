@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_ROCM_USE_AITER_ONLINE_INT8_MOE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1302,6 +1303,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Whether to use aiter's online INT8 W8A8 MoE kernel (Triton-based,
+    # portable across archs, validated on gfx1151 RDNA3.5).
+    # This quantizes BF16 checkpoint weights to int8 on-the-fly at load time
+    # and uses per-token activation quantization.
+    # Requires aiter with fused_moe_int8_smoothquant (aiter PR #3917).
+    # By default is disabled (opt-in).
+    "VLLM_ROCM_USE_AITER_ONLINE_INT8_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_ONLINE_INT8_MOE", "False").lower()
+        in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
