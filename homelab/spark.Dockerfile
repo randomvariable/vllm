@@ -3,6 +3,13 @@
 ARG CUDA_TAG=13.0.2
 ARG UBUNTU_TAG=ubuntu24.04
 
+# Build parallelism. Defaults suit the DGX Spark (20 CPU / 128 GB); the CI
+# harness overrides these low (e.g. MAX_JOBS=2) when building on the 4 CPU /
+# 16 GB Raspberry Pi build nodes so the CUDA compile fits in memory.
+ARG MAX_JOBS=6
+ARG CMAKE_BUILD_PARALLEL_LEVEL=6
+ARG NVCC_THREADS=3
+
 # GGUF quantization plugin (out-of-tree; CUDA supported). Its extension is
 # compiled in the builder and the resulting wheel is installed into the runtime.
 ARG GGUF_PLUGIN_REPOSITORY=https://github.com/vllm-project/vllm-gguf-plugin.git
@@ -13,10 +20,13 @@ ARG GGUF_PLUGIN_REF=1df60c43f1f1274681bb957e5bb9b8f5c44d2f4d
 FROM nvidia/cuda:${CUDA_TAG}-devel-${UBUNTU_TAG} AS builder
 ARG GGUF_PLUGIN_REPOSITORY
 ARG GGUF_PLUGIN_REF
+ARG MAX_JOBS
+ARG CMAKE_BUILD_PARALLEL_LEVEL
+ARG NVCC_THREADS
 ENV DEBIAN_FRONTEND=noninteractive \
-    MAX_JOBS=6 \
-    CMAKE_BUILD_PARALLEL_LEVEL=6 \
-    NVCC_THREADS=3 \
+    MAX_JOBS=${MAX_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
+    NVCC_THREADS=${NVCC_THREADS} \
     TORCH_CUDA_ARCH_LIST=12.1a \
     VLLM_TARGET_DEVICE=cuda \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
