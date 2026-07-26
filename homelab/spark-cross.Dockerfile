@@ -54,6 +54,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /tmp/cuda-keyring.deb && \
     ln -sfn /usr/local/cuda-13.0/targets/sbsa-linux \
       /usr/local/cuda-13.0/targets/aarch64-linux && \
+    for stub in /usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs/*.so; do \
+      ln -sfn "stubs/$(basename "$stub")" \
+        "/usr/local/cuda-13.0/targets/sbsa-linux/lib/$(basename "$stub")"; \
+    done && \
     printf '__global__ void k(){}' > /tmp/t.cu && \
     nvcc -target-dir sbsa-linux \
       -ccbin /usr/bin/aarch64-linux-gnu-g++ -arch=sm_121a \
