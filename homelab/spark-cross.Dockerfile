@@ -116,7 +116,7 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
     cd /src/vllm && \
     ./build_rust.sh && \
     test -x vllm/vllm-rs && \
-    file vllm/vllm-rs | grep -q AArch64 && \
+    readelf -h vllm/vllm-rs | grep -q 'Machine:.*AArch64' && \
     rust_so="$(find vllm -maxdepth 1 -name '_rust_tool_parser*.so' -print -quit)" && \
     test -n "$rust_so" && readelf -h "$rust_so" | grep -q 'Machine:.*AArch64'
 
