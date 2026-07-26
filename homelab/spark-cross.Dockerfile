@@ -22,7 +22,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     NVCC_THREADS=${NVCC_THREADS} \
-    _PYTHON_HOST_PLATFORM=linux-aarch64 \
     CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
@@ -74,12 +73,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       --index-strategy unsafe-best-match && \
     rm -rf /tmp/build-requirements && \
-    echo "=== DIAG: torch lib dir ===" && \
-    ls /opt/venv/lib/python3.12/site-packages/torch/lib/ && \
-    echo "=== DIAG: installed torch metadata version ===" && \
-    /opt/venv/bin/python -c "import importlib.metadata as m; print('torch', m.version('torch'))" && \
-    echo "=== DIAG: import torch ===" && \
-    /opt/venv/bin/python -c "import torch; print('IMPORT OK', torch.__version__, 'cuda', torch.version.cuda)"
+    /opt/venv/bin/python -c "import torch; print('builder torch OK', torch.__version__, 'cuda', torch.version.cuda)"
 
 RUN curl --fail --silent --show-error --location \
       -o /tmp/torch-aarch64.whl \
@@ -131,7 +125,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     cd /src/vllm && \
     ccache -z && \
-    python3 setup.py bdist_wheel --dist-dir /wheels \
+    _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
     cache="$(find build -name CMakeCache.txt -print -quit)" && \
     test -n "$cache" && \
