@@ -108,6 +108,8 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer CUTLASS backends
     FLASHINFER_CUTLASS_MXFP4_MXFP8 = "FLASHINFER_CUTLASS_MXFP4_MXFP8"
     FLASHINFER_CUTLASS_MXFP4_BF16 = "FLASHINFER_CUTLASS_MXFP4_BF16"
+    # B12X CuTe DSL backend for SM12x
+    B12X_MXFP4 = "B12X_MXFP4"
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
@@ -181,6 +183,13 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
+
+    elif backend == Mxfp4MoeBackend.B12X_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.b12x_mxfp4_moe import (
+            B12xExperts,
+        )
+
+        return [B12xExperts]
 
     elif backend == Mxfp4MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
@@ -288,6 +297,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
         ],
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
+        "b12x": [Mxfp4MoeBackend.B12X_MXFP4],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
@@ -615,6 +625,11 @@ def select_deepseek_v4_mxfp4_moe_backend(
         priority_backends = [
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.TRITON_UNFUSED,
+        ]
+    elif current_platform.is_device_capability_family(120):
+        priority_backends = [
+            Mxfp4MoeBackend.B12X_MXFP4,
+            *_get_priority_backends(),
         ]
     else:
         priority_backends = _get_priority_backends()
