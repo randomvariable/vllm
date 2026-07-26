@@ -158,6 +158,10 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
+    echo "=== DIAG: Rust artifacts in tree (vllm/) ===" && \
+    ls -la vllm/vllm-rs vllm/_rust_*.so 2>&1 | head -10 && \
+    echo "=== DIAG: wheel members (rust + key .so) ===" && \
+    python3 -c "import glob, zipfile; whl = glob.glob('/wheels/vllm-*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); print('total members:', len(names)); [print('  ', n) for n in names if 'vllm-rs' in n or '_rust' in n or 'spinloop' in n or n.endswith('_C.abi3.so')]" && \
     cache="$(find build -name CMakeCache.txt -print -quit)" && \
     test -n "$cache" && \
     grep -q '^CMAKE_CROSSCOMPILING:INTERNAL=TRUE$' "$cache" && \
