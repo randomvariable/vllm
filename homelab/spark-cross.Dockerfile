@@ -71,7 +71,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     /root/.local/bin/uv pip install --python /opt/venv/bin/python \
       -r /tmp/build-requirements/cuda.txt \
       -r /tmp/build-requirements/rust.txt \
-      --extra-index-url https://download.pytorch.org/whl/cu130 && \
+      --extra-index-url https://download.pytorch.org/whl/cu130 \
+      --index-strategy unsafe-best-match && \
     rm -rf /tmp/build-requirements
 
 RUN curl --fail --silent --show-error --location \
