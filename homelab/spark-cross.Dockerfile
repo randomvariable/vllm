@@ -15,10 +15,11 @@ ARG GGUF_PLUGIN_REF
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.cargo/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda-13.0 \
+    CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.0 \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.0 12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
-    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT_DIR=/usr/local/cuda-13.0" \
+    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.0" \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     NVCC_THREADS=${NVCC_THREADS} \
@@ -51,6 +52,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
       cuda-cross-sbsa-13-0 && \
     rm -f /tmp/cuda-keyring.deb && \
+    ln -sfn /usr/local/cuda-13.0/targets/sbsa-linux \
+      /usr/local/cuda-13.0/targets/aarch64-linux && \
     printf '__global__ void k(){}' > /tmp/t.cu && \
     nvcc -target-dir sbsa-linux \
       -ccbin /usr/bin/aarch64-linux-gnu-g++ -arch=sm_121a \
