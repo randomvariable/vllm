@@ -39,7 +39,7 @@ def _run_b12x_moe_fp4(
     input_scales_static: bool,
     unit_scale_contract: bool,
 ) -> None:
-    """Call b12x MoE with preplanned, expert-owned scratch."""
+    """Call b12x MoE with preplanned, shared-workspace-owned scratch."""
     from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
         b12x_moe_fp4,
     )
@@ -211,7 +211,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._experts: Any | None = None
         self._weight_plan: Any | None = None
         self._scratch_plan: Any | None = None
-        self._scratch: tuple[torch.Tensor, ...] = ()
         self._released_w4a16_source_scales = False
         self._unit_scale_by_device: dict[torch.device, torch.Tensor] = {}
 
@@ -367,13 +366,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             a2_gscale=unit_scale,
             params_dtype=params_dtype,
         )
-        self._allocate_scratch(w1.device)
+        self._plan_scratch(w1.device)
         return self._experts
 
     def _lookup_prepared_w4a16(self) -> Any | None:
         return self._experts
 
-    def _allocate_scratch(self, device: torch.device) -> None:
+    def _plan_scratch(self, device: torch.device) -> None:
         from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
             TPMoEScratchCaps,
             plan_tp_moe_scratch,
@@ -384,7 +383,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             int(self.moe_config.max_num_tokens) * int(self.moe_config.dp_size),
             int(self.moe_config.max_capture_size),
         )
-        scratch_plan = plan_tp_moe_scratch(
+        self._scratch_plan = plan_tp_moe_scratch(
             TPMoEScratchCaps(
                 max_tokens=max_tokens,
                 num_topk=int(self.moe_config.experts_per_token),
@@ -397,11 +396,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
                 frozen=True,
             )
-        )
-        self._scratch_plan = scratch_plan
-        self._scratch = tuple(
-            torch.empty(shape, dtype=dtype, device=device)
-            for shape, dtype in scratch_plan.shapes_and_dtypes()
         )
 
     def _assert_owner_aliases_source(
@@ -486,8 +480,18 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # Scratch has heterogeneous dtypes and is persistently expert-owned.
-        return (1,), (0,), (M, K)
+        if self._scratch_plan is None:
+            raise RuntimeError(
+                "B12X scratch plan was not prepared before workspace sizing"
+            )
+        specs = self._scratch_plan.scratch_specs()
+        if len(specs) != 1 or specs[0].dtype != torch.uint8:
+            raise RuntimeError("B12X scratch plan must expose one uint8 arena")
+        scratch_bytes = int(specs[0].shape[0])
+        workspace_elements = (scratch_bytes + torch.bfloat16.itemsize - 1) // (
+            torch.bfloat16.itemsize
+        )
+        return (0,), (workspace_elements,), (M, K)
 
     def apply(
         self,
@@ -507,9 +511,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ) -> None:
-        if self._experts is None or self._scratch_plan is None or not self._scratch:
+        if self._experts is None or self._scratch_plan is None:
             raise RuntimeError(
-                "B12X MoE weights and scratch were not prepared before execution"
+                "B12X MoE weights and scratch plan were not prepared before execution"
             )
 
         if expert_map is not None:
@@ -520,15 +524,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise RuntimeError(
                 "B12X MoE scratch was planned without input router weighting"
             )
+        if workspace2 is None:
+            raise RuntimeError("B12X MoE requires its planned modular workspace")
 
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
-
+        scratch = workspace2.view(torch.uint8)
+        required_bytes = int(self._scratch_plan.scratch_specs()[0].shape[0])
+        scratch = scratch[:required_bytes]
         _run_b12x_moe_fp4(
             a=hidden_states,
             experts=self._experts,
             scratch_plan=self._scratch_plan,
-            scratch=self._scratch,
+            scratch=(scratch,),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=output,

@@ -15,6 +15,9 @@ import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as oracle
 import vllm.model_executor.layers.quantization.mxfp4 as mxfp4_quant
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEKernelModularImpl,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
@@ -58,7 +61,7 @@ def test_probe_requires_exact_0302_plan_owner_bind_contract(monkeypatch):
     )
 
     assert b12x.has_b12x_moe()
-    tp_moe.__dict__["TPMoEScratchPlan"].bind.__signature__ = _signature(
+    cast(Any, tp_moe.__dict__["TPMoEScratchPlan"]).bind.__signature__ = _signature(
         "self", "scratch"
     )
     assert not b12x.has_b12x_moe()
@@ -172,11 +175,11 @@ def test_b12x_does_not_support_weight_reload():
     assert not method.supports_weight_reload()
 
 
-def test_preparation_retains_owner_and_plans_persistent_scratch(monkeypatch):
+def test_preparation_retains_owner_and_plans_scratch_without_allocating(monkeypatch):
     weight_plan = SimpleNamespace()
     owner = SimpleNamespace()
     scratch_plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((3,), torch.float32), ((2,), torch.int32))
+        scratch_specs=lambda: (SimpleNamespace(shape=(5,), dtype=torch.uint8),)
     )
     plan_weights = Mock(return_value=weight_plan)
     prepare_weights = Mock(return_value=owner)
@@ -207,11 +210,12 @@ def test_preparation_retains_owner_and_plans_persistent_scratch(monkeypatch):
     experts._experts = None
     experts._weight_plan = None
     experts._scratch_plan = None
-    experts._scratch = ()
     experts._released_w4a16_source_scales = False
     experts._unit_scale_by_device = {}
     w1 = torch.ones(2, 8, 2)
     w2 = torch.ones(2, 4, 4)
+    allocate = Mock(side_effect=AssertionError("scratch allocated during preparation"))
+    monkeypatch.setattr(b12x.torch, "empty", allocate)
 
     result = experts._get_or_prepare_fp4_moe_weights(
         w1=w1,
@@ -226,7 +230,9 @@ def test_preparation_retains_owner_and_plans_persistent_scratch(monkeypatch):
     assert prepare_weights.call_args.kwargs["plan"] is weight_plan
     assert caps.call_args.kwargs["weight_plan"] is weight_plan
     assert caps.call_args.kwargs["max_tokens"] == 32
-    assert tuple(t.shape for t in experts._scratch) == ((3,), (2,))
+    assert experts._scratch_plan is scratch_plan
+    assert not hasattr(experts, "_scratch")
+    allocate.assert_not_called()
 
 
 def test_b12x_rejects_repeated_weight_preparation():
@@ -237,28 +243,36 @@ def test_b12x_rejects_repeated_weight_preparation():
         experts.process_weights_after_loading(torch.nn.Module())
 
 
-def test_apply_binds_owner_without_planning_or_allocation(monkeypatch):
+def test_apply_binds_owner_to_modular_workspace_without_allocating(monkeypatch):
     binding = object()
-    scratch_plan = SimpleNamespace(bind=Mock(return_value=binding))
+    scratch_plan = SimpleNamespace(
+        bind=Mock(return_value=binding),
+        scratch_specs=lambda: (SimpleNamespace(shape=(5,), dtype=torch.uint8),),
+    )
     run = Mock()
+    plan_scratch = Mock(side_effect=AssertionError("scratch planned during apply"))
     tp_moe = ModuleType("b12x.integration.tp_moe")
     tp_moe.__dict__["b12x_moe_fp4"] = run
+    tp_moe.__dict__["plan_tp_moe_scratch"] = plan_scratch
     monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", tp_moe)
 
     experts = cast(Any, object.__new__(b12x.B12xExperts))
     experts._experts = owner = object()
     experts._scratch_plan = scratch_plan
-    experts._scratch = (torch.empty(1),)
     hidden = torch.empty(2, 4)
     output = torch.empty_like(hidden)
     topk_weights = torch.empty(2, 2, dtype=torch.float32)
     topk_ids = torch.empty(2, 2, dtype=torch.int32)
+    empty_weight = torch.empty(0)
+    workspace2 = torch.empty(5, dtype=torch.uint8)
+    allocate = Mock(side_effect=AssertionError("scratch allocated during apply"))
+    monkeypatch.setattr(b12x.torch, "empty", allocate)
 
     experts.apply(
         output,
         hidden,
-        torch.empty(0),
-        torch.empty(0),
+        empty_weight,
+        empty_weight,
         topk_weights,
         topk_ids,
         MoEActivation.SILU,
@@ -267,11 +281,127 @@ def test_apply_binds_owner_without_planning_or_allocation(monkeypatch):
         None,
         None,
         None,
-        None,
+        workspace2,
         None,
         False,
     )
 
     assert scratch_plan.bind.call_args.kwargs["experts"] is owner
-    assert scratch_plan.bind.call_args.kwargs["scratch"] is experts._scratch
+    scratch = scratch_plan.bind.call_args.kwargs["scratch"][0]
+    assert scratch.dtype == torch.uint8
+    assert scratch.numel() == 5
+    assert (
+        scratch.untyped_storage().data_ptr()
+        == workspace2.untyped_storage().data_ptr()
+    )
+    allocate.assert_not_called()
+    plan_scratch.assert_not_called()
     run.assert_called_once_with(binding=binding)
+
+
+def test_workspace_shapes_expose_planned_scratch_arena():
+    experts = cast(Any, object.__new__(b12x.B12xExperts))
+    experts._scratch_plan = SimpleNamespace(
+        scratch_specs=lambda: (SimpleNamespace(shape=(513,), dtype=torch.uint8),)
+    )
+
+    assert experts.workspace_shapes(2, 8, 4, 2, 2, 2, None, MoEActivation.SILU) == (
+        (0,),
+        (257,),
+        (2, 4),
+    )
+
+
+def test_modular_workspace_keeps_output_and_odd_scratch_disjoint(monkeypatch):
+    import vllm.v1.worker.workspace as workspace
+
+    manager = workspace.WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(workspace, "_manager", manager)
+
+    experts = cast(Any, object.__new__(b12x.B12xExperts))
+    experts._scratch_plan = SimpleNamespace(
+        scratch_specs=lambda: (SimpleNamespace(shape=(513,), dtype=torch.uint8),)
+    )
+    experts.workspace_dtype = lambda _: torch.bfloat16
+    experts.workspace_shapes = b12x.B12xExperts.workspace_shapes.__get__(experts)
+    kernel = cast(Any, object.__new__(FusedMoEKernelModularImpl))
+    kernel.fused_experts = experts
+
+    _, scratch_workspace, output = kernel._allocate_buffers(
+        torch.bfloat16,
+        torch.device("cpu"),
+        2,
+        2,
+        8,
+        4,
+        2,
+        2,
+        2,
+        None,
+        MoEActivation.SILU,
+    )
+    scratch = scratch_workspace.view(torch.uint8)[:513]
+    output_start = output.data_ptr()
+    output_end = output_start + output.numel() * output.element_size()
+    scratch_start = scratch.data_ptr()
+    scratch_end = scratch_start + scratch.numel()
+
+    assert output_end <= scratch_start or scratch_end <= output_start
+    assert scratch.numel() == 513
+
+    _, scratch_again, output_again = kernel._allocate_buffers(
+        torch.bfloat16,
+        torch.device("cpu"),
+        2,
+        2,
+        8,
+        4,
+        2,
+        2,
+        2,
+        None,
+        MoEActivation.SILU,
+    )
+    assert scratch_again.data_ptr() == scratch_workspace.data_ptr()
+    assert output_again.data_ptr() == output.data_ptr()
+
+
+def test_distinct_experts_bind_same_modular_workspace(monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(b12x, "_run_b12x_moe_fp4", run)
+
+    hidden = torch.empty(2, 4)
+    output = torch.empty_like(hidden)
+    topk_weights = torch.empty(2, 2, dtype=torch.float32)
+    topk_ids = torch.empty(2, 2, dtype=torch.int32)
+    workspace2 = torch.empty(5, dtype=torch.uint8)
+    for _ in range(2):
+        experts = cast(Any, object.__new__(b12x.B12xExperts))
+        experts._experts = object()
+        experts._scratch_plan = SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(shape=(5,), dtype=torch.uint8),)
+        )
+
+        experts.apply(
+            output,
+            hidden,
+            torch.empty(0),
+            torch.empty(0),
+            topk_weights,
+            topk_ids,
+            MoEActivation.SILU,
+            2,
+            None,
+            None,
+            None,
+            None,
+            workspace2,
+            None,
+            False,
+        )
+
+    assert all(
+        call.kwargs["scratch"][0].untyped_storage().data_ptr()
+        == workspace2.untyped_storage().data_ptr()
+        for call in run.call_args_list
+    )
