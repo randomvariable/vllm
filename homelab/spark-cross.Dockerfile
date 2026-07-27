@@ -148,6 +148,8 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/src/vllm/target,sharing=locked \
     cd /src/vllm && \
+    rustup toolchain install 1.95 && \
+    rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu && \
     ./build_rust.sh && \
     test -x vllm/vllm-rs && \
     readelf -h vllm/vllm-rs | grep -q 'Machine:.*AArch64' && \
