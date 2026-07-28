@@ -178,6 +178,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     CC=/usr/bin/aarch64-linux-gnu-gcc \
     CXX=/usr/bin/aarch64-linux-gnu-g++ \
     FLASHINFER_NVCC=/usr/local/cuda-13.0/bin/nvcc \
+    FLASHINFER_FMHA_V2_HOST_BUILD=1 \
+    FLASHINFER_FMHA_V2_HOST_CXX=/usr/bin/g++ \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux" \
     LIBRARY_PATH="/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs" \
     FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.0/targets/sbsa-linux/lib -L/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.0/targets/sbsa-linux/lib" \
