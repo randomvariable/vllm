@@ -171,6 +171,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/flashinfer,sharing=locked \
     cd /src/vllm && \
+    uv pip install --python /opt/venv/bin/python 'apache-tvm-ffi>=0.1,<0.2' && \
     CUDA_VERSION=13.0 \
     CC=/usr/bin/aarch64-linux-gnu-gcc \
     CXX=/usr/bin/aarch64-linux-gnu-g++ \
