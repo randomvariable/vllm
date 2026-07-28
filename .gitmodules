@@ -1,0 +1,4 @@
+[submodule "third_party/flashinfer"]
+	path = third_party/flashinfer
+	url = https://github.com/randomvariable/flashinfer.git
+	branch = homelab/v0.6.15.post1-dspark-topk256

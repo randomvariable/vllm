@@ -13,7 +13,7 @@ ARG NVCC_THREADS
 ARG GGUF_PLUGIN_REPOSITORY
 ARG GGUF_PLUGIN_REF
 ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/opt/venv/bin:/root/.cargo/bin:${PATH} \
+    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda-13.0 \
     CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.0 \
     DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++ \
@@ -165,6 +165,26 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
     ccache -s
 
+# Build both FlashInfer packages from the pinned recursive submodule. The local
+# JIT-cache wheel carries the patched AArch64 SM121 native modules.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/flashinfer,sharing=locked \
+    cd /src/vllm && \
+    CUDA_VERSION=13.0 \
+    CC=/usr/bin/aarch64-linux-gnu-gcc \
+    CXX=/usr/bin/aarch64-linux-gnu-g++ \
+    FLASHINFER_NVCC=/usr/local/cuda-13.0/bin/nvcc \
+    NVCC_PREPEND_FLAGS="-target-dir sbsa-linux" \
+    LIBRARY_PATH="/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs" \
+    FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.0/targets/sbsa-linux/lib -L/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.0/targets/sbsa-linux/lib" \
+    FLASHINFER_SOURCE_DIR=/src/vllm/third_party/flashinfer \
+    FLASHINFER_DIST_DIR=/wheels-flashinfer \
+    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
+    FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
+    BUILD_JIT_CACHE=true BUILD_NVEP=0 \
+    ./tools/flashinfer-build.sh
+
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -187,7 +207,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN mkdir -p /runtime-requirements && \
     cp /src/vllm/requirements/cuda.txt /runtime-requirements/cuda.txt && \
-    cp /src/vllm/requirements/common.txt /runtime-requirements/common.txt
+    cp /src/vllm/requirements/common.txt /runtime-requirements/common.txt && \
+    python3 -c 'from pathlib import Path; p=Path("/runtime-requirements/cuda.txt"); p.write_text("".join(line for line in p.read_text().splitlines(keepends=True) if not line.startswith(("flashinfer-python==", "flashinfer-cubin==", "flashinfer-jit-cache=="))))'
 
 FROM --platform=$TARGETPLATFORM nvidia/cuda:13.0.2-runtime-ubuntu24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -216,19 +237,30 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN python3 -m pip install --no-cache-dir --break-system-packages uv
 
 COPY --from=builder /wheels /wheels
+COPY --from=builder /wheels-flashinfer /wheels-flashinfer
 COPY --from=builder /wheels-gguf /wheels-gguf
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 
-# FlashInfer 0.6.15.post1 IS compatible with torch 2.13/cu130 (resolves via the
-# flashinfer.ai cu130 index declared in requirements/cuda.txt; cubin/jit-cache
-# are NOT on PyPI). It is mandatory: the DGX Spark production deployments
-# (deepseek-v4-flash sparse MLA, hy3-nvfp4, laguna) run on FlashInfer sm_12x
-# kernels -- a FlashInfer-less image is pointless for them. Never strip it.
+# Resolve the local Python wheel's dependencies against the same indexes used by
+# requirements/cuda.txt. The JIT-cache wheel has no dependencies of its own.
+# The upstream cubin package is deliberately absent so it cannot shadow these
+# TOPK=256-capable native artifacts.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /runtime-requirements/cuda.txt \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       --index-strategy unsafe-best-match && \
+    uv pip install --system flashinfer-cubin==0.6.15.post1 \
+      --extra-index-url https://flashinfer.ai/whl/ \
+      --extra-index-url https://flashinfer.ai/whl/cu130/ \
+      --index-strategy unsafe-best-match && \
+    uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl \
+      --extra-index-url https://flashinfer.ai/whl/ \
+      --extra-index-url https://flashinfer.ai/whl/cu130/ \
+      --extra-index-url https://download.pytorch.org/whl/cu130 \
+      --index-strategy unsafe-best-match && \
+    uv pip install --system --no-deps \
+      /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
     uv pip install --system b12x==0.30.2 && \
     uv pip install --system xxhash && \
     uv pip install --system --no-deps /wheels/*.whl && \
@@ -240,7 +272,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       echo "GGUF plugin wheel absent; skipping"; \
     fi
 
-RUN rm -rf /wheels /wheels-gguf && \
+RUN rm -rf /wheels /wheels-flashinfer /wheels-gguf && \
     python3 -m compileall -q \
       "$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
       || true
