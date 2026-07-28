@@ -36,6 +36,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
     PYO3_CROSS_PYTHON_VERSION=3.12 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_EXTRA_INDEX_URL="https://flashinfer.ai/whl/ https://flashinfer.ai/whl/cu130/ https://download.pytorch.org/whl/cu130" \
+    UV_INDEX="https://flashinfer.ai/whl/ https://flashinfer.ai/whl/cu130/ https://download.pytorch.org/whl/cu130" \
+    UV_INDEX_STRATEGY=unsafe-best-match \
     CCACHE_DIR=/root/.ccache-cross \
     CCACHE_MAXSIZE=20G \
     CCACHE_NOHASHDIR=true \
@@ -103,9 +106,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index-url https://download.pytorch.org/whl/cu130 && \
     /root/.local/bin/uv pip install --python /opt/venv/bin/python \
       -r /tmp/build-requirements/cuda.txt \
-      -r /tmp/build-requirements/rust.txt \
-      --extra-index-url https://download.pytorch.org/whl/cu130 \
-      --index-strategy unsafe-best-match && \
+      -r /tmp/build-requirements/rust.txt && \
     rm -rf /tmp/build-requirements && \
     /opt/venv/bin/python -c "import torch; print('builder torch OK', torch.__version__, 'cuda', torch.version.cuda)"
 
@@ -208,11 +209,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN mkdir -p /runtime-requirements && \
     cp /src/vllm/requirements/cuda.txt /runtime-requirements/cuda.txt && \
     cp /src/vllm/requirements/common.txt /runtime-requirements/common.txt && \
-    python3 -c 'from pathlib import Path; p=Path("/runtime-requirements/cuda.txt"); p.write_text("".join(line for line in p.read_text().splitlines(keepends=True) if not line.startswith(("flashinfer-python==", "flashinfer-cubin==", "flashinfer-jit-cache=="))))'
+    python3 -c 'from pathlib import Path; p=Path("/runtime-requirements/cuda.txt"); p.write_text("".join(line for line in p.read_text().splitlines(keepends=True) if not line.startswith(("--extra-index-url ", "flashinfer-python==", "flashinfer-cubin==", "flashinfer-jit-cache=="))))'
 
 FROM --platform=$TARGETPLATFORM nvidia/cuda:13.0.2-runtime-ubuntu24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_EXTRA_INDEX_URL="https://flashinfer.ai/whl/ https://flashinfer.ai/whl/cu130/ https://download.pytorch.org/whl/cu130" \
     UV_BREAK_SYSTEM_PACKAGES=1 \
+    UV_INDEX="https://flashinfer.ai/whl/ https://flashinfer.ai/whl/cu130/ https://download.pytorch.org/whl/cu130" \
+    UV_INDEX_STRATEGY=unsafe-best-match \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_USE_RUST_FRONTEND=1 \
     TORCH_CUDA_ARCH_LIST=12.1a \
@@ -247,18 +251,9 @@ COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 # The upstream cubin package is deliberately absent so it cannot shadow these
 # TOPK=256-capable native artifacts.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r /runtime-requirements/cuda.txt \
-      --extra-index-url https://download.pytorch.org/whl/cu130 \
-      --index-strategy unsafe-best-match && \
-    uv pip install --system flashinfer-cubin==0.6.15.post1 \
-      --extra-index-url https://flashinfer.ai/whl/ \
-      --extra-index-url https://flashinfer.ai/whl/cu130/ \
-      --index-strategy unsafe-best-match && \
-    uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl \
-      --extra-index-url https://flashinfer.ai/whl/ \
-      --extra-index-url https://flashinfer.ai/whl/cu130/ \
-      --extra-index-url https://download.pytorch.org/whl/cu130 \
-      --index-strategy unsafe-best-match && \
+    uv pip install --system -r /runtime-requirements/cuda.txt && \
+    uv pip install --system flashinfer-cubin==0.6.15.post1 && \
+    uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl && \
     uv pip install --system --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
     uv pip install --system b12x==0.30.2 && \
