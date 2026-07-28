@@ -170,6 +170,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
 # JIT-cache wheel carries the patched AArch64 SM121 native modules.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/flashinfer,sharing=locked \
+    --mount=type=cache,target=/src/vllm/third_party/flashinfer/build/aot,sharing=locked \
     cd /src/vllm && \
     uv pip install --python /opt/venv/bin/python \
       'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests numpy \
@@ -188,6 +189,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
+    MAX_JOBS=8 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh
 
