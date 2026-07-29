@@ -243,3 +243,20 @@ a live test loop: swap to the new image immediately and iterate on the real
 deployment until it works, rather than staging a separate canary. Rollback is
 the manifest revert. (2026-07-26: "completely swap out and test until we get
 working.")
+
+### Rebase on upstream at least daily, and before implementation work
+
+Keep `homelabs-main` close to `upstream/main` so fork changes stay small and
+mergeable and always land on current upstream code.
+
+- Rebase `homelabs-main` onto `upstream/main` **at least once per working day**,
+  and **before starting any new implementation/fixer work** on a feature.
+- Procedure: confirm the `upstream` remote points at `vllm-project/vllm`, then
+  `git fetch upstream && git rebase upstream/main`, then force-push with lease
+  (`git push --force-with-lease`).
+- Resolve conflicts by **preserving fork-unique work** — the SM120/SM121 CUTLASS
+  grouped-MoE port, the vendored FlashInfer submodule and its build wiring, B12X
+  MXFP4 integration, DeepGEMM/Spark cross-build changes, and the `homelab/`
+  Dockerfiles. Never drop these to make a rebase "clean".
+- If a rebase hits non-trivial conflicts, stop and resolve them with fork
+  context rather than blindly taking upstream or fork sides.
