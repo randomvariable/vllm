@@ -99,6 +99,26 @@ When adding tests:
 For model-specific requirements, see
 [`docs/contributing/model/tests.md`](docs/contributing/model/tests.md).
 
+### Documentation
+
+Docs ship in the SAME change as the code, never as a follow-up. A change is not
+complete until the docs exist.
+
+- **Any new user-facing feature, or new/changed config option** → update the
+  prose page that owns the area. Search `docs/configuration/` for the guide
+  covering it (memory, optimization, env vars) rather than assuming a path.
+- **Document**: what it does, when to use it, interaction and mutual exclusion
+  with related options, defaults, and intentional failure modes — state what
+  fails closed and why, so the behaviour does not read as a bug.
+- **Reference pages are generated** from config field docstrings (search for
+  `gen:engine-args`), so a Google-style docstring on the field *is* the
+  reference doc. Generated reference does not replace prose guidance — a new
+  option needs both.
+- **Environment variables** must be declared in `vllm/envs.py` and documented
+  wherever env vars are listed.
+- **Cross-reference** from the established option a new one competes with, so
+  readers find the alternative instead of only the one they searched for.
+
 ### Running linters
 
 > Requires [Environment setup](#environment-setup).
@@ -171,21 +191,6 @@ kernels. A FlashInfer-less DGX image is pointless for them. **Never strip
 `flashinfer-python` / `flashinfer-cubin` / `flashinfer-jit-cache` from
 `requirements/cuda.txt` at image-build time.**
 
-### flashinfer 0.6.15.post1 IS compatible with torch 2.13/cu130
-
-It resolves cleanly with `cuda-bindings>=13` via the FlashInfer index already
-declared in `requirements/cuda.txt`:
-
-```
---extra-index-url https://flashinfer.ai/whl/
---extra-index-url https://flashinfer.ai/whl/cu130/
-```
-
-`flashinfer-cubin` and `flashinfer-jit-cache` are **NOT on PyPI** — they exist
-only on the flashinfer.ai index (jit-cache ships a `+cu130` local variant
-there). Any resolution done without that index fails misleadingly and makes the
-packages look incompatible when they are not.
-
 ### Verify dependency claims by actual resolution, with the repo's indexes
 
 Before declaring two packages incompatible (and especially before baking an
@@ -198,7 +203,11 @@ uv pip compile requirements/cuda.txt --index-strategy unsafe-best-match
 
 Package-metadata reading alone is insufficient (constraints move across
 versions and indexes). An incompatibility claim that has not been reproduced by
-a resolver with the correct indexes is not a fact — do not act on it.
+a resolver with the correct indexes is not a fact — do not act on it. Note that
+`flashinfer-cubin` and `flashinfer-jit-cache` are **NOT on PyPI** — they exist
+only on the flashinfer.ai index declared in `requirements/cuda.txt`, so a
+resolution run without it fails misleadingly and makes the pinned FlashInfer
+look incompatible with torch/CUDA when it is not.
 
 ### Verify every `VLLM_*` env var against `vllm/envs.py` before use
 
@@ -207,6 +216,15 @@ Example that bit us: `VLLM_USE_FLASHINFER` does NOT exist; the sampler gate is
 `VLLM_USE_FLASHINFER_SAMPLER` (default `True`, `envs.py`). Grep `vllm/envs.py`
 for the exact variable name before adding it to any Dockerfile, script, or
 deployment manifest.
+
+### `README.md` must not overclaim
+
+The fork `README.md` is a public, user-facing document: no node names, registry
+hosts, or cluster/CI specifics. Keep it current when fork capabilities,
+supported hardware, or build commands change, and never claim work that has not
+been done — carried-upstream configs are not "ours", ported-and-building is not
+"performance-qualified", and a number nobody measured is not a benchmark.
+Correct or remove a claim as soon as it stops being true.
 
 ### Dockerfiles are build-only
 
