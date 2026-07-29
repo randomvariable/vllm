@@ -737,9 +737,10 @@ def _check_enough_kv_cache_memory(
     if available_memory <= 0:
         raise ValueError(
             "No available memory for the cache blocks. "
-            "Try increasing `gpu_memory_utilization` when initializing the engine "
-            "(this flag also controls CPU memory reservation on the CPU "
-            "backend, despite its name). "
+            "Try increasing the GPU memory budget via "
+            "`--gpu-memory-utilization` or `--gpu-memory-utilization-gb` "
+            "when initializing the engine (these flags also control CPU "
+            "memory reservation on the CPU backend, despite their names). "
             "See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
             "for more details."
         )
@@ -760,9 +761,10 @@ def _check_enough_kv_cache_memory(
             f"({max_model_len}), ({format_gib(needed_memory)} GiB KV "
             f"cache is needed, which is larger than the available KV cache "
             f"memory ({format_gib(available_memory)} GiB). {estimated_msg}"
-            f"Try increasing `gpu_memory_utilization` (which also controls "
-            f"CPU memory on the CPU backend) or decreasing `max_model_len` "
-            f"when initializing the engine. "
+            f"Try increasing the GPU memory budget via "
+            f"`--gpu-memory-utilization` or `--gpu-memory-utilization-gb` "
+            f"(which also control CPU memory on the CPU backend) or "
+            f"decreasing `max_model_len` when initializing the engine. "
             f"See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
             f"for more details."
         )
@@ -2028,7 +2030,9 @@ def _auto_fit_max_model_len(
     if auto_fit_max <= 0:
         raise ValueError(
             "Cannot auto-fit max_model_len: not enough GPU memory available "
-            "to serve even a single token. Try increasing `gpu_memory_utilization`."
+            "to serve even a single token. Try increasing the GPU memory "
+            "budget via `--gpu-memory-utilization` or "
+            "`--gpu-memory-utilization-gb`."
         )
 
     if auto_fit_max >= original_max:

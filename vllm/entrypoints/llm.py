@@ -111,7 +111,19 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             reserve for the model weights, activations, and KV cache. Higher
             values will increase the KV cache size and thus improve the model's
             throughput. However, if the value is too high, it may cause out-of-
-            memory (OOM) errors.
+            memory (OOM) errors. Defaults to 0.92 when neither this nor
+            `gpu_memory_utilization_gb` is set. Mutually exclusive with
+            `gpu_memory_utilization_gb`.
+        gpu_memory_utilization_gb: Absolute per-worker GPU memory budget in
+            GiB, as an alternative to the fractional `gpu_memory_utilization`.
+            It is the *total* engine-resident target for this worker's device
+            (weights, persistent non-KV state, the profiled activation peak,
+            captured CUDA graphs, the KV cache, and frontend GPU reservations),
+            not extra memory on top of what is already allocated. Useful on
+            unified-memory devices (e.g. NVIDIA GB10 / DGX Spark, AMD Strix
+            Halo), where a fraction of total device memory is a poor control
+            because the CPU and GPU share one pool. Mutually exclusive with
+            `gpu_memory_utilization`.
         kv_cache_memory_bytes: Size of KV Cache per GPU in bytes. By default,
             this is set to None and vllm can automatically infer the kv cache
             size based on gpu_memory_utilization. However, users may want to
@@ -193,7 +205,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         tokenizer_revision: str | None = None,
         chat_template: Path | str | None = None,
         seed: int = 0,
-        gpu_memory_utilization: float = 0.92,
+        gpu_memory_utilization: float | None = None,
+        gpu_memory_utilization_gb: float | None = None,
         cpu_offload_gb: float = 0,
         offload_group_size: int = 0,
         offload_num_in_group: int = 1,
@@ -309,6 +322,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             tokenizer_revision=tokenizer_revision,
             seed=seed,
             gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_utilization_gb=gpu_memory_utilization_gb,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
             cpu_offload_gb=cpu_offload_gb,
             offload_group_size=offload_group_size,

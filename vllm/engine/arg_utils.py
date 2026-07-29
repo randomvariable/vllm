@@ -529,7 +529,8 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
-    gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
+    gpu_memory_utilization: float | None = CacheConfig.gpu_memory_utilization
+    gpu_memory_utilization_gb: float | None = CacheConfig.gpu_memory_utilization_gb
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
@@ -1196,8 +1197,15 @@ class EngineArgs:
             description=CacheConfig.__doc__,
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
-        cache_group.add_argument(
+        # The fractional and absolute GPU memory budgets are mutually
+        # exclusive; argparse rejects the combination before CacheConfig sees
+        # it, so the CLI reports the conflict at parse time.
+        gpu_memory_budget_group = cache_group.add_mutually_exclusive_group()
+        gpu_memory_budget_group.add_argument(
             "--gpu-memory-utilization", **cache_kwargs["gpu_memory_utilization"]
+        )
+        gpu_memory_budget_group.add_argument(
+            "--gpu-memory-utilization-gb", **cache_kwargs["gpu_memory_utilization_gb"]
         )
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
@@ -1986,6 +1994,7 @@ class EngineArgs:
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
+            gpu_memory_utilization_gb=self.gpu_memory_utilization_gb,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,

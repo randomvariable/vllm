@@ -18,6 +18,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -443,24 +444,89 @@ def sanity_check_mm_encoder_outputs(
     )
 
 
+def effective_memory_budget(total_memory: int, cache_config: CacheConfig) -> int:
+    """Resolve the active GPU memory budget to an absolute byte target.
+
+    Exactly one of the two budgets is active: the absolute
+    `gpu_memory_utilization_gb` is a device-size independent GiB target,
+    while the fractional `gpu_memory_utilization` scales with the device.
+
+    `CacheConfig` validation rejects setting both, but plain attribute
+    assignment does not re-run pydantic validators (the model does not enable
+    `validate_assignment`), so the mutual exclusion is re-checked here at the
+    point of use rather than assumed. Without it, a control set after
+    construction would silently give the absolute budget precedence.
+
+    Args:
+        total_memory: Total memory of the device, in bytes.
+        cache_config: The cache config holding the active memory budget.
+
+    Returns:
+        The total engine-resident memory target, in bytes.
+
+    Raises:
+        ValueError: If both budget controls are set, or if the absolute
+            budget is too large to convert to a finite byte count.
+    """
+    gib = cache_config.gpu_memory_utilization_gb
+    fraction = cache_config.gpu_memory_utilization
+
+    if gib is not None and fraction is not None:
+        raise ValueError(
+            "gpu_memory_utilization and gpu_memory_utilization_gb are "
+            "mutually exclusive, but both are set on this CacheConfig "
+            f"(gpu_memory_utilization={fraction}, "
+            f"gpu_memory_utilization_gb={gib}). Neither takes precedence. "
+            "Set exactly one of them; note that assigning one after the "
+            "config is constructed bypasses validation."
+        )
+
+    if gib is not None:
+        requested_memory = gib * GiB_bytes
+        if not math.isfinite(requested_memory):
+            raise ValueError(
+                f"gpu_memory_utilization_gb={gib} is too large to convert to "
+                f"a byte count ({gib} * {GiB_bytes} overflows to "
+                f"{requested_memory}). Set gpu_memory_utilization_gb to a "
+                "realistic per-worker GiB budget for the device."
+            )
+        return math.ceil(requested_memory)
+
+    assert fraction is not None
+    return math.ceil(total_memory * fraction)
+
+
+def describe_memory_budget(cache_config: CacheConfig) -> str:
+    """Describe the active GPU memory budget for user-facing messages.
+
+    Args:
+        cache_config: The cache config holding the active memory budget.
+
+    Returns:
+        A short description naming the active flag and its configured value.
+    """
+    if (gib := cache_config.gpu_memory_utilization_gb) is not None:
+        return f"--gpu-memory-utilization-gb={gib}"
+    return f"--gpu-memory-utilization={cache_config.gpu_memory_utilization}"
+
+
 def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:
     """
     Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
     """
-    requested_memory = math.ceil(
-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
-    )
+    requested_memory = effective_memory_budget(init_snapshot.total_memory, cache_config)
 
     if init_snapshot.free_memory < requested_memory:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"
             f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
-            f"is less than desired GPU memory utilization "
-            f"({cache_config.gpu_memory_utilization}, "
-            f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
-            f"utilization or reduce GPU memory used by other processes."
+            f"is less than the requested GPU memory budget "
+            f"({describe_memory_budget(cache_config)}, resolved to "
+            f"{format_gib(requested_memory)} GiB / {requested_memory} bytes). "
+            f"Lower the GPU memory budget or reduce GPU memory used by other "
+            f"processes."
         )
 
     return requested_memory

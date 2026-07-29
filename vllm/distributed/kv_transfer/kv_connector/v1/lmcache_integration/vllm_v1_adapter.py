@@ -756,6 +756,9 @@ class LMCacheConnectorV1Impl:
                 "gpu_memory_utilization": getattr(
                     vllm_config.cache_config, "gpu_memory_utilization", None
                 ),
+                "gpu_memory_utilization_gb": getattr(
+                    vllm_config.cache_config, "gpu_memory_utilization_gb", None
+                ),
             },
         }
 

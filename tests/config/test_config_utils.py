@@ -276,3 +276,28 @@ print(hash_factors(envs.compile_factors()))
         "HOME relocation changed the compile-cache env hash - a "
         "location-only derived var is leaking into the key"
     )
+
+
+def test_cache_config_resolves_default_gpu_memory_utilization():
+    """Neither memory control set resolves to the historical 0.92 fraction."""
+    cache_config = CacheConfig()
+    assert cache_config.gpu_memory_utilization == 0.92
+    assert cache_config.gpu_memory_utilization_gb is None
+
+
+def test_cache_config_rejects_both_gpu_memory_controls():
+    """The fractional and absolute budgets are mutually exclusive, with no
+    precedence rule -- including when the fraction is its own default."""
+    for fraction in (0.5, 0.92):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            CacheConfig(
+                gpu_memory_utilization=fraction,
+                gpu_memory_utilization_gb=40.0,
+            )
+
+
+def test_gpu_memory_utilization_gb_not_in_compilation_hash():
+    """The absolute budget controls allocation, not compiled graph shape."""
+    baseline = CacheConfig().compute_hash()
+    assert CacheConfig(gpu_memory_utilization_gb=40.0).compute_hash() == baseline
+    assert CacheConfig(gpu_memory_utilization_gb=8.5).compute_hash() == baseline

@@ -77,7 +77,10 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    describe_memory_budget,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -476,8 +479,9 @@ class Worker(WorkerBase):
         bytes.
 
         Tip:
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
+            You may limit the usage of GPU memory by adjusting the
+            `gpu_memory_utilization` or `gpu_memory_utilization_gb`
+            parameter.
         """
         maybe_apply_startup_plan(self)
 
@@ -519,19 +523,42 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        graphs_will_be_captured = (
+            current_platform.is_cuda_alike() and cudagraph_mode != CUDAGraphMode.NONE
+        )
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
+        if graphs_will_be_captured:
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
-        # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
+        absolute_budget = self.cache_config.gpu_memory_utilization_gb is not None
+
+        if absolute_budget:
+            # The absolute budget is a *total* engine-resident target, so a
+            # missing graph estimate would silently make it incomplete --
+            # captured graphs would land on top of the target instead of
+            # inside it. Always subtract the estimate (ignoring the fraction
+            # mode opt-out), and refuse to boot if graphs will be captured
+            # but the runner's estimator cannot size them.
+            if graphs_will_be_captured and cudagraph_memory_estimate <= 0:
+                raise ValueError(
+                    "--gpu-memory-utilization-gb is a total engine-resident "
+                    "memory target, but this runner's CUDA graph memory "
+                    "estimate is 0 while graph capture is active "
+                    f"(cudagraph_mode={cudagraph_mode}). Captured graphs "
+                    "would then fall outside the budget and could OOM. Use "
+                    "the fractional --gpu-memory-utilization instead, or "
+                    "disable graph capture (--enforce-eager, or "
+                    "cudagraph_mode=NONE)."
+                )
+            cudagraph_memory_estimate_applied = cudagraph_memory_estimate
+        else:
+            # Fraction mode keeps the existing opt-in flag behaviour.
+            cudagraph_memory_estimate_applied = (
+                cudagraph_memory_estimate
+                if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                else 0
+            )
 
         self.total_consumed = profile_result.total_consumed
         self.peak_activation_memory = (
@@ -558,10 +585,11 @@ class Worker(WorkerBase):
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+        budget_description = describe_memory_budget(self.cache_config)
         logger.debug(
-            "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
+            "Initial free memory: %s GiB; Requested memory: %s, %s GiB",
             format_gib(self.init_snapshot.free_memory),
-            self.cache_config.gpu_memory_utilization,
+            budget_description,
             format_gib(self.requested_memory),
         )
         logger.debug(
@@ -575,9 +603,24 @@ class Worker(WorkerBase):
             format_gib(self.available_kv_cache_memory_bytes),
         )
 
-        if cudagraph_memory_estimate > 0:
+        if cudagraph_memory_estimate > 0 and absolute_budget:
+            # The absolute target is authoritative, so report in GiB rather
+            # than back-deriving a device-relative fraction from it.
+            current_gib = self.requested_memory / GiB_bytes
+            logger.info(
+                "CUDA graph memory (%s GiB) is accounted for inside the "
+                "--gpu-memory-utilization-gb=%.4f total engine memory "
+                "target. To keep the KV cache the size it would have been "
+                "without CUDA graph accounting, raise "
+                "--gpu-memory-utilization-gb to %.4f.",
+                format_gib(cudagraph_memory_estimate),
+                current_gib,
+                current_gib + cudagraph_memory_estimate / GiB_bytes,
+            )
+        elif cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
+            assert current_util is not None
             cg_util_delta = cudagraph_memory_estimate / total_mem
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
                 equiv_util = round(current_util - cg_util_delta, 4)
@@ -778,14 +821,14 @@ class Worker(WorkerBase):
                 f"Free memory on device "
                 f"({format_gib(self.init_snapshot.free_memory)}/"
                 f"{format_gib(self.init_snapshot.total_memory)} GiB) on startup. "
-                f"Desired GPU memory utilization is "
-                f"({self.cache_config.gpu_memory_utilization}, "
+                f"Desired GPU memory budget is "
+                f"({describe_memory_budget(self.cache_config)}, "
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage is {format_gib(self.total_consumed)} "
                 f"GiB for consumed memory (weights + non-torch), "
                 f"{format_gib(self.peak_activation_memory)} GiB "
                 f"for peak activation, and {format_gib(cuda_graph_memory_bytes)} "
-                f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
+                f"GiB for CUDAGraph memory. Replace the GPU memory budget "
                 f"config with `--kv-cache-memory="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_requested_limit)} GiB) to fit "

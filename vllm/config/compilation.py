@@ -1508,8 +1508,9 @@ class CompilationConfig:
                 f"blocks ({kv_cache_config.num_blocks}). Each decode sequence "
                 "requires one Mamba cache block, so CUDA graph capture cannot "
                 "proceed. Please lower max_num_seqs to at most "
-                f"{kv_cache_config.num_blocks} or increase "
-                "gpu_memory_utilization."
+                f"{kv_cache_config.num_blocks} or increase the GPU memory "
+                "budget via --gpu-memory-utilization or "
+                "--gpu-memory-utilization-gb."
             )
 
         self.cudagraph_mode = cudagraph_mode
