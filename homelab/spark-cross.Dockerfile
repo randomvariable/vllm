@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.0 12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
-    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.0 -DCUDA_CUDART=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so" \
+    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.0 -DCUDA_CUDART=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so -DVLLM_CUTLASS_SRC_DIR=/src/vllm/third_party/flashinfer/3rdparty/cutlass" \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     NVCC_THREADS=${NVCC_THREADS} \
