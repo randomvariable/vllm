@@ -104,7 +104,14 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
 
 
 def kernel_warmup(worker: "Worker") -> None:
-    """Run kernel warmup without importing its CUDA dependencies on preload."""
+    """Run kernel warmup without importing its CUDA dependencies on preload.
+
+    Args:
+        worker: Worker whose kernels should be warmed up.
+
+    Returns:
+        None.
+    """
     from vllm.model_executor.warmup.kernel_warmup import (
         kernel_warmup as run_kernel_warmup,
     )
