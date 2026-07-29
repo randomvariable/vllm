@@ -39,7 +39,7 @@ struct sm120_fp8_config_M64 {
   using KernelSchedule =
       cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeSm120<2>;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileShape = cute::Shape<cute::_128, cute::_16, cute::_128>;
+  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
   using ArchTag = cutlass::arch::Sm120;
 
