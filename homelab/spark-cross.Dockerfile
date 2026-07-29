@@ -189,7 +189,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
-    MAX_JOBS=8 FLASHINFER_NVCC_THREADS=1 \
+    MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh
 
