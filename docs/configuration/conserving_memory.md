@@ -97,6 +97,8 @@ Use it on unified-memory devices -- for example NVIDIA GB10 / DGX Spark and AMD 
 
 On a discrete GPU with dedicated VRAM, prefer the fractional control.
 
+For the kernel-level constraints of these unified-memory targets, see [Writing Kernels for Homelab Targets](../contributing/kernel_targets/README.md).
+
 ### Mutual exclusion
 
 Setting both `gpu_memory_utilization` and `gpu_memory_utilization_gb` raises an error. There is deliberately no precedence rule, so neither value is ever silently discarded.

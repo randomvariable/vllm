@@ -72,6 +72,8 @@ For more details about installing from source and installing for other hardware,
 
 For an optimized workflow when iterating on C++/CUDA kernels, see the [Incremental Compilation Workflow](./incremental_build.md) for recommendations.
 
+If you are writing or porting a kernel for this fork's hardware targets (AMD Strix Halo / `gfx1151`, or NVIDIA GB10 / `sm_121a`), see [Writing Kernels for Homelab Targets](./kernel_targets/README.md) for the architecture constraints and the correctness/performance verification bar.
+
 !!! tip
     vLLM is compatible with Python versions 3.10 to 3.13. However, vLLM's default [Dockerfile](../../docker/Dockerfile) ships with Python 3.12 and tests in CI (except `mypy`) are run with Python 3.12.
 
