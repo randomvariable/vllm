@@ -262,3 +262,12 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 # guide forbids duplicating or passing on any part of it, and this fork is
 # public. Kept out of docs/ so the docs build never walks it.
 .slim/reference/
+
+# Local agent tooling: installed third-party skills and their lockfile, plugin
+# state, and a ripgrep override that keeps the git-ignored paths above visible
+# to search tools. All machine-local, none of it belongs to this fork.
+.agents/
+.claude/
+.cortexkit/
+.ignore
+skills-lock.json
