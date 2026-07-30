@@ -22,7 +22,15 @@ Before setting up the incremental build:
 
     **ROCm:** Verify that ROCm is installed and that `amdclang` is available under `$ROCM_PATH/lib/llvm/bin`. vLLM's extensions **must** be compiled with `amdclang`/`amdclang++` rather than the system `gcc`: the PyTorch ROCm wheels are themselves built with that toolchain, and mixing C++ ABIs across the extension boundary produces crashes at import or inference time rather than a build error. The generator pins `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER` and `CMAKE_HIP_COMPILER` accordingly, so do not override them with `gcc`.
 
-    When ROCm is installed as Python wheels rather than under `/opt/rocm`, the installation prefix is reported by `rocm-sdk path --root`; the generator queries it automatically and falls back to `ROCM_PATH`, `HIP_PATH`, `ROCM_HOME` and then `/opt/rocm`.
+    When ROCm is installed as Python wheels rather than under `/opt/rocm`, the installation prefix is reported by `rocm-sdk path --root`; the generator queries that automatically and falls back to `ROCM_PATH`, `HIP_PATH`, `ROCM_HOME` and then `/opt/rocm`.
+
+    A wheel-based ROCm install only provides a toolchain if the development package is present. Runtime wheels alone give you `libamdhip64` but no `amdclang`, no HIP CMake config packages and no device bitcode, so CMake cannot configure a HIP build at all. Install the development extra alongside the runtime wheels:
+
+    ```console
+    uv pip install "rocm[libraries,devel]"
+    ```
+
+    Note that `rocm-sdk path --root` exits successfully and prints nothing when the development package is missing, reporting the problem only on stderr, so checking its exit status alone will not detect this. If the generator reports that it could not find a ROCm installation, check that the command prints a real directory.
 
 3. **Build Tools:** It is highly recommended to install `ccache` for fast rebuilds by caching compilation results (e.g., `sudo apt install ccache` or `conda install ccache`). It caches CUDA and HIP compilations alike, and both `setup.py` and the preset generator wire it up automatically when it is on your `PATH`. Also, ensure the core build dependencies like `cmake` and `ninja` are installed. These are installable through `requirements/build/cuda.txt` (or `requirements/build/rocm.txt` for ROCm) or your system's package manager.
 
