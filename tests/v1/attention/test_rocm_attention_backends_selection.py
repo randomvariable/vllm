@@ -222,9 +222,16 @@ def test_mla_backend_selection(
     expected_backend_path,
     should_raise,
     mock_vllm_config,
+    mock_on_mi3xx,
     monkeypatch,
 ):
-    """Test MLA backend selection with various configurations."""
+    """Test MLA backend selection with various configurations.
+
+    These cases cover env-var and block-size semantics, not architecture, so
+    they assume a mi3xx host: the AITER MLA backends gate on it via
+    supports_compute_capability. Architecture behaviour is covered separately
+    by test_aiter_mla_skipped_on_unsupported_arch and friends.
+    """
     # Set environment variables
     for key, value in env_vars.items():
         monkeypatch.setenv(key, value)
@@ -321,6 +328,108 @@ def test_aiter_fa_requires_mi3xx(mock_vllm_config):
         RocmPlatform.get_attn_backend_cls(
             selected_backend=AttentionBackendEnum.ROCM_AITER_FA,
             attn_selector_config=attn_selector_config,
+        )
+
+
+def _mla_selector_config(block_size: int = 16) -> AttentionSelectorConfig:
+    return AttentionSelectorConfig(
+        head_size=128,
+        dtype=torch.float16,
+        kv_cache_dtype="auto",
+        block_size=block_size,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=False,
+    )
+
+
+def test_aiter_mla_skipped_on_unsupported_arch(mock_vllm_config, monkeypatch):
+    """Automatic MLA selection must fall through to TRITON_MLA off mi3xx.
+
+    AITER's MLA kernels only exist for gfx942/gfx950, but AITER as a library is
+    also admitted on gfx1151 for its non-MLA kernels. With the AITER MLA env
+    gate on, automatic selection must therefore skip ROCM_AITER_MLA on an
+    unsupported arch instead of picking a backend whose kernels are absent.
+    """
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+
+    from vllm.platforms.rocm import RocmPlatform
+
+    mock_rocm_ops = MagicMock()
+    mock_rocm_ops.is_mla_enabled.return_value = True
+
+    with (
+        patch("vllm._aiter_ops.rocm_aiter_ops", mock_rocm_ops),
+        patch("vllm.platforms.rocm.on_mi3xx", return_value=False),
+    ):
+        backend_path = RocmPlatform.get_attn_backend_cls(
+            selected_backend=None,
+            attn_selector_config=_mla_selector_config(),
+        )
+
+    assert backend_path != AttentionBackendEnum.ROCM_AITER_MLA.get_path()
+    assert backend_path == AttentionBackendEnum.TRITON_MLA.get_path()
+
+
+def test_aiter_mla_still_selected_on_supported_arch(mock_vllm_config, monkeypatch):
+    """No regression on gfx942/gfx950: ROCM_AITER_MLA stays the first choice."""
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+
+    from vllm.platforms.rocm import RocmPlatform
+
+    mock_rocm_ops = MagicMock()
+    mock_rocm_ops.is_mla_enabled.return_value = True
+
+    with (
+        patch("vllm._aiter_ops.rocm_aiter_ops", mock_rocm_ops),
+        patch("vllm.platforms.rocm.on_mi3xx", return_value=True),
+    ):
+        backend_path = RocmPlatform.get_attn_backend_cls(
+            selected_backend=None,
+            attn_selector_config=_mla_selector_config(),
+        )
+
+    assert backend_path == AttentionBackendEnum.ROCM_AITER_MLA.get_path()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.ROCM_AITER_MLA,
+        # AiterTritonMLABackend subclasses AiterMLABackend and only overrides
+        # the prefill call, still inheriting forward_mqa -> mla_decode_fwd, so
+        # it must inherit the arch gate too.
+        AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
+    ],
+)
+def test_explicit_aiter_mla_raises_on_unsupported_arch(backend, mock_vllm_config):
+    """Explicit selection fails closed rather than silently downgrading."""
+    from vllm.platforms.rocm import RocmPlatform
+
+    with (
+        patch("vllm.platforms.rocm.on_mi3xx", return_value=False),
+        pytest.raises(ValueError, match="compute capability not supported"),
+    ):
+        RocmPlatform.get_attn_backend_cls(
+            selected_backend=backend,
+            attn_selector_config=_mla_selector_config(),
+        )
+
+
+def test_sparse_mla_not_gated_by_dense_arch_check(mock_vllm_config):
+    """The dense gate must not leak into the sparse backend.
+
+    ROCM_AITER_MLA_SPARSE has its own (separately tracked) support story; this
+    change must leave it exactly as it was.
+    """
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+        ROCMAiterMLASparseBackend,
+    )
+
+    with patch("vllm.platforms.rocm.on_mi3xx", return_value=False):
+        assert ROCMAiterMLASparseBackend.supports_compute_capability(
+            DeviceCapability(11, 5)
         )
 
 
