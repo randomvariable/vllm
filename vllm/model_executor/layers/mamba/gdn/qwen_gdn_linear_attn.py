@@ -87,7 +87,7 @@ logger = init_logger(__name__)
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "fla_fused"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -110,13 +110,6 @@ def _resolve_gdn_prefill_backend(
     backend = str(backend_cfg).strip().lower()
 
     if not current_platform.is_cuda():
-        # On ROCm (e.g. gfx1151 / Strix Halo), the fused FLA prefill kernel
-        # (ATOM chunk_fused) collapses the h-recurrence + o-GEMM into a single
-        # Triton kernel that keeps the chunk state in registers. Opt-in via
-        # additional_config gdn_prefill_backend="fla_fused"; the default stays
-        # the proven 2-kernel "triton" path.
-        if backend == "fla_fused":
-            return backend, "fla_fused"
         return backend, "triton"
 
     head_k_dim = getattr(
@@ -239,8 +232,6 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
-        elif active_backend == "fla_fused":
-            self._forward_method = self.forward_fla_fused
         else:
             self._forward_method = self.forward_native
 
@@ -305,61 +296,6 @@ class ChunkGatedDeltaRule(CustomOp):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
         )
-
-    def forward_fla_fused(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.Tensor | None = None,
-        chunk_indices: torch.Tensor | None = None,
-        chunk_offsets: torch.Tensor | None = None,
-        use_qk_l2norm_in_kernel: bool = True,
-        core_attn_out: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # ATOM chunk_fused: fused h-recurrence + o-GEMM (chunk state stays in
-        # registers across chunks). Inference-only GDN prefill fast path for
-        # ROCm (e.g. gfx1151). scale defaults to None -> computed internally,
-        # matching forward_native which also does not pass an explicit scale.
-        # Lazy import (mirrors the flashinfer/cutedsl backends) so an issue in
-        # the fused kernel never breaks the default triton path at module load.
-        from vllm.third_party.flash_linear_attention.ops.chunk_fused import (
-            chunk_gated_delta_rule_fused as fla_chunk_gated_delta_rule_fused,
-        )
-
-        # The fused kernel has no chunk_indices/chunk_offsets arguments, so it
-        # cannot express varlen DFlash scheduling. Refuse loudly rather than
-        # silently dropping the scheduling metadata (which would produce wrong
-        # chunk boundaries / hidden states). Oracle review B-1.
-        if chunk_indices is not None or chunk_offsets is not None:
-            raise NotImplementedError(
-                "fla_fused GDN prefill does not support varlen DFlash "
-                "scheduling (chunk_indices/chunk_offsets). Use the default "
-                "triton backend when speculative decoding is active."
-            )
-
-        o, final_state = fla_chunk_gated_delta_rule_fused(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
-        # chunk_gated_delta_rule_fused already returns final_state=None when
-        # output_final_state is False, so no extra nulling is needed here.
-        return o, final_state
 
     def forward_cutedsl(
         self,
