@@ -310,12 +310,11 @@ class DecodeCase:
     def num_blocks_per_seq(self) -> int:
         return (self.seq_len + self.block_size - 1) // self.block_size
 
-    def launch(self, skip_out_of_window: bool, out: torch.Tensor | None = None):
-        out = self.output if out is None else out
+    def _bench_kwargs(self, out: torch.Tensor, skip_out_of_window: bool) -> dict:
         num_queries_per_kv_padded = max(
             triton.next_power_of_2(self.num_queries_per_kv), 16
         )
-        _kernel_paged_attention_2d_benchmark[(self.num_seqs, self.num_kv_heads)](
+        return dict(
             output_ptr=out,
             query_ptr=self.query,
             key_cache_ptr=self.key_cache,
@@ -349,20 +348,26 @@ class DecodeCase:
             stride_v_cache_3=self.value_cache.stride(3),
             query_start_len_ptr=self.query_start_loc,
         )
+
+    def launch(self, skip_out_of_window: bool, out: torch.Tensor | None = None):
+        out = self.output if out is None else out
+        _kernel_paged_attention_2d_benchmark[(self.num_seqs, self.num_kv_heads)](
+            **self._bench_kwargs(out, skip_out_of_window)
+        )
         return out
 
-    def launch_production(self, out: torch.Tensor | None = None):
-        """Run the real production kernel, for the fidelity gate."""
-        from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
-            kernel_paged_attention_2d,
+    def launch_compiled(self, skip_out_of_window: bool):
+        """Launch the benchmark copy and return the CompiledKernel handle."""
+        return _kernel_paged_attention_2d_benchmark[(self.num_seqs, self.num_kv_heads)](
+            **self._bench_kwargs(self.output, skip_out_of_window)
         )
 
-        out = torch.empty_like(self.query) if out is None else out
+    def _production_kwargs(self, out: torch.Tensor) -> dict:
         num_queries_per_kv_padded = max(
             triton.next_power_of_2(self.num_queries_per_kv), 16
         )
         one = torch.tensor(1.0, dtype=torch.float32, device=self.device)
-        kernel_paged_attention_2d[(self.num_seqs, self.num_kv_heads)](
+        return dict(
             output_ptr=out,
             query_ptr=self.query,
             key_cache_ptr=self.key_cache,
@@ -404,7 +409,34 @@ class DecodeCase:
             USE_SINKS=False,
             USE_FP8=False,
         )
+
+    def launch_kernel(self, kernel, out: torch.Tensor | None = None):
+        """Launch any kernel with the production signature; return the handle.
+
+        Used to compile a kernel taken from git history alongside the installed
+        one, so their register allocations are directly comparable.
+        """
+        out = torch.empty_like(self.query) if out is None else out
+        return kernel[(self.num_seqs, self.num_kv_heads)](
+            **self._production_kwargs(out)
+        )
+
+    def launch_production(self, out: torch.Tensor | None = None):
+        """Run the real production kernel, for the fidelity gate."""
+        from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+            kernel_paged_attention_2d,
+        )
+
+        out = torch.empty_like(self.query) if out is None else out
+        self.launch_kernel(kernel_paged_attention_2d, out)
         return out
+
+    def launch_production_compiled(self):
+        from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+            kernel_paged_attention_2d,
+        )
+
+        return self.launch_kernel(kernel_paged_attention_2d)
 
 
 def check_equivalence(case: DecodeCase, atol: float) -> None:
@@ -442,6 +474,32 @@ def time_arm(
     fn = lambda: case.launch(skip_out_of_window)  # noqa: E731
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=iters, return_mode="median")
     return ms * 1000.0
+
+
+def time_interleaved(
+    first, second, warmup: int, iters: int, rounds: int
+) -> tuple[float, float]:
+    """Time two callables alternately, returning their per-arm medians.
+
+    Shared by the copy's two arms and by the real pre/post-change kernels; see
+    ``time_both_arms`` for why alternating matters on this hardware.
+    """
+    a: list[float] = []
+    b: list[float] = []
+    for _ in range(rounds):
+        a.append(
+            triton.testing.do_bench(
+                first, warmup=warmup, rep=iters, return_mode="median"
+            )
+            * 1000.0
+        )
+        b.append(
+            triton.testing.do_bench(
+                second, warmup=warmup, rep=iters, return_mode="median"
+            )
+            * 1000.0
+        )
+    return statistics.median(a), statistics.median(b)
 
 
 def time_both_arms(
@@ -559,18 +617,206 @@ def run_sweep(args) -> int:
     return failures
 
 
+def _load_prechange_kernel(repo_root: str):
+    """Import the pre-change kernel from git history.
+
+    The register question is about the *production* kernel across the two
+    revisions, not about the parametrised copy above: the copy shares one
+    Triton source, so both of its arms could in principle allocate alike for
+    reasons that do not hold for the real thing. So fetch the actual pre-change
+    source out of git and compile that.
+
+    Returns ``(kernel, revision)``, or ``(None, reason)`` if history is
+    unavailable (e.g. a shallow clone or an export with no .git).
+    """
+    import importlib.util
+    import subprocess
+    import tempfile
+
+    rel = "vllm/v1/attention/ops/chunked_prefill_paged_decode.py"
+    try:
+        # The commit that introduced the skip; its parent is the "before" tree.
+        rev = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_root,
+                "log",
+                "-1",
+                "--format=%H",
+                "-S",
+                "start_block",
+                "--",
+                rel,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if not rev:
+            return None, "could not find the commit that introduced start_block"
+        src = subprocess.run(
+            ["git", "-C", repo_root, "show", f"{rev}^:{rel}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        return None, f"git history unavailable: {exc}"
+
+    if "start_block" in src:
+        return None, f"{rev[:9]}^ still mentions start_block; wrong parent"
+
+    # Triton requires @jit functions to live in a real file on disk, and the
+    # file must outlive this call, so it is deliberately not auto-deleted.
+    fd, path = tempfile.mkstemp(suffix="_prechange.py", text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(src)
+
+    # Load it *as* a submodule of the real package: the file carries relative
+    # imports (``from .prefix_prefill import ...``) that only resolve if the
+    # module's package is the genuine one.
+    name = "vllm.v1.attention.ops._prechange_paged_decode"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001 - report, do not abort the run
+        sys.modules.pop(name, None)
+        return None, f"pre-change source failed to import: {exc}"
+    return mod.kernel_paged_attention_2d, f"{rev[:9]}^"
+
+
+@torch.inference_mode()
+def run_registers(args) -> int:
+    """Report VGPR allocation per kernel revision and SLIDING_WINDOW value.
+
+    Settles whether a layer with no sliding window pays for the added
+    ``if SLIDING_WINDOW > 0`` guard. ``SLIDING_WINDOW`` is a ``tl.constexpr``,
+    so at 0 the branch should fold away at compile time and the post-change
+    kernel should allocate exactly what the pre-change kernel did. Triton
+    reports ``n_regs`` from the compiled binary, so this is the compiler's own
+    number rather than an inference from timing.
+    """
+    set_random_seed(args.seed)
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+
+    prechange, rev = _load_prechange_kernel(repo_root)
+    print(f"device={torch.cuda.get_device_name(0)}  dtype={args.dtype}")
+    if prechange is None:
+        print(f"pre-change kernel NOT loaded ({rev}); reporting post-change only")
+    else:
+        print(f"pre-change kernel loaded from {rev}")
+    print()
+
+    rows: list[tuple[str, int, int, int]] = []
+    for window in args.sliding_window:
+        # ctx == window means no block is skippable, isolating the branch cost
+        # from the work saving.
+        case = DecodeCase(
+            num_seqs=args.batch_size,
+            seq_len=args.seq_lens[0],
+            num_query_heads=args.num_query_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_size=args.head_size,
+            block_size=args.block_size,
+            sliding_window=window,
+            dtype=dtype,
+            device=args.device,
+        )
+        if prechange is not None:
+            k = case.launch_kernel(prechange)
+            rows.append(("pre-change  (production)", window, k.n_regs, k.n_spills))
+        k = case.launch_production_compiled()
+        rows.append(("post-change (production)", window, k.n_regs, k.n_spills))
+        k = case.launch_compiled(skip_out_of_window=False)
+        rows.append(("benchmark copy, skip=off", window, k.n_regs, k.n_spills))
+        k = case.launch_compiled(skip_out_of_window=True)
+        rows.append(("benchmark copy, skip=on", window, k.n_regs, k.n_spills))
+        del case
+        torch.cuda.empty_cache()
+
+    print(f"{'kernel':>26} {'SLIDING_WINDOW':>15} {'VGPRs':>7} {'spills':>7}")
+    print("-" * 60)
+    for name, window, regs, spills in rows:
+        print(f"{name:>26} {window:>15} {regs:>7} {spills:>7}")
+    print()
+
+    # Registers are a compile-time proxy for a runtime cost, so also time the
+    # two real kernels head to head. At SLIDING_WINDOW=0 this is the question
+    # that matters: does a non-windowed layer actually run slower?
+    if prechange is not None and args.time_registers:
+        print(
+            f"{'SLIDING_WINDOW':>15} {'pre-change us':>14} "
+            f"{'post-change us':>15} {'ratio':>7}"
+        )
+        print("-" * 55)
+        for window in args.sliding_window:
+            case = DecodeCase(
+                num_seqs=args.batch_size,
+                seq_len=args.seq_lens[0],
+                num_query_heads=args.num_query_heads,
+                num_kv_heads=args.num_kv_heads,
+                head_size=args.head_size,
+                block_size=args.block_size,
+                sliding_window=window,
+                dtype=dtype,
+                device=args.device,
+            )
+            pre_us, post_us = time_interleaved(
+                lambda c=case: c.launch_kernel(prechange),
+                lambda c=case: c.launch_production(),
+                args.warmup,
+                args.iters,
+                args.rounds,
+            )
+            print(
+                f"{window:>15} {pre_us:>14.1f} {post_us:>15.1f} "
+                f"{pre_us / post_us:>6.2f}x"
+            )
+            del case
+            torch.cuda.empty_cache()
+        print()
+
+    # The verdict, computed rather than eyeballed.
+    by_key = {(n, w): r for n, w, r, _ in rows}
+    for window in args.sliding_window:
+        pre = by_key.get(("pre-change  (production)", window))
+        post = by_key.get(("post-change (production)", window))
+        if pre is None or post is None:
+            continue
+        if pre == post:
+            print(
+                f"SLIDING_WINDOW={window}: unchanged at {post} VGPRs -- "
+                f"the guard costs no registers here."
+            )
+        else:
+            print(
+                f"SLIDING_WINDOW={window}: {pre} -> {post} VGPRs "
+                f"({post - pre:+d}) -- the guard costs registers here."
+            )
+    return 0
+
+
 @torch.inference_mode()
 def run_profile(args) -> int:
     """Single-arm, fixed-iteration run for an external profiler.
 
     rocprofv3 wants one hot kernel and a deterministic dispatch count, not a
     sweep with two arms and a do_bench autotune loop mixed in.
+
+    ``--arm prechange`` / ``--arm production`` launch the real kernel from
+    either side of the change instead of the parametrised copy, so a profiler
+    reads register counts off the kernel that actually ships.
     """
     set_random_seed(args.seed)
     dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
     seq_len = args.seq_lens[0]
     window = args.sliding_window[0]
-    skip = args.arm == "after"
 
     case = DecodeCase(
         num_seqs=args.batch_size,
@@ -583,13 +829,32 @@ def run_profile(args) -> int:
         dtype=dtype,
         device=args.device,
     )
+
+    if args.arm == "prechange":
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        kernel, rev = _load_prechange_kernel(repo_root)
+        if kernel is None:
+            print(f"cannot profile the pre-change arm: {rev}", file=sys.stderr)
+            return 1
+        label = f"prechange({rev})"
+        launch = lambda: case.launch_kernel(kernel)  # noqa: E731
+    elif args.arm == "production":
+        label = "production"
+        launch = case.launch_production
+    else:
+        skip = args.arm == "after"
+        label = f"copy(skip={skip})"
+        launch = lambda: case.launch(skip)  # noqa: E731
+
     # Compile and warm caches outside the counted region.
     for _ in range(args.warmup_iters):
-        case.launch(skip)
+        launch()
     torch.cuda.synchronize()
 
     print(
-        f"profile arm={args.arm} skip_out_of_window={skip} ctx={seq_len} "
+        f"profile arm={label} ctx={seq_len} "
         f"window={window} blocks={case.num_blocks_per_seq} "
         f"start_block={case.start_block} "
         f"loop_iters_per_program={case.num_blocks_per_seq - case.start_block} "
@@ -597,7 +862,7 @@ def run_profile(args) -> int:
         f"dispatches={args.profile_iters}"
     )
     for _ in range(args.profile_iters):
-        case.launch(skip)
+        launch()
     torch.cuda.synchronize()
     print("profile run complete")
     return 0
@@ -654,7 +919,30 @@ def main() -> int:
         help="If >0, run a single arm this many times for an external profiler.",
     )
     parser.add_argument("--warmup-iters", type=int, default=20)
-    parser.add_argument("--arm", type=str, choices=["before", "after"], default="after")
+    parser.add_argument(
+        "--arm",
+        type=str,
+        choices=["before", "after", "prechange", "production"],
+        default="after",
+        help="Which kernel to profile: 'before'/'after' are the parametrised "
+        "copy's two arms; 'prechange'/'production' are the real kernel from "
+        "either side of the change.",
+    )
+    parser.add_argument(
+        "--no-time-registers",
+        dest="time_registers",
+        action="store_false",
+        help="With --report-registers, skip the head-to-head timing of the "
+        "two real kernels and report register counts only.",
+    )
+    parser.add_argument(
+        "--report-registers",
+        action="store_true",
+        help="Report VGPR allocation for the pre- and post-change production "
+        "kernels at each --sliding-window value, then exit. Use "
+        "--sliding-window 0 512 to check whether a non-windowed layer pays "
+        "for the constexpr guard.",
+    )
     args = parser.parse_args()
 
     if not (current_platform.is_cuda() or current_platform.is_rocm()):
@@ -671,6 +959,8 @@ def main() -> int:
     if args.num_query_heads % args.num_kv_heads != 0:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
 
+    if args.report_registers:
+        return run_registers(args)
     if args.profile_iters > 0:
         return run_profile(args)
     return run_sweep(args)
