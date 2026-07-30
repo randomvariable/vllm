@@ -33,7 +33,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
     build_sps_table,
@@ -231,17 +230,14 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
-        return gumbel_sample(
-            logits,
-            idx_map,
-            self.temperature,
-            self.seeds,
-            sample_pos - 1,
-            apply_temperature=True,
-            is_drafting=True,
-            logits_cache=self.draft_logits,
-            logits_cache_col=self._step_cols[step],
-            use_fp64=self.use_fp64_gumbel,
+        return self._sample_probabilistic_draft(
+            logits=logits,
+            sample_src_positions=sample_pos - 1,
+            idx_mapping=idx_map,
+            temperature=self.temperature,
+            seeds=self.seeds,
+            draft_step=self._step_cols[step],
+            draft_logits=self.draft_logits,
         )
 
     def _sample_sequential(
