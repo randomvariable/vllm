@@ -4,6 +4,12 @@ dist
 vllm/*.so
 vllm/vllm-rs
 
+# Local scratch trees. Never part of an image, and both can contain
+# root-owned files from earlier container runs, which fails the context
+# upload for every build with "error from sender: permission denied".
+/.deps
+/.slim
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
