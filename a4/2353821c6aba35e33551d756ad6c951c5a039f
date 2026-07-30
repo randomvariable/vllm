@@ -1,0 +1,19 @@
+docs/contributing/incremental_build.md
+  s_417621c3aaae3e::t_22855c3db5187b 25-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "a42353821c6aba35e33551d756ad6c951c5a039f",
+  "prompts": {},
+  "sessions": {
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
