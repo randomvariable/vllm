@@ -47,8 +47,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-    FlashInferFP8ScaledMMLinearKernel,
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+    _b12x_tensor_fp8_linear,
+    warmup_b12x_tensor_fp8_linear,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -154,6 +159,7 @@ def test_b12x_explicit_backend_selects_per_tensor_fp8(
     )
 
     assert isinstance(kernel, B12xTensorFP8ScaledMMLinearKernel)
+
 
 
 def test_b12x_tensor_fp8_can_implement_supported_config() -> None:

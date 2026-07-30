@@ -25,6 +25,7 @@ from .ScaledMMLinearKernel import (
 )
 
 
+
 def _apply_b12x_tensor_fp8_packed_linear(
     layer: torch.nn.Module,
     x_q: torch.Tensor,
@@ -49,8 +50,10 @@ def _apply_b12x_tensor_fp8_packed_linear(
         bias=bias,
         out_dtype=out_dtype,
         expected_m=max(1, int(input_2d.shape[0])),
+
     )
     return output.view(*output_shape)
+
 
 
 def warmup_b12x_tensor_fp8_linear(
@@ -60,6 +63,7 @@ def warmup_b12x_tensor_fp8_linear(
     cudagraph_capture_sizes: Iterable[int] = (),
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> int:
+
     if not current_platform.is_cuda():
         return 0
     if not current_platform.is_device_capability_family(120):
@@ -143,6 +147,7 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         cls,
         config: FP8ScaledMMLinearLayerConfig,
     ) -> tuple[bool, str | None]:
+
         activation_scale = config.activation_quant_key.scale
         weight_scale = config.weight_quant_key.scale
         if (
