@@ -454,3 +454,247 @@ def test_sparse_not_supported(mock_vllm_config):
         RocmPlatform.get_attn_backend_cls(
             selected_backend=None, attn_selector_config=attn_selector_config
         )
+
+
+# ---------------------------------------------------------------------------
+# Observability of the ROCm custom paged-attention fallback.
+#
+# ROCM_ATTN reports itself as the selected backend even when its custom paged
+# kernel cannot serve the runtime config, in which case it silently runs its
+# internal Triton path. unsupported_reason_rocm_custom_paged_attention names the
+# specific reason so the fallback is visible in the log.
+#
+# The reason function must agree with use_rocm_custom_paged_attention: whenever
+# the latter says False the former must give a reason, and vice versa. These
+# tests pin that agreement as well as the individual messages.
+# ---------------------------------------------------------------------------
+
+_IN_ENVELOPE_GFX9 = dict(
+    qtype=torch.float16,
+    head_size=128,
+    block_size=16,
+    gqa_ratio=8,
+    max_seq_len=4096,
+    sliding_window=0,
+    kv_cache_dtype="auto",
+)
+
+
+@pytest.fixture
+def clear_paged_attn_caches():
+    """Clear the ``@cache`` on both envelope helpers around each test.
+
+    Both are keyed on the config args only -- architecture is a module-level
+    constant that never changes within a real process, so caching across archs
+    cannot happen in production. Tests do patch the arch, so the caches must be
+    cleared or a patched-arch call would get a stale answer.
+    """
+    from vllm.platforms.rocm import (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    )
+
+    for fn in (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    ):
+        fn.cache_clear()
+    yield
+    for fn in (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    ):
+        fn.cache_clear()
+
+
+@pytest.fixture
+def as_gfx9():
+    """Pretend the module resolved a gfx942-class arch."""
+    with (
+        patch("vllm.platforms.rocm._ON_GFX9", True),
+        patch("vllm.platforms.rocm._ON_GFX1X", False),
+        patch("vllm.platforms.rocm._GCN_ARCH", "gfx942"),
+    ):
+        yield
+
+
+@pytest.fixture
+def as_gfx1x():
+    """Pretend the module resolved an RDNA arch (e.g. gfx1151)."""
+    with (
+        patch("vllm.platforms.rocm._ON_GFX9", False),
+        patch("vllm.platforms.rocm._ON_GFX1X", True),
+        patch("vllm.platforms.rocm._GCN_ARCH", "gfx1151"),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_fragment",
+    [
+        # Shared rejections (both architectures).
+        ({"sliding_window": 4096}, "sliding window enabled"),
+        ({"qtype": torch.float32}, "unsupported query dtype"),
+        ({"max_seq_len": 256 * 1024}, "exceeds 128K"),
+        # gfx9 envelope: head 64/128, block 16/32, GQA 1-16.
+        ({"head_size": 96}, "unsupported head size"),
+        ({"block_size": 64}, "unsupported block size"),
+        ({"gqa_ratio": 32}, "outside supported range 1-16"),
+    ],
+)
+def test_fallback_reason_gfx9(
+    overrides, expected_fragment, as_gfx9, clear_paged_attn_caches
+):
+    """Each out-of-envelope gfx9 config reports its own specific reason."""
+    from vllm.platforms.rocm import unsupported_reason_rocm_custom_paged_attention
+
+    reason = unsupported_reason_rocm_custom_paged_attention(
+        **{**_IN_ENVELOPE_GFX9, **overrides}
+    )
+    assert reason is not None
+    assert expected_fragment in reason, reason
+    # Must not be the generic message this replaced.
+    assert "falling back" not in reason.lower()
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_fragment",
+    [
+        # RDNA is strictly narrower: head must be 128, block 16, GQA 3-16,
+        # no ALiBi, unquantized KV.
+        ({"head_size": 64}, "needs 128 on this arch"),
+        ({"block_size": 32}, "needs 16 on this arch"),
+        ({"gqa_ratio": 1}, "outside supported range 3-16"),
+        ({"has_alibi_slopes": True}, "ALiBi slopes not supported"),
+        ({"kv_cache_dtype": "fp8"}, "quantized KV cache"),
+        ({"has_sinks": True}, "attention sinks enabled"),
+    ],
+)
+def test_fallback_reason_gfx1x(
+    overrides, expected_fragment, as_gfx1x, clear_paged_attn_caches
+):
+    """Each out-of-envelope RDNA config reports its own specific reason."""
+    from vllm.platforms.rocm import unsupported_reason_rocm_custom_paged_attention
+
+    reason = unsupported_reason_rocm_custom_paged_attention(
+        **{**_IN_ENVELOPE_GFX9, **overrides}
+    )
+    assert reason is not None
+    assert expected_fragment in reason, reason
+
+
+def test_no_reason_when_in_envelope_gfx9(as_gfx9, clear_paged_attn_caches):
+    """In-envelope config yields no reason, i.e. no diagnostic is emitted."""
+    from vllm.platforms.rocm import (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    )
+
+    assert unsupported_reason_rocm_custom_paged_attention(**_IN_ENVELOPE_GFX9) is None
+    # And the envelope check agrees that the custom kernel is usable.
+    assert use_rocm_custom_paged_attention(**_IN_ENVELOPE_GFX9) is True
+
+
+def test_no_reason_when_in_envelope_gfx1x(as_gfx1x, clear_paged_attn_caches):
+    """head=128 / block=16 / GQA 8 is inside the RDNA envelope too."""
+    from vllm.platforms.rocm import (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    )
+
+    assert unsupported_reason_rocm_custom_paged_attention(**_IN_ENVELOPE_GFX9) is None
+    assert use_rocm_custom_paged_attention(**_IN_ENVELOPE_GFX9) is True
+
+
+def test_unsupported_architecture_reported(clear_paged_attn_caches):
+    """Neither gfx9 nor RDNA: name the architecture rather than a condition."""
+    from vllm.platforms.rocm import unsupported_reason_rocm_custom_paged_attention
+
+    with (
+        patch("vllm.platforms.rocm._ON_GFX9", False),
+        patch("vllm.platforms.rocm._ON_GFX1X", False),
+        patch("vllm.platforms.rocm._GCN_ARCH", "gfx1030"),
+    ):
+        reason = unsupported_reason_rocm_custom_paged_attention(**_IN_ENVELOPE_GFX9)
+    assert reason is not None
+    assert "unsupported architecture" in reason
+    assert "gfx1030" in reason
+
+
+@pytest.mark.parametrize("arch_fixture", ["as_gfx9", "as_gfx1x"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"sliding_window": 4096},
+        {"qtype": torch.float32},
+        {"head_size": 96},
+        {"block_size": 64},
+        {"gqa_ratio": 32},
+        {"gqa_ratio": 1},
+        {"has_alibi_slopes": True},
+        {"kv_cache_dtype": "fp8"},
+        {"has_sinks": True},
+        {"max_seq_len": 256 * 1024},
+    ],
+)
+def test_reason_agrees_with_envelope_check(
+    arch_fixture, overrides, request, clear_paged_attn_caches
+):
+    """A reason is given exactly when the custom kernel is unusable.
+
+    Guards against the two functions drifting apart: a config the envelope
+    rejects with no reason would log "reason unavailable", and a config it
+    accepts while a reason exists would log a spurious fallback.
+    """
+    request.getfixturevalue(arch_fixture)
+    from vllm.platforms.rocm import (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    )
+
+    cfg = {**_IN_ENVELOPE_GFX9, **overrides}
+    reason = unsupported_reason_rocm_custom_paged_attention(**cfg)
+    usable = use_rocm_custom_paged_attention(
+        qtype=cfg["qtype"],
+        head_size=cfg["head_size"],
+        block_size=cfg["block_size"],
+        gqa_ratio=cfg["gqa_ratio"],
+        max_seq_len=cfg["max_seq_len"],
+        sliding_window=cfg["sliding_window"],
+        kv_cache_dtype=cfg["kv_cache_dtype"],
+        alibi_slopes=torch.zeros(1) if cfg.get("has_alibi_slopes") else None,
+        sinks=torch.zeros(1) if cfg.get("has_sinks") else None,
+    )
+    assert usable == (reason is None), (
+        f"usable={usable} but reason={reason!r} for {overrides}"
+    )
+
+
+def test_diagnostic_logs_once_per_distinct_reason(caplog):
+    """The hot-path diagnostic must not spam: once per distinct reason.
+
+    ``logger.info_once`` is backed by an ``lru_cache`` keyed on
+    ``(logger, msg, *args)``, so passing the reason as an arg gives one line per
+    distinct reason and drops every repeat -- which is what the decode path
+    needs, since it reaches this branch on every forward.
+    """
+    import logging
+
+    from vllm.logger import init_logger
+
+    logger = init_logger("test_rocm_paged_attn_fallback_once")
+    msg = "ROCm custom paged attention kernel unavailable (%s); using Triton."
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(5):
+            logger.info_once(msg, "unsupported head size (96); needs 64 or 128")
+        for _ in range(5):
+            logger.info_once(msg, "quantized KV cache (fp8) not supported on this arch")
+
+    emitted = [r for r in caplog.records if "ROCm custom paged attention" in r.message]
+    assert len(emitted) == 2, [r.message for r in emitted]
+    assert all(r.levelno == logging.INFO for r in emitted), (
+        "expected INFO: the Triton path is correct for many valid configs and "
+        "must not be surfaced as a warning"
+    )

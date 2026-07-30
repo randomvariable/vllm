@@ -420,6 +420,68 @@ if (
 
 
 @cache
+def unsupported_reason_rocm_custom_paged_attention(
+    qtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    gqa_ratio: int,
+    max_seq_len: int,
+    sliding_window: int,
+    kv_cache_dtype: str,
+    has_alibi_slopes: bool = False,
+    has_sinks: bool = False,
+) -> str | None:
+    """Why the ROCm custom paged-attention kernel cannot serve this config.
+
+    Returns a short specific reason, or ``None`` when the config is inside the
+    kernel's envelope. Kept next to :func:`use_rocm_custom_paged_attention` so
+    the two cannot drift apart, and takes booleans rather than the alibi/sink
+    tensors so the ``@cache`` key stays bounded by the config space instead of
+    growing per tensor identity.
+
+    The envelope is architecture-dependent, so the reason names the arch's
+    actual requirement rather than a generic one.
+    """
+    dtype_ok = qtype == torch.half or qtype == torch.bfloat16
+    window_ok = sliding_window == 0 or sliding_window == (-1, -1)
+
+    if not _ON_GFX9 and not _ON_GFX1X:
+        return f"unsupported architecture ({_GCN_ARCH})"
+
+    # Shared by both architectures.
+    if not window_ok:
+        return f"sliding window enabled (window={sliding_window})"
+    if not dtype_ok:
+        return f"unsupported query dtype ({qtype}); needs float16 or bfloat16"
+    if max_seq_len > 128 * 1024:
+        return f"max_seq_len {max_seq_len} exceeds 128K"
+    if has_sinks:
+        return "attention sinks enabled"
+
+    if _ON_GFX9:
+        if head_size not in (64, 128):
+            return f"unsupported head size ({head_size}); needs 64 or 128"
+        if block_size not in (16, 32):
+            return f"unsupported block size ({block_size}); needs 16 or 32"
+        if not (1 <= gqa_ratio <= 16):
+            return f"GQA ratio {gqa_ratio} outside supported range 1-16"
+        return None
+
+    # gfx11xx / gfx12xx (RDNA): a strictly narrower envelope than gfx9.
+    if head_size != 128:
+        return f"unsupported head size ({head_size}); needs 128 on this arch"
+    if block_size != 16:
+        return f"unsupported block size ({block_size}); needs 16 on this arch"
+    if not (3 <= gqa_ratio <= 16):
+        return f"GQA ratio {gqa_ratio} outside supported range 3-16 on this arch"
+    if has_alibi_slopes:
+        return "ALiBi slopes not supported on this arch"
+    if kv_cache_dtype != "auto":
+        return f"quantized KV cache ({kv_cache_dtype}) not supported on this arch"
+    return None
+
+
+@cache
 def use_rocm_custom_paged_attention(
     qtype: torch.dtype,
     head_size: int,
