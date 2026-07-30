@@ -245,6 +245,7 @@ def _get_linear_backend() -> str:
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xTensorFP8ScaledMMLinearKernel,
         B12xMxFp4LinearKernel,
         B12xMxfp8LinearKernel,
         B12xNvFp4LinearKernel,
@@ -396,6 +397,8 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xTensorFP8ScaledMMLinearKernel,
+        MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
         B12xTensorFP8ScaledMMLinearKernel,
