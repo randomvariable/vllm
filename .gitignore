@@ -41,6 +41,7 @@ build/
 !requirements/build/
 cmake-build-*/
 CMakeUserPresets.json
+compile_commands.json
 develop-eggs/
 dist/
 downloads/
