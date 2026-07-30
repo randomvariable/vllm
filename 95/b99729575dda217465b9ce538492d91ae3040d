@@ -1,0 +1,22 @@
+.dockerignore
+  s_8dde442370a8df::t_d9f78b06118a21 7-12
+homelab/strix.Dockerfile
+  s_8dde442370a8df::t_9f650bba0cb35e 157-289
+  s_8dde442370a8df::t_b7e3d12fe38ce9 156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "95b99729575dda217465b9ce538492d91ae3040d",
+  "prompts": {},
+  "sessions": {
+    "s_8dde442370a8df": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04d88aba2ffeg7WyTPfsmTgM5o",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
