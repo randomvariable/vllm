@@ -58,3 +58,12 @@ Keep `homelabs-main` close to `upstream/main` so fork changes stay small, mergea
 - Procedure: confirm the `upstream` remote points at `vllm-project/vllm`, then `git fetch upstream && git rebase upstream/main`, then force-push with lease (`git push --force-with-lease`).
 - Resolve conflicts by **preserving fork-unique work** — the SM120/SM121 CUTLASS grouped-MoE port, the vendored FlashInfer submodule and its build wiring, B12X MXFP4 integration, DeepGEMM/Spark cross-build changes, and the `homelab/` Dockerfiles. Never drop these to make a rebase "clean".
 - If a rebase hits non-trivial conflicts, stop and resolve them with fork context rather than blindly taking upstream or fork sides.
+
+## Optimise the development lifecycle daily, and build incrementally
+
+A slow edit-test loop is treated as a defect, not a cost of doing business. Rebuilding a whole image to test a source change is never acceptable as the routine path. (2026-07-30: "the development practice should force fast incremental build whenever we need to... aggressively optimise the development lifecycle daily.")
+
+- Use the **documented CMake path** in [Incremental Build Setup](./incremental_build.md) — `tools/generate_cmake_presets.py` plus a persistent build tree and `ccache` — for every C++/HIP/CUDA change. It supports both CUDA and ROCm.
+- **Review the loop daily**, alongside the upstream rebase above. If any routine step has become slow, fix the tooling before continuing feature work.
+- **Environment staleness must fail closed.** A harness that cannot find the source it is meant to test, or that silently falls back to an installed package or a fallback kernel, must error rather than report success. Prove *which* files a run actually loaded — resolved package path and compiled extension imports — before trusting a pass. Test harnesses that overlay source into a container must run pytest with `--import-mode=importlib`, otherwise the mount shadows the installed package and its compiled extensions vanish silently.
+- **Do not add another language** to solve build orchestration. This tree is already Python, C++/HIP/CUDA and Rust; dev tooling belongs in Rust (`cargo-make`, already a dependency via `setuptools-rust`). A hermetic build system such as Bazel or Pants is not justified by polyglot pain alone: the recurring costs here have been SDK packaging, cross-compilation toolchain files and artefact staleness, none of which it addresses, and it would fight the ROCm SDK's layout harder than CMake does.
