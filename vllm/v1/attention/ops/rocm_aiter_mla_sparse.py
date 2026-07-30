@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -18,9 +19,12 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
+logger = init_logger(__name__)
+
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    from vllm.platforms.rocm import _GCN_ARCH, _ON_GFX942, _ON_GFX950
 else:
+    _GCN_ARCH = ""
     _ON_GFX942 = False
     _ON_GFX950 = False
 
@@ -371,13 +375,96 @@ def paged_mqa_logits_module():
     elif find_spec("aiter.ops.triton.attention.pa_mqa_logits") is not None:
         paged_mqa_logits_module_path = "aiter.ops.triton.attention.pa_mqa_logits"
 
-    if paged_mqa_logits_module_path is not None:
-        try:
-            module = importlib.import_module(paged_mqa_logits_module_path)
-            return module
-        except ImportError:
-            return None
-    return None
+    if paged_mqa_logits_module_path is None:
+        logger.warning_once(
+            "AITER paged-MQA logits module not found; the sparse-MLA indexer "
+            "decode path falls back to the slow Torch reference. Install a "
+            "version of AITER that provides aiter.ops.triton.pa_mqa_logits."
+        )
+        return None
+
+    try:
+        return importlib.import_module(paged_mqa_logits_module_path)
+    except ImportError as e:
+        # Swallowing this silently is how a deployment lands on the Torch
+        # reference path for a reason nobody can recover from the logs.
+        logger.warning_once(
+            "Failed to import AITER paged-MQA logits module %s with %r; the "
+            "sparse-MLA indexer decode path falls back to the slow Torch "
+            "reference.",
+            paged_mqa_logits_module_path,
+            e,
+        )
+        return None
+
+
+# Route names for the paged-logits dispatch, reported once per process by
+# ``_report_paged_logits_route``.
+_PAGED_LOGITS_ROUTE_FUSED = "AITER fused deepgemm_fp8_paged_mqa_logits"
+_PAGED_LOGITS_ROUTE_STAGE1 = (
+    "AITER deepgemm_fp8_paged_mqa_logits_stage1 + torch reduction"
+)
+_PAGED_LOGITS_ROUTE_TORCH = "Torch reference fp8_paged_mqa_logits_torch"
+
+
+def _report_paged_logits_route(route: str, block_size: int) -> None:
+    """Log the selected paged-logits route once per process.
+
+    Decode runs this per request, so the message must be deduplicated. It
+    records the information needed to tell a healthy deployment from a
+    silently degraded one: which kernel path was picked, the resolved GPU
+    architecture, and the indexer cache block size that determines the
+    cache's packing layout.
+
+    Args:
+        route: Human-readable name of the selected route.
+        block_size: Indexer KV-cache block size, i.e. the size of the packed
+            block dimension. 1 selects the unpacked ``NORMAL`` layout; any
+            larger value selects the shuffled 16x16 ``SHUFFLE`` layout.
+    """
+    logger.info_once(
+        "Sparse-MLA indexer paged-logits route: %s (arch=%s, "
+        "indexer cache block_size=%d, layout=%s).",
+        route,
+        _GCN_ARCH or "unknown",
+        block_size,
+        "NORMAL" if block_size == 1 else "SHUFFLE",
+    )
+
+
+def _raise_unsupported_shuffled_layout(route: str, block_size: int) -> None:
+    """Reject a shuffled indexer cache on a route that reads it as unpacked.
+
+    ``indexer_k_quant_and_cache_triton`` writes the indexer cache in the
+    shuffled 16x16 tiled layout whenever ``block_size > 1``, and only the
+    fused AITER kernel is told about it (via ``Preshuffle``/``KVBlockSize``).
+    The stage-1 kernel takes no layout arguments and the Torch reference
+    reshapes the block flat as ``[block_size, head_dim]``, so both interpret
+    tiled bytes as row-major. That does not fail — it scores the wrong bytes
+    and returns a plausible but wrong top-k, so it must fail loudly instead.
+
+    Args:
+        route: Name of the route that cannot interpret the layout.
+        block_size: The offending indexer cache block size.
+
+    Raises:
+        NotImplementedError: Always; the caller only invokes this when the
+            layout is genuinely unsupported.
+    """
+    raise NotImplementedError(
+        f"Sparse-MLA indexer: the {route} path cannot read an indexer KV "
+        f"cache with block_size={block_size}. The cache is written in the "
+        "shuffled 16x16 tiled layout for any block_size > 1 (see "
+        "indexer_k_quant_and_cache_triton), but this path assumes the "
+        "unpacked row-major layout: the stage-1 kernel accepts no "
+        "Preshuffle/KVBlockSize arguments and the Torch reference reshapes "
+        "each block flat as [block_size, head_dim]. Scoring tiled bytes as "
+        "row-major would silently produce wrong top-k indices rather than "
+        f"an error, so it is rejected. Only the fused AITER kernel "
+        f"(gfx942/gfx950) handles this layout today. Detected arch: "
+        f"{_GCN_ARCH or 'unknown'}. Workaround: run with an indexer cache "
+        "block size of 1."
+    )
 
 
 def rocm_fp8_paged_mqa_logits(
@@ -412,16 +499,20 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
-    aiter_paged_mqa_logits_module = None
-    # if rocm_aiter_ops.is_enabled():
-    batch_size, next_n = q_fp8.shape[:2]
+    # Block dimension of the indexer KV cache. This also selects the cache's
+    # packing layout, so every route below needs it, not just the AITER ones.
     block_size = kv_cache_fp8.shape[1]
 
-    if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
+    aiter_paged_mqa_logits_module = None
+    if rocm_aiter_ops._enabled() and rocm_aiter_ops._rdna_aiter_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
+            # The fused kernel is told about the packing via Preshuffle /
+            # KVBlockSize below, so it handles block_size > 1 correctly and is
+            # deliberately left ungated.
+            _report_paged_logits_route(_PAGED_LOGITS_ROUTE_FUSED, block_size)
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
@@ -444,6 +535,9 @@ def rocm_fp8_paged_mqa_logits(
             )
             out_logits.nan_to_num_(float("-inf"))
             return out_logits
+        _report_paged_logits_route(_PAGED_LOGITS_ROUTE_STAGE1, block_size)
+        if block_size > 1:
+            _raise_unsupported_shuffled_layout(_PAGED_LOGITS_ROUTE_STAGE1, block_size)
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
@@ -464,6 +558,9 @@ def rocm_fp8_paged_mqa_logits(
         )
         return out_qk.sum(dim=0)
     else:
+        _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
+        if block_size > 1:
+            _raise_unsupported_shuffled_layout(_PAGED_LOGITS_ROUTE_TORCH, block_size)
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )

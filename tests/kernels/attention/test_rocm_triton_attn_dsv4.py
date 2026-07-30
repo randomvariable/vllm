@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -716,3 +717,302 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+# --------------------------------------------------------------------------
+# Sparse-MLA indexer dispatch observability.
+#
+# These exercise the dispatch bookkeeping in ``rocm_fp8_paged_mqa_logits``
+# (import-failure diagnostic, route diagnostic, unsupported-layout guard),
+# not any kernel, so they mock architecture and AITER availability and run
+# on CPU without AITER installed.
+# --------------------------------------------------------------------------
+
+
+def _cpu_paged_mqa_logits_args(block_size: int) -> tuple:
+    """Minimal CPU tensors shaped so dispatch reaches the route decision.
+
+    ``head_dim`` is 4 so the packed ``[block_size, head_dim + 4]`` cache keeps
+    the fp32 scale section 4-byte aligned; the Torch reference reinterprets
+    that section and would otherwise fail on alignment rather than on the
+    behaviour under test.
+    """
+    head_dim = 4
+    return (
+        torch.zeros((1, 1, 1, head_dim), dtype=torch.uint8),  # q_fp8
+        # [num_blocks, block_size, 1, head_dim + 4]
+        torch.zeros((1, block_size, 1, head_dim + 4), dtype=torch.uint8),
+        torch.zeros((1, 1), dtype=torch.float32),  # weights
+        torch.ones(1, dtype=torch.int32),  # context_lens
+        torch.zeros((1, 1), dtype=torch.int32),  # block_tables
+        torch.zeros(0, dtype=torch.int32),  # schedule_metadata
+        block_size,  # max_model_len, must cover one full block
+    )
+
+
+def _stub_paged_logits_dispatch(
+    monkeypatch,
+    mod,
+    *,
+    on_mi3xx: bool,
+    aiter_module,
+) -> None:
+    """Pin arch and AITER availability, and stub out the kernels/workspace."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(mod, "_ON_GFX942", on_mi3xx)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(mod, "paged_mqa_logits_module", lambda: aiter_module)
+
+    class _FakeWorkspaceManager:
+        def get_simultaneous(self, *shapes_and_dtypes):
+            return [
+                torch.zeros(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
+            ]
+
+    monkeypatch.setattr(
+        mod, "current_workspace_manager", lambda: _FakeWorkspaceManager()
+    )
+
+
+def _fake_fused_kernel(*args, **kwargs) -> None:
+    """Stand-in for the fused AITER kernel; records nothing, writes nothing."""
+    return None
+
+
+def _fake_stage1_kernel(*args, **kwargs) -> None:
+    return None
+
+
+def test_paged_mqa_logits_module_import_failure_is_logged_once(monkeypatch):
+    """A failed AITER import must report the underlying reason, once.
+
+    Silently returning None is how a deployment lands on the slow Torch
+    reference for a reason nobody can recover from the logs.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(
+        mod,
+        "find_spec",
+        lambda name: object() if name == "aiter.ops.triton.pa_mqa_logits" else None,
+    )
+
+    boom = ImportError("libaiter.so: cannot open shared object file")
+
+    def _raise_import_error(name):
+        raise boom
+
+    monkeypatch.setattr(mod.importlib, "import_module", _raise_import_error)
+
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        mod.logger,
+        "warning_once",
+        lambda msg, *args, **kwargs: logged.append((msg, args)),
+    )
+
+    # Bypass the lru_cache so the diagnostic is observable in-test.
+    assert mod.paged_mqa_logits_module.__wrapped__() is None
+
+    assert len(logged) == 1, "import failure must be reported exactly once"
+    msg, args = logged[0]
+    assert "Failed to import AITER paged-MQA logits module" in msg
+    # The actual exception must be recoverable from the log, not just the fact
+    # that something failed.
+    assert boom in args
+
+
+def test_paged_mqa_logits_module_is_cached_so_diagnostic_fires_once(monkeypatch):
+    """The resolver is lru_cached, so a repeated miss logs only on first call."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(mod, "find_spec", lambda name: None)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mod.logger, "warning_once", lambda msg, *a, **k: calls.append(msg)
+    )
+
+    cached = functools.lru_cache(mod.paged_mqa_logits_module.__wrapped__)
+    assert cached() is None
+    assert cached() is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "on_mi3xx,aiter_available,expected_route",
+    [
+        (True, True, "_PAGED_LOGITS_ROUTE_FUSED"),
+        (False, True, "_PAGED_LOGITS_ROUTE_STAGE1"),
+        (False, False, "_PAGED_LOGITS_ROUTE_TORCH"),
+        (True, False, "_PAGED_LOGITS_ROUTE_TORCH"),
+    ],
+)
+@torch.inference_mode()
+def test_paged_mqa_logits_reports_selected_route(
+    monkeypatch, on_mi3xx, aiter_available, expected_route
+):
+    """Each reachable route names itself, so logs distinguish the paths.
+
+    Without AITER the arch is irrelevant: both gfx942 and gfx1151 fall back to
+    the Torch reference.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = (
+        SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+        )
+        if aiter_available
+        else None
+    )
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=on_mi3xx, aiter_module=aiter_module
+    )
+
+    reported: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        mod,
+        "_report_paged_logits_route",
+        lambda route, block_size: reported.append((route, block_size)),
+    )
+
+    # block_size 1 is the supported layout on every route.
+    mod.rocm_fp8_paged_mqa_logits(*_cpu_paged_mqa_logits_args(block_size=1))
+
+    assert reported == [(getattr(mod, expected_route), 1)]
+
+
+def test_report_paged_logits_route_logs_once_with_layout(monkeypatch):
+    """The route diagnostic is deduplicated and names arch, block size, layout.
+
+    Decode calls this per request, so it must not log per request.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        mod.logger, "info_once", lambda msg, *args, **kwargs: logged.append(args)
+    )
+    monkeypatch.setattr(mod, "_GCN_ARCH", "gfx1151")
+
+    mod._report_paged_logits_route(mod._PAGED_LOGITS_ROUTE_TORCH, 1)
+
+    assert logged == [(mod._PAGED_LOGITS_ROUTE_TORCH, "gfx1151", 1, "NORMAL")]
+
+    logged.clear()
+    mod._report_paged_logits_route(mod._PAGED_LOGITS_ROUTE_FUSED, 64)
+    assert logged == [(mod._PAGED_LOGITS_ROUTE_FUSED, "gfx1151", 64, "SHUFFLE")]
+
+
+@pytest.mark.parametrize("block_size", [16, 64, 256])
+@pytest.mark.parametrize("aiter_available", [True, False])
+@torch.inference_mode()
+def test_paged_mqa_logits_rejects_shuffled_layout_off_fused_path(
+    monkeypatch, block_size, aiter_available
+):
+    """Routes that read the cache as row-major must reject block_size > 1.
+
+    The cache is written in the shuffled 16x16 layout for block_size > 1, and
+    only the fused kernel is told about it. Scoring tiled bytes as row-major
+    yields wrong top-k rather than an error, so it must raise instead.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = (
+        SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+        )
+        if aiter_available
+        else None
+    )
+    # on_mi3xx=False keeps us off the fused path in both cases.
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=False, aiter_module=aiter_module
+    )
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        mod.rocm_fp8_paged_mqa_logits(
+            *_cpu_paged_mqa_logits_args(block_size=block_size)
+        )
+
+    message = str(excinfo.value)
+    # The error must explain what is unsupported and why, not merely assert.
+    assert f"block_size={block_size}" in message
+    assert "shuffled 16x16 tiled layout" in message
+    assert "wrong top-k" in message
+    expected_route = (
+        mod._PAGED_LOGITS_ROUTE_STAGE1
+        if aiter_available
+        else mod._PAGED_LOGITS_ROUTE_TORCH
+    )
+    assert expected_route in message
+
+
+@pytest.mark.parametrize("block_size", [1, 64, 256])
+@torch.inference_mode()
+def test_paged_mqa_logits_fused_path_accepts_any_block_size(monkeypatch, block_size):
+    """The fused gfx942/gfx950 kernel handles packing, so it stays ungated.
+
+    It receives Preshuffle/KVBlockSize, so gating it would break a correct
+    path.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    seen: list[dict] = []
+
+    def _record_fused(*args, **kwargs):
+        seen.append(kwargs)
+
+    _stub_paged_logits_dispatch(
+        monkeypatch,
+        mod,
+        on_mi3xx=True,
+        aiter_module=SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits=_record_fused,
+            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+        ),
+    )
+
+    mod.rocm_fp8_paged_mqa_logits(*_cpu_paged_mqa_logits_args(block_size=block_size))
+
+    assert len(seen) == 1
+    # The layout is communicated to the kernel, which is why it is safe.
+    assert seen[0]["KVBlockSize"] == block_size
+    assert seen[0]["Preshuffle"] is (block_size > 1)
+
+
+def test_deepseek_v4_indexer_cache_block_size_is_64():
+    """Pin the reachable indexer cache block size for DeepSeek-V4 on ROCm.
+
+    ``DeepseekV4IndexerBackend`` advertises only [256], and the indexer cache
+    spec carries compress_ratio=4, so the KV tensor is built with
+    ``storage_block_size`` = 256 // 4 = 64. block_size > 1 is therefore the
+    normal case, not a hypothetical, which is what makes the guard load-bearing.
+    """
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV4IndexerBackend
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    assert DeepseekV4IndexerBackend.get_supported_kernel_block_sizes() == [256]
+
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        alignment=512,
+    )
+    assert spec.storage_block_size == 64
+
+    # initialize_kv_cache_tensors uses storage_block_size when it diverges
+    # from block_size, so this is the block dim the kernels actually see.
+    assert spec.storage_block_size != spec.block_size
+    shape = DeepseekV4IndexerBackend.get_kv_cache_shape(
+        4, spec.storage_block_size, 1, 132
+    )
+    assert shape[1] == 64
