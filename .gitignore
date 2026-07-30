@@ -257,3 +257,8 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 
 # deepwork session state (git-local, OpenCode-readable)
 .slim/deepwork/
+
+# Vendor reference material, read locally but never redistributed. AMD's ISA
+# guide forbids duplicating or passing on any part of it, and this fork is
+# public. Kept out of docs/ so the docs build never walks it.
+.slim/reference/
