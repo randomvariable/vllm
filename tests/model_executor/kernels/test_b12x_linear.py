@@ -51,6 +51,26 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
 )
 from vllm.platforms import PlatformEnum
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+    _b12x_tensor_fp8_linear,
+    warmup_b12x_tensor_fp8_linear,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
+)
+from vllm.platforms import PlatformEnum, current_platform
+from vllm.utils.b12x import b12x_warmup_token_counts
+
+
+def test_b12x_backend_maps_mxfp8_kernel() -> None:
+    assert B12xMxfp8LinearKernel in _LINEAR_BACKEND_KERNEL_MAP["b12x"]
+    assert B12xMxfp8LinearKernel in _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
+
+
+def test_b12x_backend_maps_tensor_fp8_kernel() -> None:
+    assert B12xTensorFP8ScaledMMLinearKernel in _LINEAR_BACKEND_KERNEL_MAP["b12x"]
+    assert B12xTensorFP8ScaledMMLinearKernel in _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA]
 
 
 @pytest.mark.parametrize(
@@ -161,7 +181,6 @@ def test_b12x_module_lookup_is_dynamo_safe(monkeypatch) -> None:
 
     x = torch.ones(1)
     torch.testing.assert_close(forward(x), x + 1)
-
 
 def test_b12x_tensor_fp8_can_implement_supported_config() -> None:
     config = FP8ScaledMMLinearLayerConfig(
