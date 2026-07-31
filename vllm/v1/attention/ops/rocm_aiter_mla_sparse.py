@@ -277,8 +277,23 @@ def fp8_paged_mqa_logits_torch(
 
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
+
+    def shuffled_byte_offsets(block_size: int) -> torch.Tensor:
+        token_offsets = torch.arange(block_size, device=kv_cache.device)
+        dim_offsets = torch.arange(dim, device=kv_cache.device)
+        return (
+            (token_offsets[:, None] // 16) * 16 * dim
+            + (dim_offsets[None, :] // 16) * 16 * 16
+            + (token_offsets[:, None] % 16) * 16
+            + dim_offsets[None, :] % 16
+        )
+
+    block_size = kv_cache.shape[1]
+    byte_offsets = (
+        shuffled_byte_offsets(block_size) if block_size > 1 else None
+    )
+
     if next_n == 1:
-        block_size = kv_cache.shape[1]
         logits = torch.full(
             [batch_size, max_model_len],
             float("-inf"),
@@ -303,14 +318,7 @@ def fp8_paged_mqa_logits_torch(
                 cache_value = value_region.view(dtype=fp8_dtype).to(torch.float32)
             else:
                 # The writer stores [token_tile, dim_tile, token_lane, dim_lane].
-                dims = torch.arange(dim, device=cache.device)
-                token_offsets = torch.arange(block_size, device=cache.device)
-                byte_offsets = (
-                    (token_offsets[:, None] // 16) * 16 * dim
-                    + (dims[None, :] // 16) * 16 * 16
-                    + (token_offsets[:, None] % 16) * 16
-                    + dims[None, :] % 16
-                )
+                assert byte_offsets is not None
                 cache_value = value_region[:, byte_offsets].view(dtype=fp8_dtype)
                 cache_value = cache_value.to(torch.float32)
             cache_scale = (
@@ -326,11 +334,8 @@ def fp8_paged_mqa_logits_torch(
             logits[i, :seq_len] = score[:seq_len]
         return logits
 
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
-    scale = scale.contiguous().view(torch.float)
     q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
-    num_block, block_size, _, dim = kv_cache.size()
+    kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -356,26 +361,31 @@ def fp8_paged_mqa_logits_torch(
         max_context_len = int(context_limit.max().item())
         for block_rk in range(cdiv(max_context_len, block_size)):
             block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
+            qx = q[i]
+            cache = kv_cache[block_idx, :, 0].reshape(-1)
+            value_region = cache[: block_size * dim]
+            if block_size == 1:
+                kx = value_region.view(dtype=fp8_dtype).float().reshape(1, 1, dim)
+            else:
+                assert byte_offsets is not None
+                kx = value_region[byte_offsets].view(dtype=fp8_dtype).float()
+                kx = kx.reshape(1, block_size, dim)
+            cache_scale = cache[block_size * dim :].view(torch.float32)
+            cache_scale = cache_scale.reshape(block_size)
+            kx *= cache_scale[None, :, None]
             k_offsets = torch.arange(
                 block_rk * block_size, (block_rk + 1) * block_size, device=q.device
             )
             mask = (k_offsets[None, :] < context_limit[:, None]) & (
                 k_offsets[None, :] <= q_offsets[:, None]
             )
-            s = torch.where(
-                mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
-                    logits.dtype
-                ),
-                float("-inf"),
-            )
-            s = torch.relu(s) * weight_slice[..., None]
+            s = torch.einsum("thd,kd->htk", qx, kx.squeeze(0)).to(logits.dtype)
+            s = torch.relu(s) * weight_slice[:, :, None]
             s = s.sum(dim=0)
             logits[
                 i * next_n : (i + 1) * next_n,
                 block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+            ] = torch.where(mask, s, float("-inf"))
     return logits
 
 
@@ -441,42 +451,6 @@ def _report_paged_logits_route(route: str, block_size: int) -> None:
         _GCN_ARCH or "unknown",
         block_size,
         "NORMAL" if block_size == 1 else "SHUFFLE",
-    )
-
-
-def _raise_unsupported_shuffled_layout(route: str, block_size: int) -> None:
-    """Reject shuffled indexer cache on AITER stage-1 or speculative Torch.
-
-    ``indexer_k_quant_and_cache_triton`` writes the indexer cache in the
-    shuffled 16x16 tiled layout whenever ``block_size > 1``, and only the
-    fused AITER kernel is told about it (via ``Preshuffle``/``KVBlockSize``).
-    Stage-1 takes no layout arguments. The Torch reference supports the
-    shuffled layout only for single-token decode; speculative decode still
-    lacks a safe implementation.
-
-    Args:
-        route: Name of the route that cannot interpret the layout.
-        block_size: The offending indexer cache block size.
-
-    Raises:
-        NotImplementedError: Always; the caller only invokes this when the
-            layout is genuinely unsupported.
-    """
-    if route == _PAGED_LOGITS_ROUTE_STAGE1:
-        detail = (
-            "AITER stage-1 has no Preshuffle/KVBlockSize arguments and lacks "
-            "shuffled-layout support"
-        )
-    else:
-        detail = (
-            "the Torch fallback supports shuffled layout only for next_n=1; "
-            "multi-token/speculative decode is not implemented safely"
-        )
-    raise NotImplementedError(
-        f"Sparse-MLA indexer: {detail}. block_size={block_size} selects the "
-        "shuffled 16x16 tiled layout. Detected arch: "
-        f"{_GCN_ARCH or 'unknown'}. Workaround: use next_n=1 or an indexer "
-        "cache block size of 1."
     )
 
 
@@ -550,11 +524,6 @@ def rocm_fp8_paged_mqa_logits(
             return out_logits
         batch_size, next_n, _, _ = q_fp8.shape
         if block_size > 1:
-            if next_n != 1:
-                _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
-                _raise_unsupported_shuffled_layout(
-                    _PAGED_LOGITS_ROUTE_TORCH, block_size
-                )
             _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
             return fp8_paged_mqa_logits_torch(
                 q_fp8,
@@ -586,9 +555,6 @@ def rocm_fp8_paged_mqa_logits(
         return out_qk.sum(dim=0)
     else:
         _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
-        batch_size, next_n, _, _ = q_fp8.shape
-        if block_size > 1 and next_n != 1:
-            _raise_unsupported_shuffled_layout(_PAGED_LOGITS_ROUTE_TORCH, block_size)
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )

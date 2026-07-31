@@ -944,14 +944,10 @@ def test_report_paged_logits_route_logs_once_with_layout(monkeypatch):
 
 @pytest.mark.parametrize("block_size", [16, 64, 256])
 @torch.inference_mode()
-def test_paged_mqa_logits_rejects_shuffled_layout_off_fused_path(
+def test_paged_mqa_logits_torch_handles_shuffled_layout_off_fused_path(
     monkeypatch, block_size
 ):
-    """The AITER stage-1 route must reject block_size > 1.
-
-    The stage-1 kernel has no layout arguments, so scoring tiled bytes as
-    row-major yields wrong top-k rather than an error.
-    """
+    """Non-fused shuffled layouts use the Torch implementation."""
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
     aiter_module = SimpleNamespace(
@@ -963,16 +959,16 @@ def test_paged_mqa_logits_rejects_shuffled_layout_off_fused_path(
         monkeypatch, mod, on_mi3xx=False, aiter_module=aiter_module
     )
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        mod.rocm_fp8_paged_mqa_logits(
-            *_cpu_paged_mqa_logits_args(block_size=block_size, next_n=2)
-        )
-
-    message = str(excinfo.value)
-    # The error must explain what is unsupported and why, not merely assert.
-    assert f"block_size={block_size}" in message
-    assert "shuffled 16x16 tiled layout" in message
-    assert "multi-token/speculative" in message
+    called = []
+    monkeypatch.setattr(
+        mod,
+        "fp8_paged_mqa_logits_torch",
+        lambda *args: called.append(args) or torch.empty(0),
+    )
+    args = _cpu_paged_mqa_logits_args(block_size=block_size, next_n=2)
+    result = mod.rocm_fp8_paged_mqa_logits(*args)
+    assert called
+    assert result.numel() == 0
 
 
 @torch.inference_mode()
@@ -1040,19 +1036,96 @@ def test_paged_mqa_logits_torch_reads_shuffle_layout(monkeypatch):
 
 
 @torch.inference_mode()
-def test_paged_mqa_logits_torch_rejects_multi_token_shuffle_layout(monkeypatch):
-    """Torch fallback fails closed for speculative shuffled-layout decode."""
+def test_paged_mqa_logits_torch_reads_multi_token_shuffle_layout(monkeypatch):
+    """Torch fallback reads independently packed speculative shuffled pages."""
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
+    fp8_dtype = torch.float8_e4m3fn
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(mod, "_ON_GFX942", False)
     monkeypatch.setattr(mod, "_ON_GFX950", False)
 
-    with pytest.raises(NotImplementedError, match="multi-token/speculative"):
-        mod.rocm_fp8_paged_mqa_logits(
-            *_cpu_paged_mqa_logits_args(block_size=64, next_n=2)
+    monkeypatch.setattr(mod.current_platform, "fp8_dtype", lambda: fp8_dtype)
+
+    block_size, dim, heads = 64, 128, 2
+    batch_size, next_n, max_model_len = 2, 3, 64
+    context_lens = torch.tensor([[17, 33, 64], [16, 31, 48]], dtype=torch.int32)
+    block_tables = torch.tensor([[4, 1], [7, 3]], dtype=torch.int32)
+    num_pages = 8
+
+    cache = torch.zeros((num_pages, block_size, 1, dim + 4), dtype=torch.uint8)
+    page_values: dict[int, torch.Tensor] = {}
+    for page in block_tables.flatten().unique().tolist():
+        values = torch.tensor(
+            [
+                [((page + 1) * (token + 3) * (lane + 5) % 37 - 18) / 7
+                 for lane in range(dim)]
+                for token in range(block_size)
+            ],
+            dtype=torch.float32,
         )
+        scales = torch.linspace(0.25 + page / 20, 1.5 + page / 20, block_size)
+        packed_values = values.reshape(4, 16, 8, 16).permute(0, 2, 1, 3).contiguous()
+        flat_page = cache[page, :, 0].reshape(-1)
+        flat_page[: block_size * dim] = packed_values.flatten().to(fp8_dtype).view(
+            torch.uint8
+        )
+        flat_page[block_size * dim :].view(torch.float32).copy_(scales)
+        page_values[page] = values.to(fp8_dtype).to(torch.float32) * scales[:, None]
+
+    q_values = torch.tensor(
+        [
+            [
+                [
+                    [((query + 2) * (token + 1) * (head + 3) * (lane + 1) % 31 - 15)
+                     / 11
+                     for lane in range(dim)]
+                    for head in range(heads)
+                ]
+                for token in range(next_n)
+            ]
+            for query in range(batch_size)
+        ],
+        dtype=torch.float32,
+    )
+    q = q_values.to(fp8_dtype).view(batch_size, next_n, heads, dim)
+    weights = torch.tensor(
+        [[0.5, 1.25], [0.75, 1.5], [1.0, 1.75], [0.6, 1.1], [0.9, 1.3], [1.2, 1.6]],
+        dtype=torch.float32,
+    )
+
+    actual = mod.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0, dtype=torch.int32),
+        max_model_len,
+    )
+
+    expected = torch.full(
+        (batch_size * next_n, max_model_len), float("-inf"), dtype=torch.float32
+    )
+    for batch_idx in range(batch_size):
+        for token_idx in range(next_n):
+            row = batch_idx * next_n + token_idx
+            context_len = int(context_lens[batch_idx, token_idx])
+            query = q[row // next_n, token_idx].float()
+            for position in range(context_len):
+                page_idx = int(block_tables[batch_idx, position // block_size])
+                key = page_values[page_idx][position % block_size]
+                expected[row, position] = sum(
+                    torch.relu(torch.dot(query[head], key)) * weights[row, head]
+                    for head in range(heads)
+                )
+
+    torch.testing.assert_close(actual, expected)
+    for row, context_len in enumerate(context_lens.flatten().tolist()):
+        expected_topk = torch.argsort(expected[row, :context_len], descending=True)[:8]
+        actual_topk = torch.argsort(actual[row, :context_len], descending=True)[:8]
+        torch.testing.assert_close(actual_topk, expected_topk)
 
 
 @pytest.mark.parametrize("block_size", [1, 64, 256])
