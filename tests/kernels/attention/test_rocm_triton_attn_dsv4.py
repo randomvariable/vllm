@@ -729,7 +729,9 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 # --------------------------------------------------------------------------
 
 
-def _cpu_paged_mqa_logits_args(block_size: int) -> tuple:
+def _cpu_paged_mqa_logits_args(
+    block_size: int, *, next_n: int = 1, heads: int = 1
+) -> tuple:
     """Minimal CPU tensors shaped so dispatch reaches the route decision.
 
     ``head_dim`` is 4 so the packed ``[block_size, head_dim + 4]`` cache keeps
@@ -739,10 +741,10 @@ def _cpu_paged_mqa_logits_args(block_size: int) -> tuple:
     """
     head_dim = 4
     return (
-        torch.zeros((1, 1, 1, head_dim), dtype=torch.uint8),  # q_fp8
+        torch.zeros((1, next_n, heads, head_dim), dtype=torch.uint8),  # q_fp8
         # [num_blocks, block_size, 1, head_dim + 4]
         torch.zeros((1, block_size, 1, head_dim + 4), dtype=torch.uint8),
-        torch.zeros((1, 1), dtype=torch.float32),  # weights
+        torch.zeros((next_n, heads), dtype=torch.float32),  # weights
         torch.ones(1, dtype=torch.int32),  # context_lens
         torch.zeros((1, 1), dtype=torch.int32),  # block_tables
         torch.zeros(0, dtype=torch.int32),  # schedule_metadata
@@ -783,6 +785,38 @@ def _fake_fused_kernel(*args, **kwargs) -> None:
 
 def _fake_stage1_kernel(*args, **kwargs) -> None:
     return None
+
+
+def test_paged_mqa_logits_aiter_non_mi3xx_uses_torch_for_shuffle(monkeypatch):
+    """Non-MI300 AITER dispatch uses Torch for single-token shuffle decode."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = SimpleNamespace(
+        deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+        deepgemm_fp8_paged_mqa_logits_stage1=lambda *args, **kwargs: pytest.fail(
+            "stage-1 must not handle shuffled decode"
+        ),
+    )
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=False, aiter_module=aiter_module
+    )
+    monkeypatch.setattr(
+        mod,
+        "fp8_paged_mqa_logits_torch",
+        lambda *args: torch.zeros((1, 64), dtype=torch.float32),
+    )
+    reported: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        mod,
+        "_report_paged_logits_route",
+        lambda route, block_size: reported.append((route, block_size)),
+    )
+
+    mod.rocm_fp8_paged_mqa_logits(
+        *_cpu_paged_mqa_logits_args(block_size=64, next_n=1)
+    )
+
+    assert reported == [(mod._PAGED_LOGITS_ROUTE_TORCH, 64)]
 
 
 def test_paged_mqa_logits_module_import_failure_is_logged_once(monkeypatch):
@@ -909,26 +943,20 @@ def test_report_paged_logits_route_logs_once_with_layout(monkeypatch):
 
 
 @pytest.mark.parametrize("block_size", [16, 64, 256])
-@pytest.mark.parametrize("aiter_available", [True, False])
 @torch.inference_mode()
 def test_paged_mqa_logits_rejects_shuffled_layout_off_fused_path(
-    monkeypatch, block_size, aiter_available
+    monkeypatch, block_size
 ):
-    """Routes that read the cache as row-major must reject block_size > 1.
+    """The AITER stage-1 route must reject block_size > 1.
 
-    The cache is written in the shuffled 16x16 layout for block_size > 1, and
-    only the fused kernel is told about it. Scoring tiled bytes as row-major
-    yields wrong top-k rather than an error, so it must raise instead.
+    The stage-1 kernel has no layout arguments, so scoring tiled bytes as
+    row-major yields wrong top-k rather than an error.
     """
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
-    aiter_module = (
-        SimpleNamespace(
-            deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
-            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
-        )
-        if aiter_available
-        else None
+    aiter_module = SimpleNamespace(
+        deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+        deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
     )
     # on_mi3xx=False keeps us off the fused path in both cases.
     _stub_paged_logits_dispatch(
@@ -937,20 +965,94 @@ def test_paged_mqa_logits_rejects_shuffled_layout_off_fused_path(
 
     with pytest.raises(NotImplementedError) as excinfo:
         mod.rocm_fp8_paged_mqa_logits(
-            *_cpu_paged_mqa_logits_args(block_size=block_size)
+            *_cpu_paged_mqa_logits_args(block_size=block_size, next_n=2)
         )
 
     message = str(excinfo.value)
     # The error must explain what is unsupported and why, not merely assert.
     assert f"block_size={block_size}" in message
     assert "shuffled 16x16 tiled layout" in message
-    assert "wrong top-k" in message
-    expected_route = (
-        mod._PAGED_LOGITS_ROUTE_STAGE1
-        if aiter_available
-        else mod._PAGED_LOGITS_ROUTE_TORCH
+    assert "multi-token/speculative" in message
+
+
+@torch.inference_mode()
+def test_paged_mqa_logits_torch_reads_shuffle_layout(monkeypatch):
+    """Torch fallback decodes shuffled values across token and dim tiles."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    fp8_dtype = torch.float8_e4m3fn
+    monkeypatch.setattr(mod.current_platform, "fp8_dtype", lambda: fp8_dtype)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_ON_GFX942", False)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+
+    block_size, dim, heads = 64, 128, 3
+    logical_values = torch.tensor(
+        [
+            [((token + 1) * (lane + 3) % 29 - 14) / 8 for lane in range(dim)]
+            for token in range(block_size)
+        ],
+        dtype=torch.float32,
     )
-    assert expected_route in message
+    cache = torch.zeros((1, block_size, 1, dim + 4), dtype=torch.uint8)
+    flat_page = cache.reshape(1, -1)[0]
+    # Build physical bytes independently: writer order is
+    # [token_tile, dim_tile, token_lane, dim_lane].
+    packed_values = logical_values.reshape(
+        block_size // 16, 16, dim // 16, 16
+    ).permute(0, 2, 1, 3).contiguous()
+    flat_page[: block_size * dim] = packed_values.flatten().to(fp8_dtype).view(
+        torch.uint8
+    )
+    scales = torch.linspace(0.25, 1.75, block_size)
+    flat_page[block_size * dim :].view(torch.float32).copy_(scales)
+
+    q = torch.tensor(
+        [
+            [
+                [[((head + 1) * (lane + 1) % 17 - 8) / 4 for lane in range(dim)]
+                 for head in range(heads)]
+            ]
+        ],
+        dtype=torch.float32,
+    ).to(fp8_dtype)
+    weights = torch.tensor([[0.5, 1.25, 2.0]], dtype=torch.float32)
+    logits = mod.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        torch.tensor([block_size], dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        block_size,
+    )
+    quantized_values = logical_values.to(fp8_dtype).to(torch.float32)
+    expected = torch.zeros(block_size, dtype=torch.float32)
+    for token in range(block_size):
+        for head in range(heads):
+            dot = torch.dot(
+                q[0, 0, head].to(torch.float32), quantized_values[token]
+            )
+            expected[token] = expected[token] + torch.relu(dot) * weights[0, head]
+        expected[token] *= scales[token]
+    torch.testing.assert_close(logits[0, :block_size], expected)
+
+
+@torch.inference_mode()
+def test_paged_mqa_logits_torch_rejects_multi_token_shuffle_layout(monkeypatch):
+    """Torch fallback fails closed for speculative shuffled-layout decode."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_ON_GFX942", False)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+
+    with pytest.raises(NotImplementedError, match="multi-token/speculative"):
+        mod.rocm_fp8_paged_mqa_logits(
+            *_cpu_paged_mqa_logits_args(block_size=64, next_n=2)
+        )
 
 
 @pytest.mark.parametrize("block_size", [1, 64, 256])

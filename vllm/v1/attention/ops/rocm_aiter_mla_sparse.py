@@ -298,9 +298,21 @@ def fp8_paged_mqa_logits_torch(
             pages = block_tables[i, :num_pages]
             cache = kv_cache_flat[pages]
             scale_offset = block_size * dim
-            cache_value = (
-                cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
-            )
+            value_region = cache[..., :scale_offset]
+            if block_size == 1:
+                cache_value = value_region.view(dtype=fp8_dtype).to(torch.float32)
+            else:
+                # The writer stores [token_tile, dim_tile, token_lane, dim_lane].
+                dims = torch.arange(dim, device=cache.device)
+                token_offsets = torch.arange(block_size, device=cache.device)
+                byte_offsets = (
+                    (token_offsets[:, None] // 16) * 16 * dim
+                    + (dims[None, :] // 16) * 16 * 16
+                    + (token_offsets[:, None] % 16) * 16
+                    + dims[None, :] % 16
+                )
+                cache_value = value_region[:, byte_offsets].view(dtype=fp8_dtype)
+                cache_value = cache_value.to(torch.float32)
             cache_scale = (
                 cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
             )
@@ -433,15 +445,14 @@ def _report_paged_logits_route(route: str, block_size: int) -> None:
 
 
 def _raise_unsupported_shuffled_layout(route: str, block_size: int) -> None:
-    """Reject a shuffled indexer cache on a route that reads it as unpacked.
+    """Reject shuffled indexer cache on AITER stage-1 or speculative Torch.
 
     ``indexer_k_quant_and_cache_triton`` writes the indexer cache in the
     shuffled 16x16 tiled layout whenever ``block_size > 1``, and only the
     fused AITER kernel is told about it (via ``Preshuffle``/``KVBlockSize``).
-    The stage-1 kernel takes no layout arguments and the Torch reference
-    reshapes the block flat as ``[block_size, head_dim]``, so both interpret
-    tiled bytes as row-major. That does not fail — it scores the wrong bytes
-    and returns a plausible but wrong top-k, so it must fail loudly instead.
+    Stage-1 takes no layout arguments. The Torch reference supports the
+    shuffled layout only for single-token decode; speculative decode still
+    lacks a safe implementation.
 
     Args:
         route: Name of the route that cannot interpret the layout.
@@ -451,19 +462,21 @@ def _raise_unsupported_shuffled_layout(route: str, block_size: int) -> None:
         NotImplementedError: Always; the caller only invokes this when the
             layout is genuinely unsupported.
     """
+    if route == _PAGED_LOGITS_ROUTE_STAGE1:
+        detail = (
+            "AITER stage-1 has no Preshuffle/KVBlockSize arguments and lacks "
+            "shuffled-layout support"
+        )
+    else:
+        detail = (
+            "the Torch fallback supports shuffled layout only for next_n=1; "
+            "multi-token/speculative decode is not implemented safely"
+        )
     raise NotImplementedError(
-        f"Sparse-MLA indexer: the {route} path cannot read an indexer KV "
-        f"cache with block_size={block_size}. The cache is written in the "
-        "shuffled 16x16 tiled layout for any block_size > 1 (see "
-        "indexer_k_quant_and_cache_triton), but this path assumes the "
-        "unpacked row-major layout: the stage-1 kernel accepts no "
-        "Preshuffle/KVBlockSize arguments and the Torch reference reshapes "
-        "each block flat as [block_size, head_dim]. Scoring tiled bytes as "
-        "row-major would silently produce wrong top-k indices rather than "
-        f"an error, so it is rejected. Only the fused AITER kernel "
-        f"(gfx942/gfx950) handles this layout today. Detected arch: "
-        f"{_GCN_ARCH or 'unknown'}. Workaround: run with an indexer cache "
-        "block size of 1."
+        f"Sparse-MLA indexer: {detail}. block_size={block_size} selects the "
+        "shuffled 16x16 tiled layout. Detected arch: "
+        f"{_GCN_ARCH or 'unknown'}. Workaround: use next_n=1 or an indexer "
+        "cache block size of 1."
     )
 
 
@@ -535,13 +548,27 @@ def rocm_fp8_paged_mqa_logits(
             )
             out_logits.nan_to_num_(float("-inf"))
             return out_logits
-        _report_paged_logits_route(_PAGED_LOGITS_ROUTE_STAGE1, block_size)
+        batch_size, next_n, _, _ = q_fp8.shape
         if block_size > 1:
-            _raise_unsupported_shuffled_layout(_PAGED_LOGITS_ROUTE_STAGE1, block_size)
+            if next_n != 1:
+                _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
+                _raise_unsupported_shuffled_layout(
+                    _PAGED_LOGITS_ROUTE_TORCH, block_size
+                )
+            _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
+            return fp8_paged_mqa_logits_torch(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                context_lens,
+                block_tables,
+                max_model_len,
+            )
+        _report_paged_logits_route(_PAGED_LOGITS_ROUTE_STAGE1, block_size)
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
-        batch_size, next_n, heads, _ = q_fp8.shape
+        _, _, heads, _ = q_fp8.shape
         (out_qk,) = current_workspace_manager().get_simultaneous(
             ((heads, batch_size * next_n, max_model_len), torch.float32),
         )
@@ -559,7 +586,8 @@ def rocm_fp8_paged_mqa_logits(
         return out_qk.sum(dim=0)
     else:
         _report_paged_logits_route(_PAGED_LOGITS_ROUTE_TORCH, block_size)
-        if block_size > 1:
+        batch_size, next_n, _, _ = q_fp8.shape
+        if block_size > 1 and next_n != 1:
             _raise_unsupported_shuffled_layout(_PAGED_LOGITS_ROUTE_TORCH, block_size)
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
