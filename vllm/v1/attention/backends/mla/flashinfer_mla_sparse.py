@@ -297,13 +297,21 @@ class FlashInferMLASparseMetadataBuilder(
 _fi_sparse_workspace: torch.Tensor | None = None
 
 
-def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
+def _get_workspace_buffer(
+    device: torch.device, workspace_size: int | None = None
+) -> torch.Tensor:
     global _fi_sparse_workspace
-    if _fi_sparse_workspace is None:
+    configured_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+    buffer_size = (
+        max(workspace_size, configured_size)
+        if workspace_size
+        else configured_size
+    )
+    if _fi_sparse_workspace is None or _fi_sparse_workspace.numel() < buffer_size:
         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
         _fi_sparse_workspace = torch.zeros(
-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            buffer_size,
             dtype=torch.int8,
             device=device,
         )

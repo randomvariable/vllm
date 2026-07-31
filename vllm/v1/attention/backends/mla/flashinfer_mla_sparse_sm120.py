@@ -15,6 +15,9 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseMetadata,
     _get_workspace_buffer,
 )
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    get_prefill_workspace_size,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -33,6 +36,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
     """SM120 FlashInfer sparse-MLA implementation."""
 
     is_sparse = True
+
+    @staticmethod
+    def get_workspace_size(max_model_len: int) -> int:
+        """Return SM120 FlashInfer sparse MLA workspace size in bytes."""
+        return get_prefill_workspace_size(max_model_len) * 576 * 2
 
     def __init__(
         self,
@@ -82,6 +90,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 vllm_config.model_config.hf_text_config, "model_type", None
             )
         self.kv_scale_format = _kv_scale_format_for_model(model_type)
+        self.max_model_len = vllm_config.model_config.max_model_len
 
         # Skip-topk layers are built with indexer=None and get the shared
         # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
@@ -134,7 +143,9 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         )
 
         if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
+            self._workspace_buffer = _get_workspace_buffer(
+                q.device, self.get_workspace_size(self.max_model_len)
+            )
 
         from vllm.utils.flashinfer import (
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,

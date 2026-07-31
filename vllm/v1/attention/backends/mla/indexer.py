@@ -441,15 +441,21 @@ class DeepseekV32IndexerMetadata:
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
-    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
+    is_sm120_cuda = current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(120)
+    )
+    multiplier = 8 if is_sm120_cuda else 40
+    # SM120's FlashInfer workspace uses 2 * max_model_len; non-SM12x CUDA
+    # platforms and all ROCm targets use FlashMLA's 5 * max_model_len equivalent.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
-    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
+    # The flashmla_sparse backend uses 5 * max_model_len on SM100, while the
+    # SM120 FlashInfer backend uses 2 * max_model_len.
     # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
-    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
-    # within the flashmla_sparse workspace.
+    # (576 * 2 // 132) * 5 = 40 on SM100, maximizing the workspace while still
+    # fitting within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    return max_model_len * multiplier
 
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
