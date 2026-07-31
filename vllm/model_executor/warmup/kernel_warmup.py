@@ -127,6 +127,37 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
+        spec_config = worker.vllm_config.speculative_config
+        num_spec_tokens = getattr(spec_config, "num_speculative_tokens", None)
+        if spec_config is not None and spec_config.method in ("eagle", "eagle3"):
+            drafter = getattr(worker.model_runner, "drafter", None)
+            eagle_block_size = getattr(drafter, "block_size", None)
+            if eagle_block_size is None or eagle_block_size <= 0:
+                eagle_block_size = worker.vllm_config.cache_config.block_size
+            try:
+                eagle_eagle_kernel_warmup(
+                    device=getattr(
+                        worker.model_runner, "device", torch.device("cuda")
+                    ),
+                    num_speculative_tokens=num_spec_tokens,
+                    vllm_config=worker.vllm_config,
+                    block_size=eagle_block_size,
+                    max_model_len=worker.vllm_config.model_config.max_model_len,
+                )
+            except Exception:
+                logger.warning("Skipping Eagle spec-decode warmup.", exc_info=True)
+
+        if spec_config is not None and (
+            spec_config.use_dflash() or spec_config.use_dspark()
+        ):
+            speculator = getattr(worker.model_runner, "speculator", None)
+            if speculator is not None:
+                try:
+                    dflash_kernel_warmup(speculator)
+                except Exception:
+                    logger.warning(
+                        "Skipping DFlash spec-decode warmup.", exc_info=True
+                    )
         fa4_cutedsl_warmup(worker)
         sparse_mla_triton_warmup(worker)
 

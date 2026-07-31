@@ -136,6 +136,7 @@ Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#3
 - Match existing code style
 - Minimize use of comments. Eliminate comments which are redundant, preferring legible and self-documenting code. When used, keep docstrings and comments brief and direct.
 - Assume the reader is familiar with vLLM.
+- Keep no broken windows: after every edit, inspect diagnostics and fix all reported errors, including pre-existing errors in files touched by the work. Do not declare work complete while known diagnostics remain; if an environment or dependency blocker prevents a fix, document it explicitly.
 
 ### Commit messages
 
