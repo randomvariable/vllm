@@ -1141,6 +1141,7 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
                     head_size=1,
                     dtype=torch.float32,
                 ),
+                is_eagle_group=True,
             ),
             KVCacheGroupSpec(
                 ["mamba"],
@@ -1160,6 +1161,8 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
         hash_block_size=hash_block_size,
         use_eagle=True,
     )
+    assert manager.coordinator.eagle_group_ids == {0}
+    assert not manager.coordinator.single_type_managers[1].use_eagle
 
     # The owner prefills in scheduler-split style: stop at the block boundary
     # (4), then at the prompt's last hash boundary (6, partial entries).
@@ -1177,7 +1180,17 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
     req1 = make_request("1", [7] * 6 + [9] * 2, hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
     assert num_computed == 4
-    assert all(
-        len(group) * block_size >= num_computed for group in computed_blocks.blocks
+    assert [len(group) for group in computed_blocks.blocks] == [1, 1]
+    expected_blocks = manager.block_pool.get_cached_block(
+        req1.block_hashes[1], kv_cache_group_ids=[0, 1]
     )
-    assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+    assert expected_blocks is not None
+    assert computed_blocks.blocks[0][0] is expected_blocks[0]
+    assert computed_blocks.blocks[1][0] is expected_blocks[1]
+    assert expected_blocks[1].block_hash_num_tokens == num_computed
+    new_blocks = manager.allocate_slots(req1, 4, num_computed, computed_blocks)
+    assert new_blocks is not None
+    request_blocks = manager.get_blocks("1").blocks
+    assert request_blocks[0][0] is expected_blocks[0]
+    assert request_blocks[1][0] is expected_blocks[1]
+    assert request_blocks[1][0].block_hash_num_tokens == num_computed
