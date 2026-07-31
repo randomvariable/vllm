@@ -95,25 +95,39 @@ Adding registers is free until an allocation block boundary is crossed, at
 which point the wave's block count increments, fewer waves fit per SIMD, and
 latency hiding drops discontinuously.
 
-!!! example "Measured: 216 → 224 VGPRs cost 4-17%"
-    Adding one predicated branch to a kernel raised VGPR usage from 216 to 224
-    and cost 4-17% on a saturated grid. Work it through with 24-register
-    blocks and a 1536-register file: 216 needs 9 blocks (216 registers), and
-    1536/216 gives **7 waves per SIMD**. 224 needs 10 blocks (240 registers),
-    and 1536/240 gives **6 waves per SIMD**. Eight registers bought one fewer
-    wave in flight -- a 1/7 reduction in latency-hiding capacity, which is the
-    right order for the loss measured. At low occupancy, where the SIMD was
-    not wave-limited in the first place, the same change was invisible.
+!!! example "Worked example: 216 to 224 VGPRs costs a wave"
+    Adding one predicated branch to a kernel raised VGPR usage from 216 to 224.
+    Work it through with 24-register blocks and a 1536-register file: 216 needs
+    9 blocks (216 registers), and 1536/216 gives **7 waves per SIMD**. 224 needs
+    10 blocks (240 registers), and 1536/240 gives **6 waves per SIMD**. Eight
+    registers bought one fewer wave in flight -- a 1/7 reduction in
+    latency-hiding capacity.
+
+    A regression of roughly that order was observed locally on a saturated grid
+    when this change was made, and the same change was invisible at low
+    occupancy where the SIMD was not wave-limited in the first place. That
+    observation is recorded here as motivation for the arithmetic, not as a
+    reproducible benchmark result: the kernel, shapes, driver and ROCm version
+    behind it are not captured, so treat the percentage as anecdote. The
+    block arithmetic above is the part that generalises.
 
 Two lessons generalise from this:
 
-1. **Compute your distance to the next boundary, don't guess.** Check the
+1. **Compute the distance to the next boundary, don't guess.** Check the
    compiled VGPR count (`-Rpass-analysis=kernel-resource-usage`, or the
    `.vgpr_count` metadata in the compiled object), round it up to the
    allocation block size, and divide the register file by the result. That
-   quotient -- not the raw register count -- is what changed. Under
-   24-register blocks, going from 192 to 216 registers is free (both 9
-   blocks); 216 to 224 costs a wave.
+   quotient -- not the raw register count -- is what changed.
+
+    Worked through with 24-register blocks and a 1536-register file: 192
+    registers is exactly 8 blocks (192 allocated), so 1536/192 gives **8 waves
+    per SIMD**. Anything from 193 to 216 rounds up to 9 blocks (216 allocated),
+    so 1536/216 gives **7 waves**. Anything from 217 to 240 rounds up to 10
+    blocks (240 allocated), so 1536/240 gives **6 waves**.
+
+    Growth *within* a block is therefore free -- 200 to 216 costs nothing, both
+    allocate 216 -- while one register crossing a boundary costs a wave: 192 to
+    193 drops 8 waves to 7, and 216 to 217 drops 7 to 6.
 2. **Benchmark at saturation.** Occupancy regressions are invisible on a small
    grid because there were never enough waves to be limited by wave slots.
    A microbenchmark that does not saturate the GPU will report parity for a
@@ -188,11 +202,9 @@ budget — see [conserving memory](../../configuration/conserving_memory.md#gpu-
 
 ### Out-of-range behaviour is the biggest silent-failure source
 
-Buffer addresses are range-checked against buffer size, and the failure mode is
-not a fault:
-
-> Out-of-range buffer **loads return zero**, and out-of-range **stores and
-> atomics are dropped** (ISA §9.4.1).
+Buffer addresses are range-checked against the buffer size, and the failure mode
+is not a fault: out-of-range buffer **loads return zero**, while out-of-range
+**stores and atomics are discarded** (ISA §9.4.1).
 
 Range checking is per-component for non-formatted access wider than one DWORD:
 a `B64`/`B96`/`B128` access is bounds-checked per DWORD, so a partially
@@ -302,20 +314,36 @@ Float atomics are available as LDS, buffer and flat/global/scratch operations
 
 ## Profiling on gfx1151
 
-Tooling on this target is thinner than on CDNA, and one of the gaps will hang
-your session rather than error:
+Tooling on this target is thinner than on CDNA, and in this fork's development
+environment one of the gaps hung the session rather than erroring.
 
 ```bash
 # Works: kernel-level tracing.
 rocprofv3 --kernel-trace -- <your command>
 ```
 
-!!! danger "Counter collection hangs uninterruptibly"
-    Counter collection via `rocprofv3 -i <file>` with a `pmc:` line hangs
-    indefinitely on gfx1151 and cannot be interrupted — you will need to kill
-    the session. Do not use it. `rocprof`, `rocprofv2` and
-    `rocprofiler-compute` are not installed.
+!!! danger "Counter collection hung in this fork's environment"
+    Counter collection via `rocprofv3 -i <file>` with a `pmc:` line hung
+    indefinitely and could not be interrupted, requiring the session to be
+    killed. `rocprof`, `rocprofv2` and `rocprofiler-compute` were not installed.
 
-With counters unavailable, lean on kernel-trace timings plus compiled resource
-usage (VGPR/LDS counts from the compiler) and reason about occupancy from the
-allocation rules above, rather than measuring it directly.
+    This is an observation from a single environment whose ROCm and `rocprofv3`
+    versions were not recorded -- not an established property of gfx1151 or of
+    ROCm generally. Try it if you like, but start something you are willing to
+    kill, and record the versions if it works for you.
+
+Where counters are unavailable, lean on kernel-trace timings plus compiled
+resource usage (VGPR/LDS counts from the compiler) to reason about occupancy
+from the allocation rules above, rather than measuring it directly.
+
+## Related pages
+
+This page is the target-specific reference for gfx1151. For direct contrasts
+against `sm_121a`, and for the porting procedure, see:
+
+- [Execution model: warps, waves and launch geometry](execution_model.md)
+- [Matrix units: `mma.sync` versus WMMA](matrix_units.md)
+- [Memory model: LDS, caches and unified memory](memory_model.md)
+- [Numerics: atomics, NaN handling and narrow formats](numerics.md)
+- [Toolchain, target suffixes and dispatch gating](toolchain.md)
+- [Porting workflow: SM120 to gfx1151](porting_sm120_to_gfx1151.md)

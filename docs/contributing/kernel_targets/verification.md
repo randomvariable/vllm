@@ -97,11 +97,13 @@ without one is not yet evidence — it is a measurement whose bias is unknown.
 
 ### Measure at saturation
 
-Occupancy effects only appear when the machine is wave-limited. On gfx1151 a
-register-pressure regression measured at 4-17% on a saturated grid was
-**invisible** at low occupancy, because there were never enough waves in flight
-to be limited by wave slots. Benchmark at the grid sizes you will actually
-serve.
+Occupancy effects only appear when the machine is wave-limited. A local
+observation on gfx1151: a register-pressure change that cost a wave per SIMD
+showed a clear regression on a saturated grid and was **invisible** at low
+occupancy, because there were never enough waves in flight to be limited by
+wave slots. The environment behind that observation was not captured, so treat
+it as motivation rather than as a number to compare against. Benchmark at the
+grid sizes you will actually serve.
 
 ## Profiling
 
@@ -112,13 +114,21 @@ serve.
 rocprofv3 --kernel-trace -- <your command>
 ```
 
-Counter collection via `rocprofv3 -i <file>` with a `pmc:` line **hangs
-indefinitely and uninterruptibly** on gfx1151. Do not use it. `rocprof`,
-`rocprofv2` and `rocprofiler-compute` are not installed.
+!!! danger "Counter collection hung in this fork's environment"
+    Counter collection via `rocprofv3 -i <file>` with a `pmc:` line **hung
+    indefinitely and uninterruptibly** in this fork's development environment on
+    gfx1151, requiring the session to be killed. `rocprof`, `rocprofv2` and
+    `rocprofiler-compute` were not installed there.
 
-With hardware counters unavailable, combine kernel-trace timings with compiled
-resource usage (VGPR and LDS counts from the compiler) and reason about
-occupancy analytically from the allocation granularity — see
+    This is an observation from one environment, not an established property of
+    gfx1151 or of ROCm, and the exact ROCm and `rocprofv3` versions were not
+    recorded. Try it if you like -- but start something you are willing to kill.
+    If counter collection works in your environment, record the versions and
+    say so, because the guidance below assumes it does not.
+
+Where hardware counters are unavailable, combine kernel-trace timings with
+compiled resource usage (VGPR and LDS counts from the compiler) and reason about
+occupancy analytically from the allocation granularity -- see
 [RDNA3.5 constraints](rdna35.md#vgpr-allocation-granularity-and-occupancy).
 
 ### CUDA / sm_121a
@@ -141,3 +151,11 @@ That last point deserves emphasis on these targets. Both of them silently fall
 back: gated features select generic paths, and a kernel you believe you are
 benchmarking may not be the kernel that ran. Confirm dispatch before
 interpreting any number.
+
+## Related pages
+
+- [Numerics: atomics, NaN handling and narrow formats](numerics.md) — the
+  specific numerical divergences worth writing targeted tests against.
+- [Toolchain, target suffixes and dispatch gating](toolchain.md) — how to
+  confirm which backend actually ran.
+- [Porting workflow: SM120 to gfx1151](porting_sm120_to_gfx1151.md)
