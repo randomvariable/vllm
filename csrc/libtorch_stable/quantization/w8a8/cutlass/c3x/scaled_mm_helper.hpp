@@ -30,7 +30,7 @@ void dispatch_scaled_mm(torch::stable::Tensor& c,
       if constexpr (!std::is_same_v<Int8Func, std::nullptr_t>) {
         int8_func(c, a, b, a_scales, b_scales, bias);
       } else {
-        int32_t version_num = get_sm_version_num();
+        int32_t version_num = get_sm_version_num(a.get_device_index());
         STD_TORCH_CHECK(
             false, "Int8 not supported on SM", version_num,
             ". Use FP8 quantization instead, or run on older arch (SM < 100).");
@@ -39,7 +39,7 @@ void dispatch_scaled_mm(torch::stable::Tensor& c,
   } else {
     STD_TORCH_CHECK(a_scales.dim() == 2, "a scale must be 2d tensor.");
     STD_TORCH_CHECK(b_scales.dim() == 2, "b scale must be 2d tensor.");
-    int32_t version_num = get_sm_version_num();
+    int32_t version_num = get_sm_version_num(a.get_device_index());
     if (version_num >= 90) {
       STD_TORCH_CHECK(
           a.size(0) == a_scales.size(0) &&

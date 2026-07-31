@@ -60,8 +60,8 @@ void silu_and_mul_scaled_fp4_experts_quant_sm1xxa(
 
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
-static bool nvfp4_quant_sm_supported() {
-  const int32_t sm = get_sm_version_num();
+static bool nvfp4_quant_sm_supported(int device) {
+  const int32_t sm = get_sm_version_num(device);
   #if defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
   if (sm >= 100 && sm < 120) return true;
   #endif
@@ -79,9 +79,9 @@ void scaled_fp4_quant_out(torch::stable::Tensor const& input,
                           torch::stable::Tensor& output_sf) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
-  STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
+  STD_TORCH_CHECK(nvfp4_quant_sm_supported(input.get_device_index()),
                   "No compiled nvfp4 quantization kernel for SM ",
-                  get_sm_version_num(),
+                  get_sm_version_num(input.get_device_index()),
                   ". Recompile with the appropriate CUDA arch.");
   return scaled_fp4_quant_sm1xxa(output, input, output_sf, input_sf,
                                  is_sf_swizzled_layout);
@@ -125,9 +125,9 @@ void scaled_fp4_experts_quant(
     torch::stable::Tensor const& output_scale_offset_by_experts) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
-  STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
+  STD_TORCH_CHECK(nvfp4_quant_sm_supported(input.get_device_index()),
                   "No compiled nvfp4 experts quantization kernel for SM ",
-                  get_sm_version_num(),
+                  get_sm_version_num(input.get_device_index()),
                   ". Recompile with the appropriate CUDA arch.");
   return scaled_fp4_experts_quant_sm1xxa(
       output, output_scale, input, input_global_scale, input_offset_by_experts,
@@ -143,9 +143,9 @@ void silu_and_mul_nvfp4_quant(torch::stable::Tensor& output,
                               torch::stable::Tensor& input_sf) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
-  STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
+  STD_TORCH_CHECK(nvfp4_quant_sm_supported(input.get_device_index()),
                   "No compiled silu_and_mul nvfp4 quantization kernel for SM ",
-                  get_sm_version_num(),
+                  get_sm_version_num(input.get_device_index()),
                   ". Recompile with the appropriate CUDA arch.");
   return silu_and_mul_nvfp4_quant_sm1xxa(output, output_sf, input, input_sf);
 #endif
@@ -161,10 +161,10 @@ void silu_and_mul_scaled_fp4_experts_quant(
     torch::stable::Tensor const& output_scale_offset_by_experts) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
-  STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
+  STD_TORCH_CHECK(nvfp4_quant_sm_supported(input.get_device_index()),
                   "No compiled silu_and_mul nvfp4 experts quantization kernel "
                   "for SM ",
-                  get_sm_version_num(),
+                  get_sm_version_num(input.get_device_index()),
                   ". Recompile with the appropriate CUDA arch.");
   return silu_and_mul_scaled_fp4_experts_quant_sm1xxa(
       output, output_scale, input, input_global_scale, input_offset_by_experts,

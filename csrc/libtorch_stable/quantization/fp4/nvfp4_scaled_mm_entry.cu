@@ -47,7 +47,7 @@ void cutlass_scaled_fp4_mm(torch::stable::Tensor& D,
   // Make sure we're on A's device.
   const torch::stable::accelerator::DeviceGuard device_guard(
       A.get_device_index());
-  const int32_t sm = get_sm_version_num();
+  const int32_t sm = get_sm_version_num(A.get_device_index());
 
 #if defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
   if (sm >= 100 && sm < 120) {

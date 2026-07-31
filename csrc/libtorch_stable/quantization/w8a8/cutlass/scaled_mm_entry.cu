@@ -236,7 +236,7 @@ void cutlass_scaled_mm(torch::stable::Tensor& c, torch::stable::Tensor const& a,
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       a.get_device_index());
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(a.get_device_index());
 
 #if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
   if (version_num >= 120) {
@@ -299,7 +299,7 @@ void cutlass_moe_mm(torch::stable::Tensor& out_tensors,
                     torch::stable::Tensor const& b_strides,
                     torch::stable::Tensor const& c_strides, bool per_act_token,
                     bool per_out_ch) {
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(a_tensors.get_device_index());
 #if defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120
   if (version_num >= 120 && version_num < 130) {
     cutlass_moe_mm_sm120(out_tensors, a_tensors, b_tensors, a_scales, b_scales,
@@ -342,7 +342,7 @@ void get_cutlass_moe_mm_data(
     const bool is_gated) {
   // This function currently gets compiled only if we have a valid cutlass moe
   // mm to run it for.
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(topk_ids.get_device_index());
 #if (defined ENABLE_CUTLASS_MOE_SM90 && ENABLE_CUTLASS_MOE_SM90) ||   \
     (defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100) || \
     (defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120)
@@ -364,7 +364,8 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     torch::stable::Tensor& problem_sizes1,
     torch::stable::Tensor& problem_sizes2, const int64_t n, const int64_t k,
     const bool swap_ab) {
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num =
+      get_sm_version_num(expert_first_token_offset.get_device_index());
 #if (defined ENABLE_CUTLASS_MOE_SM90 && ENABLE_CUTLASS_MOE_SM90) ||   \
     (defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100) || \
     (defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120)
@@ -388,7 +389,7 @@ void get_cutlass_batched_moe_mm_data(
     const int64_t k) {
   // This function currently gets compiled only if we have a valid cutlass moe
   // mm to run it for.
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(expert_offsets.get_device_index());
 #if (defined ENABLE_CUTLASS_MOE_SM90 && ENABLE_CUTLASS_MOE_SM90) ||   \
     (defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100) || \
     (defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120)
@@ -448,7 +449,7 @@ void cutlass_scaled_mm_azp(torch::stable::Tensor& c,
   const torch::stable::accelerator::DeviceGuard device_guard(
       a.get_device_index());
 
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(a.get_device_index());
 
 #if defined ENABLE_SCALED_MM_SM90 && ENABLE_SCALED_MM_SM90
   if (version_num >= 90) {
