@@ -1,0 +1,30 @@
+tests/kernels/attention/test_rocm_triton_attn_dsv4.py
+  s_0f754708c4fd63::t_1fec14d74ee48f 968,975
+  s_0f754708c4fd63::t_577fa6ea75791f 948,957-959,976-979,981-989,991,996-999,1007,1010,1021-1023,1025-1028,1039
+  s_0f754708c4fd63::t_87cbdb7d280934 790-821
+  s_0f754708c4fd63::t_adb0c9c2a84fe7 1000-1006
+  s_0f754708c4fd63::t_03bd7d8486d0e2 1031
+  s_0f754708c4fd63::t_b8c9bb91a3652b 732-734,744,747,980,990,993,1008-1009,1011-1020,1024,1030,1032-1038,1040-1055
+  s_0f754708c4fd63::t_090b577095f8f5 950,952-953,992,994-995
+vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+  s_0f754708c4fd63::t_1c52c8a039c226 301-315,589-590
+  s_0f754708c4fd63::t_f7c84adb404173 551,553-554,558-567,571
+  s_0f754708c4fd63::t_1fec14d74ee48f 555-557
+  s_0f754708c4fd63::t_1026721c3e99c5 448,453-455,465-474,476-479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "1092cf22a2867d5b14958d0ad0b8f260479eb1f6",
+  "prompts": {},
+  "sessions": {
+    "s_0f754708c4fd63": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04a755510ffe2MhrQW67GMY1M9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
