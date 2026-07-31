@@ -42,6 +42,53 @@ Before setting up the incremental build:
     uv pip install -r requirements/build/rocm.txt
     ```
 
+## Strix Halo cargo-make devloop
+
+For AMD Strix Halo (`gfx1151`) kernel development, repository also provides
+a containerized incremental loop driven by `cargo-make`. This path is scoped to
+ROCm on Strix Halo; CMake workflow below remains supported for general CUDA and
+ROCm development.
+
+### Prerequisites
+
+- Docker must access GPU (`/dev/kfd` and `/dev/dri`); invoking user must have
+  permission to use those devices.
+- Install `cargo-make` (`cargo install cargo-make`) and run from repository root.
+
+Devloop refuses to run when Docker, GPU devices, devtools image, or either named
+volume is unavailable. It prints image and checkout provenance before
+build/test actions, and test lane probes that mounted checkout Python and
+compiled extensions are the ones being tested. This fail-closed behavior avoids
+treating stale installed package as passing test.
+
+### Commands
+
+```console
+# Check prerequisites and in-container provenance
+cargo make doctor
+
+# Build devtools image and create persistent volumes if needed
+cargo make setup
+
+# Incrementally build HIP/C++ extensions
+cargo make build
+
+# Pass targeted pytest paths and flags through unchanged
+cargo make test -- tests/kernels/attention/test_prefix_prefill.py -k sliding_window
+```
+
+Build artifacts and compiler cache persist in deterministic checkout-scoped Docker
+volumes (names start with `vllm-strix-build-` and `vllm-strix-ccache-`); containers
+remain disposable. This prevents CMake state containing absolute paths from being
+shared across clones. The test lane runs `vllm-hip-build` first, letting Ninja
+rebuild changed sources while keeping current trees as no-ops, then runs pytest
+only after that build succeeds. Use `cargo make build -- -j 8` to pass build
+arguments. Do not run bare `cargo make test`: devloop requires explicit pytest
+arguments.
+
+Compatibility wrapper `homelab/rocm-dev-test.sh` remains available for existing
+scripts, but new commands should use `cargo make test`.
+
 ## Setting up the CMake Build Environment
 
 The incremental build process is managed through CMake. You can configure your build settings using a `CMakeUserPresets.json` file at the root of the vLLM repository.

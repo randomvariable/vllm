@@ -29,6 +29,9 @@ if [ "$#" -eq 0 ]; then
     exit 2
 fi
 
+echo "warning: ${BASH_SOURCE[0]##*/} is deprecated; use cargo make test -- <pytest args...>" >&2
+echo "warning: compatibility wrapper preserves legacy argument semantics" >&2
+
 for dev in /dev/kfd /dev/dri; do
     if [ ! -e "$dev" ]; then
         echo "error: $dev missing; this host has no usable AMD GPU" >&2
