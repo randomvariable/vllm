@@ -101,7 +101,15 @@ def process_weights_after_loading(
     # loaded, but it is identical to the input embeddings.
     maybe_retie_word_embeddings(model, model_config)
 
-    for _, module in model.named_modules():
+    modules = sorted(
+        model.named_modules(),
+        key=lambda named_module: getattr(
+            getattr(named_module[1], "quant_method", None),
+            "process_weights_after_loading_priority",
+            0,
+        ),
+    )
+    for _, module in modules:
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
