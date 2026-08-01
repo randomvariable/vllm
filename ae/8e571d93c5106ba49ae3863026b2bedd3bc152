@@ -1,0 +1,41 @@
+tests/v1/worker/test_mamba_utils.py
+  s_c1268505944957::t_6f00abb701ab8a 192-195,197-202
+  s_c1268505944957::t_47e327f58f5019 204-207
+  s_c1268505944957::t_5f2d6bd08e3915 170-174
+  s_ba79a87b2fe3fa::t_c30d41fb9730a9 18,232
+  s_5e1f7782d76154::t_9aaed3894247b5 155-162,167-169,175,178-191,203,208-209
+  s_c1268505944957::t_79bb976e295c97 5,353
+  s_c1268505944957::t_1701c4200f9bac 163-166,176-177,196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "ae8e571d93c5106ba49ae3863026b2bedd3bc152",
+  "prompts": {},
+  "sessions": {
+    "s_5e1f7782d76154": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_043ff50c9ffe5hJjdxZE7as34p",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_ba79a87b2fe3fa": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_043f66e57ffeKeIkis75vZn76F",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_c1268505944957": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_043e6a307ffe2cKJiwdbRqsD3V",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
