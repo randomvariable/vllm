@@ -3,6 +3,10 @@ vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
   s_3c644cf33f69a1::t_9779ea6710aa07 652,654
   s_3c644cf33f69a1::t_b41af97e117b70 685-686,690-691,694-695,698
   s_3c644cf33f69a1::t_54e2b2cf7a6d17 391-392
+vllm/platforms/__init__.py
+  s_f005c5699009e4::t_7d08c4d46a41a9 110-129,148-150
+vllm/platforms/rocm.py
+  s_f005c5699009e4::t_7d08c4d46a41a9 189-212,222-230
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -143,6 +147,14 @@ vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
         "tool": "opencode",
         "id": "ses_04a7fe82fffeLsZHuGG87plcs9",
         "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_f005c5699009e4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04559b73fffeOF1ye8mg4wNr1y",
+        "model": "gpt-5.6-terra"
       },
       "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
     },
