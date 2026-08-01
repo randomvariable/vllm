@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 import torch
 
-from tests.utils import single_gpu_only
-from vllm import LLM, SamplingParams
+from tests.utils import large_gpu_mark, single_gpu_only
+from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.platforms import current_platform
 
@@ -151,5 +151,65 @@ def test_mtp_correctness(
         # Upon failure, inspect the outputs to check for inaccuracy.
         assert matches > int(0.8 * len(ref_outputs))
         del spec_llm
+        torch.accelerator.empty_cache()
+        cleanup_dist_env_and_memory()
+
+
+@single_gpu_only
+@large_gpu_mark(min_gb=20)
+def test_mtp_hybrid_prefix_cache_reuse():
+    """MTP on Qwen3.5 reuses aligned hybrid-model prefix-cache blocks."""
+    if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1":
+        pytest.skip("Qwen3.5 hybrid models are unsupported by Model Runner V2")
+
+    model = "Qwen/Qwen3.5-0.8B-Base"
+    engine_kwargs = {
+        "model": model,
+        "max_model_len": 2048,
+        "max_num_seqs": 1,
+        "enforce_eager": True,
+        "trust_remote_code": True,
+        "mamba_cache_mode": "align",
+        "speculative_config": {
+            "method": "mtp",
+            "model": model,
+            "num_speculative_tokens": 1,
+        },
+        "limit_mm_per_prompt": {"image": 0, "video": 0},
+    }
+    sampling_params = SamplingParams(temperature=0, max_tokens=2)
+    cold_llm = LLM(**engine_kwargs, enable_prefix_caching=False)
+    try:
+        tokenizer = cold_llm.get_tokenizer()
+        block_size = cold_llm.llm_engine.vllm_config.cache_config.block_size
+        prefix_ids = tokenizer.encode(
+            "Prefix cache regression. " * (block_size * 2)
+        )[: block_size * 2]
+        suffix_a = tokenizer.encode(" Answer with alpha.")
+        suffix_b = tokenizer.encode(" Answer with beta.")
+        prompt_a = TokensPrompt(prompt_token_ids=prefix_ids + suffix_a)
+        prompt_b = TokensPrompt(prompt_token_ids=prefix_ids + suffix_b)
+        cold_b = cold_llm.generate([prompt_b], sampling_params)[0]
+    finally:
+        del cold_llm
+        torch.accelerator.empty_cache()
+        cleanup_dist_env_and_memory()
+
+    llm = LLM(**engine_kwargs, enable_prefix_caching=True)
+    try:
+        llm.generate([prompt_a], sampling_params)
+        first_b = llm.generate([prompt_b], sampling_params)[0]
+        second_b = llm.generate([prompt_b], sampling_params)[0]
+        third_b = llm.generate([prompt_b], sampling_params)[0]
+
+        assert first_b.num_cached_tokens >= len(prefix_ids)
+        assert second_b.num_cached_tokens == first_b.num_cached_tokens
+        assert third_b.num_cached_tokens == second_b.num_cached_tokens
+        cold_tokens = cold_b.outputs[0].token_ids
+        assert first_b.outputs[0].token_ids == cold_tokens
+        assert second_b.outputs[0].token_ids == cold_tokens
+        assert third_b.outputs[0].token_ids == cold_tokens
+    finally:
+        del llm
         torch.accelerator.empty_cache()
         cleanup_dist_env_and_memory()
