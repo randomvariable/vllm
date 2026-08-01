@@ -1,0 +1,23 @@
+.gitignore
+  s_417621c3aaae3e::t_6c710f4f1719dc 44
+.devcontainer/devcontainer.json
+  s_417621c3aaae3e::t_d27b4d22804d3b 1-48
+.devcontainer/postattach.sh
+  s_417621c3aaae3e::t_45ccfd5e6d0081 1-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "4d0e6800212e87fb3db5355c107d4217c7714038",
+  "prompts": {},
+  "sessions": {
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
