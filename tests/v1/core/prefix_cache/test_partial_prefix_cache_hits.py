@@ -5,6 +5,7 @@
 on partial hits, and same-step deferral."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -12,12 +13,14 @@ import torch
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
     KVCacheBlockCopy,
     get_block_hash,
     get_group_id,
     init_none_hash,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -31,6 +34,13 @@ def _auto_init_hash_fn():
     init_none_hash(sha256)
 
 
+def _mamba_dtypes() -> tuple[torch.dtype]:
+    # MambaSpec currently annotates this as a singleton tuple, while its
+    # shapes/dtypes pairing requires one dtype per state shape.
+    dtypes: tuple[torch.dtype, ...] = (torch.float32, torch.float32)
+    return cast(tuple[torch.dtype], dtypes)
+
+
 def test_mamba_align_split_partial_tail_schedule():
     """Chunk ends with partial hits on: block-aligned chunks, one extra stop
     at the prompt's last hash boundary (registering the partial tail), then
@@ -38,14 +48,14 @@ def test_mamba_align_split_partial_tail_schedule():
     0 -> 8192 -> 9728 -> 9984 -> 10000."""
     block_size = 512
     hash_block_size = 32
-    mock = SimpleNamespace(
+    mock = cast(Scheduler, SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
         hash_block_size=hash_block_size,
         mamba_partial_cache_hit=True,
-    )
+    ))
     split = Scheduler._mamba_block_aligned_split
 
     req = make_request("0", [0] * 10000, hash_block_size, sha256)
@@ -82,14 +92,14 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     block_size = 11392
     token_budget = 8192
     prompt_length = 30000
-    mock = SimpleNamespace(
+    mock = cast(Scheduler, SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
-    )
+    ))
     req = make_request("0", [0] * prompt_length, 32, sha256)
     split = Scheduler._mamba_block_aligned_split
 
@@ -118,7 +128,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     token_budget = 8192
     long_prefill_threshold = 384
     prompt_length = 1300
-    mock = SimpleNamespace(
+    mock = cast(Scheduler, SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
@@ -127,7 +137,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         use_eagle=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
-    )
+    ))
     req = make_request("0", [0] * prompt_length, 32, sha256)
     split = Scheduler._mamba_block_aligned_split
 
@@ -169,8 +179,8 @@ def test_hybrid_mamba_align_partial_hash_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=mamba_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -228,7 +238,7 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     hash_block_size = 2
     block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(
-        num_blocks=24,
+        num_blocks=64,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -244,8 +254,8 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -292,6 +302,7 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     )
     assert moved is not None
     assert moved[0].block_id == cow_copy.dst_block_id
+    assert moved[0].block_hash is not None
     assert get_block_hash(moved[0].block_hash) == partial_mamba_hash
     assert get_group_id(moved[0].block_hash) == 1
     assert moved[0].block_hash_num_tokens == 6
@@ -320,8 +331,8 @@ def test_take_partial_tail_offloads_returns_cow_target():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -400,8 +411,8 @@ def test_partial_tail_pin_survives_released_cow_retention():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -461,8 +472,8 @@ def test_partial_tail_offload_dropped_when_request_freed_before_drain():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -508,8 +519,8 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -556,8 +567,8 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
                 ["mamba"],
                 MambaSpec(
                     block_size=2 * hash_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -573,6 +584,7 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     blocks, num_computed, _ = manager.get_computed_blocks(producer)
     assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
     manager.free(producer)
+    manager.take_partial_tail_offloads()
     manager.new_step_starts()
 
     consumer = make_request(
@@ -588,6 +600,182 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     assert [len(group) for group in truncated.blocks] == [2, 1]
     assert truncated.blocks[1][0].is_null
     assert [len(group) for group in blocks.blocks] == [3, 2]
+
+
+@pytest.mark.cpu_test
+def test_hybrid_partial_prefix_reuse_does_not_accumulate_request_metadata():
+    """Repeated producer/consumer reuse releases all per-request metadata."""
+    hash_block_size = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=2 * hash_block_size,
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    mamba_manager = cast(
+        MambaManager, manager.coordinator.single_type_managers[1]
+    )
+    expected_cached_blocks = [3, 2]
+
+    def physical_snapshot():
+        """Capture all BlockPool state that reuse cycles may mutate."""
+        free_id_list = [
+            block.block_id
+            for block in manager.block_pool.free_block_queue.get_all_free_blocks()
+        ]
+        assert len(free_id_list) == len(set(free_id_list))
+        queued_ids = set(free_id_list)
+        free_ids = tuple(sorted(queued_ids))
+        expected_queued_ids = {
+            block.block_id
+            for block in manager.block_pool.blocks
+            if not block.is_null and block.ref_cnt == 0
+        }
+        assert queued_ids == expected_queued_ids
+        assert len(free_id_list) == len(expected_queued_ids)
+        cached_mappings = tuple(
+            sorted(
+                (
+                    block_id,
+                    tuple(sorted(map(repr, hashes))),
+                )
+                for block_id, hashes in (
+                    manager.block_pool.cached_block_hashes_by_block.items()
+                )
+            )
+        )
+        hash_to_block = tuple(
+            sorted(
+                (
+                    repr(block_hash),
+                    tuple(
+                        sorted(
+                            block.block_id
+                            for block in (
+                                blocks.values()
+                                if isinstance(blocks, dict)
+                                else [blocks]
+                            )
+                        )
+                    ),
+                )
+                for block_hash, blocks in (
+                    manager.block_pool.cached_block_hash_to_block._cache.items()
+                )
+            )
+        )
+        blocks = tuple(
+            (
+                block.block_id,
+                repr(block.block_hash),
+                block.block_hash_num_tokens,
+                block.ref_cnt,
+                block.is_null,
+            )
+            for block in manager.block_pool.blocks
+            if not block.is_null
+        )
+        return free_ids, cached_mappings, hash_to_block, blocks
+
+    def assert_no_request_metadata() -> None:
+        for single_type_manager in manager.coordinator.single_type_managers:
+            assert not single_type_manager.req_to_blocks
+            assert not single_type_manager.num_cached_block
+            assert not single_type_manager._partial_hit_reqs
+        assert not mamba_manager._allocated_block_reqs
+        assert not mamba_manager.last_state_block_idx
+        assert not mamba_manager._producer_partial_tail_reqs
+        assert not mamba_manager._pending_partial_tail_offloads
+
+    producer = make_request(
+        "producer", [0, 0, 1, 1, 2, 2], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
+    producer.num_computed_tokens = 6
+    producer.append_output_token_ids([3])
+    assert manager.allocate_slots(producer, 1) is not None
+    _, retained_blocks = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained_blocks)
+    partial_tail_offloads = manager.take_partial_tail_offloads()
+    assert partial_tail_offloads[producer.request_id]
+    assert producer.request_id in manager._partial_tail_pins
+    manager.free(producer)
+    manager.new_step_starts()
+
+    # Producer handoff plus three consumer cycles are the explicit warm-up:
+    # cache promotion settles before the repeated steady-state proof begins.
+    warmup_cycles = 3
+    expected_warmed_snapshot = None
+    for cycle in range(warmup_cycles + 5):
+        consumer = make_request(
+            "consumer",
+            [0, 0, 1, 1, 2, 2, 3, 3],
+            hash_block_size,
+            sha256,
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+        assert num_computed == 6
+        assert [len(group) for group in blocks.blocks] == expected_cached_blocks
+        assert blocks.blocks[1][0].is_null
+        assert manager.allocate_slots(
+            consumer,
+            1,
+            num_computed,
+            blocks,
+            delay_cache_blocks=True,
+        ) is not None
+        _, retained_blocks = manager.take_kv_cache_block_copies()
+        manager.block_pool.free_blocks(retained_blocks)
+        manager.take_partial_tail_offloads()
+        manager.free(consumer)
+        manager.new_step_starts()
+
+        assert_no_request_metadata()
+        assert not manager._partial_tail_pins
+        physical = physical_snapshot()
+        if cycle == warmup_cycles - 1:
+            expected_warmed_snapshot = physical
+        elif cycle >= warmup_cycles:
+            assert expected_warmed_snapshot is not None
+            assert physical == expected_warmed_snapshot
+
+    final_consumer = make_request(
+        "final-consumer", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(final_consumer)
+    assert num_computed == 6
+    assert [len(group) for group in blocks.blocks] == expected_cached_blocks
+    assert blocks.blocks[1][0].is_null
+    assert_no_request_metadata()
+    assert not manager._partial_tail_pins
+    assert expected_warmed_snapshot is not None
+    assert physical_snapshot() == expected_warmed_snapshot
 
 
 def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
@@ -610,8 +798,8 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -690,8 +878,8 @@ def test_hybrid_mamba_moved_partial_entry_defers_same_step_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -749,8 +937,8 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -823,8 +1011,8 @@ def test_hybrid_partial_hit_cow_target_starts_uncached():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -906,8 +1094,8 @@ def test_hybrid_partial_hash_truncates_full_attention_hit_length():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -980,8 +1168,8 @@ def test_cow_retained_blocks_returned_for_release():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),
@@ -1017,15 +1205,18 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     from collections import deque
 
     freed: list = []
-    blocks = [SimpleNamespace(block_id=7), SimpleNamespace(block_id=9)]
-    mock = SimpleNamespace(
+    blocks = cast(
+        list[KVCacheBlock],
+        [SimpleNamespace(block_id=7), SimpleNamespace(block_id=9)],
+    )
+    mock = cast(Scheduler, SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             block_pool=SimpleNamespace(free_blocks=freed.extend)
         ),
         deferred_frees=deque(),
         defer_block_free=True,
         processed_step_seq=2,
-    )
+    ))
     free = Scheduler._free_cow_retained_blocks
 
     # Copy step still in flight: deferred with its fence.
@@ -1147,8 +1338,8 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
+                    shapes=((1,), (1,)),
+                    dtypes=_mamba_dtypes(),
                     mamba_cache_mode="align",
                 ),
             ),

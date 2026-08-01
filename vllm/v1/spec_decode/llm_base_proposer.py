@@ -54,10 +54,10 @@ from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
-    eagle_prepare_inputs_padded_kernel,
-    eagle_prepare_next_token_padded_kernel,
     eagle_step_update_slot_mapping_and_metadata,
     extend_all_queries_by_N,
+    get_eagle_prepare_inputs_kernel,
+    get_eagle_prepare_next_token_kernel,
     next_power_of_2,
 )
 from vllm.v1.utils import CpuGpuBuffer
@@ -1082,12 +1082,9 @@ class SpecDecodeBaseProposer:
         next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
         valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
 
-        # Kernel grid: one program per request (row)
-        grid = (batch_size,)
-
         # Find the next power of 2 for block sizes
         BLOCK_SIZE_TOKENS = next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
+        get_eagle_prepare_next_token_kernel()(
             sampled_token_ids,
             discard_request_mask,
             backup_tokens_gpu,
@@ -1126,8 +1123,7 @@ class SpecDecodeBaseProposer:
             (num_reqs,), dtype=torch.int32, device=device
         )
 
-        grid = (num_reqs,)
-        eagle_prepare_inputs_padded_kernel[grid](
+        get_eagle_prepare_inputs_kernel()(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
             common_attn_metadata.query_start_loc,
