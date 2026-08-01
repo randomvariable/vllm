@@ -1,0 +1,61 @@
+vllm/platforms/rocm.py
+  s_b10c7abf90135d::t_643a7511b16bd5 96
+tests/platforms/test_rocm.py
+  s_b10c7abf90135d::t_112b2b8b00b93d 19,23-24,27,31,36,43,48-49,52,55,60,63-70
+  s_9d4ab468459336::t_6efad4d6cbcc61 1-5,8-9,12-14,34-35,50-51,53-54,56-59,61-62,71
+  s_de71b96cc1bb4d::t_54e93b10407c97 6-7
+  s_de71b96cc1bb4d::t_4ac54983d7dc97 10-11,15-18,20-22,25-26,28-30,32-33,37-42,44-47
+tests/utils.py
+  s_e83a2953cb2d7e::t_e49fda2eef9bc9 609,616,1586-1587
+  s_e83a2953cb2d7e::t_6e79cbb4cf934b 91-94,103-108,115-117,119,122,596-601,1572-1579,1588-1589
+  s_91bab85612975f::t_1bcb63321c48e8 95,97-102
+  s_e83a2953cb2d7e::t_19dc087d8ebe55 96,602-607,1580-1585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "b1a4caf8317abb3a26afaac53501ea21a9d080c0",
+  "prompts": {},
+  "sessions": {
+    "s_91bab85612975f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_040ff1b79ffeqLHLQBS1mAWRsd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_9d4ab468459336": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0424de66affe1bD241Kl6LUYwE",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_b10c7abf90135d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0422cbbe3ffe5j9XpjhTaSWx55",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_de71b96cc1bb4d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0424409e9ffeaQetEl8N6hhdkI",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_e83a2953cb2d7e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_040de3794ffeU37nRjqD4AkLrN",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
