@@ -1,0 +1,39 @@
+vllm/model_executor/layers/quantization/fp8.py
+  s_ca13a20438278d::t_095911351928a5 521-524
+tests/quantization/test_fp8_moe_oracle.py
+  s_771c408e950c76::t_fafdbed87e5d25 1-4,7-8,10,12-20,23,26-30,32-33,35-68,70-113,125-126
+  s_771c408e950c76::t_6ec9df898fa17d 24
+  s_ca13a20438278d::t_0dac8987af6b3d 160-161
+  s_ca13a20438278d::t_482496f68a1876 5-6
+  s_771c408e950c76::t_e176f7444f58a9 25
+  s_771c408e950c76::t_74d324ae7f1b09 31
+  s_ca13a20438278d::t_f45d74b8daa353 114-124
+  s_ca13a20438278d::t_b72ffcead85afa 21
+  s_ca13a20438278d::t_1892cc9f23b958 9,22,127-159,162-165
+  s_ca13a20438278d::t_095911351928a5 11,34
+  s_771c408e950c76::t_03b52de32d421b 69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "b4a7fca1f728e6b89e3f3429a878e6110acdccc8",
+  "prompts": {},
+  "sessions": {
+    "s_771c408e950c76": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_045304918ffeNzbPdBwyf19TYG",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_ca13a20438278d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_045282932fferAv23kcQgNO03z",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
