@@ -91,6 +91,7 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
     dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
@@ -443,6 +444,7 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.is_amx_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
     layer.impl = SimpleNamespace(process_weights_after_loading=lambda act_dtype: None)
@@ -576,6 +578,7 @@ def test_b12x_absorb_bmm_unsupported_pack_uses_materialized_pair(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
 
@@ -1469,6 +1472,7 @@ def test_mla_query_absorb_safe_bmm_fallback_materializes_input(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.use_safe_mla_query_bmm = True
     layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.is_aiter_triton_fp4_bmm_enabled = False
@@ -1585,6 +1589,7 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.force_contiguous_mla_bmm_input = False
     layer.use_safe_mla_query_bmm = False
     layer.force_contiguous_mla_bmm_output = False
@@ -1669,6 +1674,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.force_contiguous_mla_bmm_input = False
     layer.use_safe_mla_query_bmm = False
     layer.is_aiter_triton_fp4_bmm_enabled = False
