@@ -6,7 +6,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -16,6 +16,12 @@ from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
+)
+from vllm.model_executor.warmup.dflash_spec_decode_warmup import (
+    dflash_kernel_warmup,
+)
+from vllm.model_executor.warmup.eagle_spec_decode_warmup import (
+    eagle_eagle_kernel_warmup,
 )
 from vllm.model_executor.warmup.fa4_cutedsl_warmup import (
     fa4_cutedsl_warmup,
@@ -302,7 +308,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # When autotuning with number of tokens m, flashinfer will autotune
     # operations for all number of tokens up to m, so we only need to
     # run with the max number of tokens.
-    dummy_run_kwargs = dict(
+    dummy_run_kwargs: dict[str, Any] = dict(
         num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
@@ -334,7 +340,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     else:
         write_flashinfer_autotune_cache(cache_path, tune_results)
         world.barrier()
-        from flashinfer.autotuner import AutoTuner
+        from flashinfer.autotuner import (  # pyright: ignore[reportMissingImports]
+            AutoTuner,
+        )
 
         AutoTuner.get().load_configs(str(cache_path))
         logger.info_once(
