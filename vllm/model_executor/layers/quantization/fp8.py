@@ -495,7 +495,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             config=self.moe,
             weight_key=weight_key,
             activation_key=activation_key,
-            allow_vllm_cutlass=False,
+            allow_vllm_cutlass=(
+                not self.block_quant
+                and self.quant_config.activation_scheme == "dynamic"
+            ),
         )
 
     def create_weights(
