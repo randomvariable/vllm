@@ -93,7 +93,7 @@ def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     # This can be removed and simply replaced with torch.cuda.get_device_count
     # after https://github.com/pytorch/pytorch/pull/122815 is released."""
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
-    # LRU Cache purposes.
+    # LRU cache purposes.
 
     # Code below is based on
     # https://github.com/pytorch/pytorch/blob/
