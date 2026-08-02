@@ -56,6 +56,7 @@ class KVReplayRequest:
     computed_group_block_ids: tuple[tuple[int, ...], ...]
     group_block_ids: tuple[tuple[int, ...], ...]
     group_block_refs: tuple[tuple[tuple[int, int], ...], ...]
+    pre_free_group_block_refs: tuple[tuple[tuple[int, int], ...], ...]
     post_free_group_block_refs: tuple[tuple[tuple[int, int], ...], ...]
 
 
@@ -170,6 +171,9 @@ def replay_trace(
                         computed_group_block_ids=empty_groups,
                         group_block_ids=empty_groups,
                         group_block_refs=tuple(() for _ in empty_groups),
+                        pre_free_group_block_refs=tuple(
+                            () for _ in empty_groups
+                        ),
                         post_free_group_block_refs=tuple(() for _ in empty_groups),
                     )
                 )
@@ -249,6 +253,9 @@ def replay_trace(
                     ),
                     group_block_ids=group_block_ids,
                     group_block_refs=group_block_refs,
+                    pre_free_group_block_refs=tuple(
+                        () for _ in range(manager.num_kv_cache_groups)
+                    ),
                     post_free_group_block_refs=tuple(
                         () for _ in range(manager.num_kv_cache_groups)
                     ),
@@ -312,6 +319,13 @@ def replay_trace(
             index = request_results.index(request_result)
             request_results[index] = replace(
                 request_result,
+                pre_free_group_block_refs=tuple(
+                    tuple(
+                        (block_id, before_ref)
+                        for _, block_id, before_ref in group
+                    )
+                    for group in pre_free_refs
+                ),
                 post_free_group_block_refs=tuple(
                     tuple((block_id, block.ref_cnt) for block, block_id, _ in group)
                     for group in pre_free_refs

@@ -73,8 +73,11 @@ def test_small_pool_pressure_is_deterministic_and_order_sensitive() -> None:
     assert reverse["b"].group_block_ids == ((1, 2, 3, 4),)
     assert len(set(reverse["b"].group_block_ids[0])) == 4
     assert all(block_id != 0 for block_id in reverse["b"].group_block_ids[0])
+    assert reverse["b"].computed_group_block_ids == ((),)
     assert not reverse["a"].admitted
     assert reverse["a"].recomputed_tokens == 0
+    assert reverse["a"].per_group_cache_block_ids == ((),)
+    assert reverse["a"].computed_group_block_ids == ((),)
     assert reverse["a"].group_block_ids == ((),)
     assert outcomes["a"].group_block_refs == (((1, 1), (2, 1), (3, 1), (4, 1)),)
     outcomes_a = {
@@ -101,6 +104,11 @@ def test_same_step_prefix_sharing_releases_each_owner() -> None:
     shared = set(first.computed_group_block_ids[0])
     assert shared
     assert set(shared) == set(first.group_block_ids[0]) & set(second.group_block_ids[0])
+    assert tuple(
+        (block_id, ref)
+        for block_id, ref in first.pre_free_group_block_refs[0]
+        if block_id in shared
+    ) == tuple((block_id, 2) for block_id in shared)
     assert tuple(
         (block_id, ref)
         for block_id, ref in first.post_free_group_block_refs[0]
@@ -218,6 +226,11 @@ def test_hybrid_replay_preserves_sparse_shared_prefix_boundary() -> None:
         != cleared_probe.per_group_cache_block_ids[1]
     )
     assert normal_probe.per_group_cache_block_ids[1][-1] != 0
+    assert normal_probe.prefix_hit_tokens > cleared_probe.prefix_hit_tokens
+    assert normal_probe.recomputed_tokens < cleared_probe.recomputed_tokens
+    assert normal_probe.computed_group_block_ids[0] == (1, 2, 3, 4, 5)
+    assert cleared_probe.computed_group_block_ids == ((), (), ())
+    assert normal_probe.group_block_ids != cleared_probe.group_block_ids
 
 
 def test_replay_respects_max_model_len() -> None:
