@@ -26,12 +26,15 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
 
 
-def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
+def _create_mtp_proposer(
+    num_speculative_tokens: int, proposer_cls=EagleProposer
+) -> EagleProposer:
     """Create an MTP proposer with unified model configuration."""
     model_config = ModelConfig(
         model=mimo_7b_dir, runner="generate", max_model_len=100, trust_remote_code=True
@@ -42,7 +45,7 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
         target_parallel_config=ParallelConfig(),
         model=mimo_7b_dir,
         method="mtp",
-        num_speculative_tokens=num_speculative_tokens,
+        num_speculative_tokens=max(num_speculative_tokens, 1),
     )
 
     vllm_config = VllmConfig(
@@ -58,7 +61,7 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
         ),
     )
 
-    return EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
+    return proposer_cls(vllm_config=vllm_config, device=DEVICE_TYPE)
 
 
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_pp_group")
@@ -115,7 +118,7 @@ def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_gro
     assert proposer.model.model.embed_tokens == target_model.model.embed_tokens
 
 
-@pytest.mark.parametrize("num_speculative_tokens", [1])
+@pytest.mark.parametrize("num_speculative_tokens", [0, 1, 2])
 def test_mtp_propose(num_speculative_tokens, monkeypatch):
     """Test that MTP's forward method returns hidden states directly"""
 
@@ -125,14 +128,16 @@ def test_mtp_propose(num_speculative_tokens, monkeypatch):
     total_tokens = sum(seq_lens)
     vocab_size = 100
 
-    proposer = _create_mtp_proposer(num_speculative_tokens)
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens, proposer_cls=Step3p5MTPProposer
+    )
     hidden_size = proposer.hidden_size
 
     # Mock the MTP model to verify it returns hidden states directly
     model_mock = mock.MagicMock()
 
     # MTP returns hidden states directly
-    if num_speculative_tokens == 1:
+    if num_speculative_tokens <= 1:
         model_mock.return_value = torch.zeros(total_tokens, hidden_size, device=device)
     else:
         # Multiple forward passes for multi-token speculation
@@ -164,6 +169,8 @@ def test_mtp_propose(num_speculative_tokens, monkeypatch):
 
     proposer.model = model_mock
     proposer._draft_attn_layer_names = {"layer.0"}
+    proposer.allowed_attn_types = None
+    proposer.block_size = 16
 
     # Prepare inputs
     batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
@@ -203,19 +210,48 @@ def test_mtp_propose(num_speculative_tokens, monkeypatch):
     mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
     proposer.draft_attn_groups = [mock_attn_group]
 
-    # Run propose
-    result = proposer.propose(
-        num_speculative_tokens=num_speculative_tokens,
-        target_token_ids=target_token_ids,
-        target_positions=target_positions,
-        target_hidden_states=target_hidden_states,
-        next_token_ids=next_token_ids,
-        token_indices_to_sample=None,
-        common_attn_metadata=common_attn_metadata,
-        sampling_metadata=sampling_metadata,
+    # Run propose. K=0 must still execute the first model forward, while K>0
+    # exercises the normal sampling path and additional draft passes.
+    sample_mock = mock.patch.object(
+        proposer,
+        "_sample_draft_tokens_for_step",
+        wraps=proposer._sample_draft_tokens_for_step,
     )
+    with sample_mock as sample_mock:
+        if num_speculative_tokens == 0:
+            sample_mock.reset_mock()
+            result = proposer.propose(
+                num_speculative_tokens=num_speculative_tokens,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=None,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+            )
+        else:
+            result = proposer.propose(
+                num_speculative_tokens=num_speculative_tokens,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=None,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+            )
 
     # Verify the model was called correctly
-    assert model_mock.called
+    if num_speculative_tokens == 0:
+        model_mock.assert_called_once()
+        model_mock.compute_logits.assert_not_called()
+        sample_mock.assert_not_called()
+    else:
+        assert model_mock.call_count == num_speculative_tokens
+        assert model_mock.compute_logits.call_count == num_speculative_tokens
+        assert sample_mock.call_count == num_speculative_tokens
     # Verify output shape
     assert result.shape == (batch_size, num_speculative_tokens)
+    assert result.dtype == torch.int64
+    assert result.device.type == device.type
