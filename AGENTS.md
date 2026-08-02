@@ -86,11 +86,12 @@ When adding tests:
   the cheapest level that catches it (unit over integration over e2e)?
 - **Reuse before create.** Extend existing test files, `conftest.py` fixtures, and
   helpers; add a new file only when no nearby suite fits.
-- **Test behavior with intent.** Assert observable outcomes through public APIs;
-  state why in the name or docstring. Skip trivial wiring; flaky tests are worse
-  than no tests.
-- **Keep it minimal.** One behavior per test and the smallest setup that
-  triggers it; if the test diff dwarfs the code change, cut scope.
+- **Test behavior with intent and minimal scope.** Assert observable outcomes
+  through public APIs; one behavior per test with the smallest setup that
+  triggers it. Skip trivial wiring; flaky tests are worse than no tests.
+- **Use property-based testing wherever relevant.** Python tests must use
+  Hypothesis and Rust tests must use proptest for meaningful generative or
+  state-space coverage. Otherwise choose the cheapest appropriate test level.
 - **No one-off kernel benchmarks in `tests/`.** Put kernel perf work in
   `benchmarks/kernels/`; prove correctness in existing pytest suites.
 - **Run model evals for model-affecting changes.** Search `tests/evals/` or use
@@ -101,7 +102,8 @@ For model-specific requirements, see
 
 ### Documentation
 
-Docs ship in the SAME change as the code, never as a follow-up. A change is not complete until the docs exist.
+Documentation updates are mandatory for relevant code or config changes: update
+the owning docs page in the same change, never as a follow-up.
 
 - **Any new user-facing feature, or new/changed config option** → update the prose page that owns the area. Search `docs/configuration/` for the guide covering it (memory, optimization, env vars) rather than assuming a path.
 - **Document**: what it does, when to use it, interaction and mutual exclusion with related options, defaults, and intentional failure modes — state what fails closed and why, so the behaviour does not read as a bug.
