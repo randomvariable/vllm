@@ -56,11 +56,14 @@ class ThinkingBudgetStateHolder:
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
+            self.reasoning_marker_token_ids = []
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
+            markers = getattr(reasoning_config, "reasoning_marker_token_ids", None)
+            self.reasoning_marker_token_ids = markers if markers else []
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -89,10 +92,12 @@ class ThinkingBudgetStateHolder:
 
         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
             thinking_token_budget = params.thinking_token_budget
-            if thinking_token_budget is not None:
+            marker_penalty = getattr(params, "reasoning_marker_penalty", None)
+            if thinking_token_budget is not None or marker_penalty not in (None, 0.0):
                 self._state[index] = self._init_state_entry(
                     prompt_tok_ids, thinking_token_budget
                 )
+                self._state[index]["reasoning_marker_penalty"] = marker_penalty
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
             else:
@@ -157,7 +162,40 @@ class ThinkingBudgetStateHolder:
         if not self.is_enabled or not self._state:
             return logits
         spec_lists = spec_token_ids or []
+        self._apply_marker_penalty(logits, predict_bonus_token, spec_lists)
         return self._apply_forcing_to_logits(logits, predict_bonus_token, spec_lists)
+
+    def _apply_marker_penalty(
+        self,
+        logits: torch.Tensor,
+        predict_bonus_token: bool,
+        spec_token_ids: list[list[int]],
+    ) -> None:
+        if not self.reasoning_marker_token_ids:
+            return
+        cumulative_total = 0
+        for seq_idx in range(
+            max(len(spec_token_ids), max(self._state, default=-1) + 1)
+        ):
+            spec_tokens = (
+                spec_token_ids[seq_idx] if seq_idx < len(spec_token_ids) else []
+            )
+            count = 1 if predict_bonus_token else max(1, len(spec_tokens))
+            state = self._state.get(seq_idx)
+            if state is None:
+                cumulative_total += count
+                continue
+            penalty = state.get("reasoning_marker_penalty", 0.0)
+            if state.get("in_think") and penalty:
+                tokens = [
+                    token
+                    for token in self.reasoning_marker_token_ids
+                    if 0 <= token < logits.shape[1]
+                ]
+                end = min(cumulative_total + count, logits.shape[0])
+                if tokens and cumulative_total < end:
+                    logits[cumulative_total:end, tokens] -= penalty
+            cumulative_total += count
 
     @staticmethod
     def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
@@ -169,7 +207,7 @@ class ThinkingBudgetStateHolder:
         return -1
 
     def _init_state_entry(
-        self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
+        self, prompt_tok_ids: list[int] | None, thinking_token_budget: int | None
     ) -> dict[str, Any]:
         if prompt_tok_ids is None:
             last_start = -1
@@ -199,11 +237,13 @@ class ThinkingBudgetStateHolder:
                     last_start + len(self.think_start_token_ids)
                 )
                 start_thinking = len(prompt_tok_ids) - think_count - 1
-                countdown -= think_count
+                if countdown is not None:
+                    countdown -= think_count
                 continue_thinking = True
                 # check if the token is exhausted within prompt
-                token_exhausted = thinking_token_budget - think_count
-                in_end = token_exhausted <= 0
+                if thinking_token_budget is not None:
+                    token_exhausted = thinking_token_budget - think_count
+                    in_end = token_exhausted <= 0
             else:
                 think_count = 0
 
@@ -228,6 +268,16 @@ class ThinkingBudgetStateHolder:
         }
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
+        if state.get("thinking_token_budget") is None:
+            sequence = [
+                *(state.get("prompt_tok_ids") or []),
+                *(state.get("output_tok_ids") or []),
+            ]
+            start = self._find_last_sequence_index(sequence, self.think_start_token_ids)
+            end = self._find_last_sequence_index(sequence, self.think_end_token_ids)
+            state["in_think"] = start >= 0 and start > end
+            state["force_index"] = []
+            return
         if state.get("thinking_token_budget", -1) == -1:
             return
         if len(self.think_end_token_ids) == 0:
@@ -498,7 +548,9 @@ class ThinkingBudgetStateHolder:
                 else []
             )
             if self.in_spec_mode:
-                cumulative_total += len(spec_tokens) if not predict_bonus_token else 1
+                cumulative_total += (
+                    max(1, len(spec_tokens)) if not predict_bonus_token else 1
+                )
             else:
                 cumulative_total += 1
 

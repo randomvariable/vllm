@@ -5,8 +5,11 @@ from dataclasses import field
 
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
+from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
+
+logger = init_logger(__name__)
 
 
 @config
@@ -25,6 +28,8 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    reasoning_marker_strs: list[str] = field(default_factory=list)
+    """Single-token strings emitted while reasoning."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
@@ -32,6 +37,9 @@ class ReasoningConfig:
     """Private backing field for `reasoning_start_token_ids`. Set by
     `initialize_token_ids`. Not intended to be configured directly."""
     _reasoning_end_token_ids: list[int] | None = field(
+        default=None, init=False, repr=False
+    )
+    _reasoning_marker_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
     )
     """Private backing field for forced reasoning end token IDs."""
@@ -62,6 +70,10 @@ class ReasoningConfig:
         return self._reasoning_end_token_ids
 
     @property
+    def reasoning_marker_token_ids(self) -> list[int] | None:
+        return self._reasoning_marker_token_ids
+
+    @property
     def natural_reasoning_end_token_ids(self) -> list[int] | None:
         """Token IDs that indicate the model naturally ended reasoning."""
         return self._natural_reasoning_end_token_ids
@@ -72,6 +84,7 @@ class ReasoningConfig:
             self._reasoning_start_token_ids is not None
             and self._reasoning_end_token_ids is not None
             and self._natural_reasoning_end_token_ids is not None
+            and self._reasoning_marker_token_ids is not None
         ):
             self._enabled = True
             return  # Already initialized
@@ -110,6 +123,21 @@ class ReasoningConfig:
         self._natural_reasoning_end_token_ids = tokenizer.encode(
             natural_reasoning_end_str, add_special_tokens=False
         )
+        marker_token_ids = set[int]()
+        for marker in self.reasoning_marker_strs:
+            if not marker or not marker.strip():
+                logger.info("Dropping empty reasoning marker.")
+                continue
+            token_ids = tokenizer.encode(marker, add_special_tokens=False)
+            if len(token_ids) == 1:
+                marker_token_ids.add(token_ids[0])
+            else:
+                logger.info(
+                    "Dropping reasoning marker %r: expected one token, got %d.",
+                    marker,
+                    len(token_ids),
+                )
+        self._reasoning_marker_token_ids = list(marker_token_ids)
 
         if (
             not self._reasoning_start_token_ids

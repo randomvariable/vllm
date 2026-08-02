@@ -338,6 +338,10 @@ class RejectionSampler(nn.Module):
                 )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():
+            holder.update_state(
+                sampling_metadata.output_token_ids,
+                sampling_metadata.spec_token_ids,
+            )
             logits = holder.apply_to_logits(
                 logits,
                 predict_bonus_token=False,

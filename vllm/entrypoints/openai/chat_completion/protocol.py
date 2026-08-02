@@ -11,6 +11,7 @@ from openai.types.chat.chat_completion_audio import (
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
 from pydantic import (
+    BeforeValidator,
     Field,
     PrivateAttr,
     SerializeAsAny,
@@ -48,6 +49,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    validate_reasoning_marker_penalty,
 )
 from vllm.utils import random_uuid
 
@@ -255,6 +257,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
+    reasoning_marker_penalty: Annotated[
+        float | None, BeforeValidator(validate_reasoning_marker_penalty)
+    ] = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -736,6 +741,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
+            reasoning_marker_penalty=self.reasoning_marker_penalty,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

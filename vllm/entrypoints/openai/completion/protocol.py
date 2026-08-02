@@ -6,7 +6,7 @@
 import time
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import BeforeValidator, Field, model_validator
 
 import vllm.envs as envs
 from vllm.config import ModelConfig
@@ -31,6 +31,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    validate_reasoning_marker_penalty,
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
@@ -241,6 +242,9 @@ class CompletionRequest(OpenAIBaseModel):
             "-1 means unlimited (treated as unset)."
         ),
     )
+    reasoning_marker_penalty: Annotated[
+        float | None, BeforeValidator(validate_reasoning_marker_penalty)
+    ] = None
 
     stream_interval: Annotated[int, Field(ge=1)] | None = Field(
         default=None,
@@ -393,6 +397,7 @@ class CompletionRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
+            reasoning_marker_penalty=self.reasoning_marker_penalty,
         )
 
     @model_validator(mode="before")

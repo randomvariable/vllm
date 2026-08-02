@@ -105,6 +105,7 @@ class MockReasoningConfig:
     reasoning_start_token_ids = [THINK_START_TOKEN_ID]
     reasoning_end_token_ids = [THINK_END_TOKEN_ID]
     enabled = True
+    reasoning_marker_token_ids = [42]
 
 
 def _generate_fake_sampling_metadata(
@@ -967,6 +968,91 @@ def test_thinking_budget_holder_sync_add_without_budget_drops_row():
     assert not h.has_tracked_requests()
 
 
+def test_reasoning_marker_penalty_tracks_penalty_only_request():
+    vc = VllmConfig()
+    vc.reasoning_config = MockReasoningConfig()
+    h = ThinkingBudgetStateHolder(vc.reasoning_config, 2, 0, torch.device("cpu"), False)
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.5),
+                    [THINK_START_TOKEN_ID],
+                    [10],
+                )
+            ],
+            moved=(),
+        )
+    )
+    assert h.has_tracked_requests()
+    assert h._state[0]["thinking_token_budget"] is None
+    assert h._state[0]["in_think"]
+    assert h._state[0]["reasoning_marker_penalty"] == 2.5
+
+
+def test_reasoning_marker_penalty_only_inside_thinking_block():
+    cfg = MockReasoningConfig()
+    h = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+    h.update_state([[THINK_START_TOKEN_ID]], None)
+    logits = torch.zeros((1, 50))
+    h.apply_to_logits(logits, False, None)
+    assert logits[0, 42] == -2
+
+    h.update_state([[THINK_START_TOKEN_ID, THINK_END_TOKEN_ID]], None)
+    logits = torch.zeros((1, 50))
+    h.apply_to_logits(logits, False, None)
+    assert logits[0, 42] == 0
+
+
+def test_reasoning_marker_penalty_uses_full_speculative_batch_layout():
+    cfg = MockReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 3, 3, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=3,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    [THINK_START_TOKEN_ID],
+                    [],
+                ),
+                (1, SamplingParams(), [1], []),
+                (
+                    2,
+                    SamplingParams(reasoning_marker_penalty=3.0),
+                    [THINK_START_TOKEN_ID],
+                    [],
+                ),
+            ],
+            moved=(),
+        )
+    )
+    holder.update_state([[1], [1], [1]], [[10, 11], [20], [30, 31, 32]])
+    logits = torch.zeros((6, 50))
+    holder.apply_to_logits(logits, False, [[10, 11], [], [30, 31, 32]])
+    assert torch.equal(logits[:, 42], torch.tensor([-2, -2, 0, -3, -3, -3]))
+
+
 def test_thinking_budget_holder_swap_exchanges_state():
     vc = VllmConfig()
     vc.reasoning_config = MockReasoningConfig()
@@ -1444,6 +1530,7 @@ class TestThinkingBudgetNaturalEndReentry:
 
         params = MagicMock()
         params.thinking_token_budget = budget
+        params.reasoning_marker_penalty = None
         batch_update = MagicMock(
             removed=[],
             added=[(0, params, None, [])],
@@ -1745,6 +1832,7 @@ class TestThinkingBudgetNaturalEndReentry:
         prompt_tok_ids = [self.THINK_START]
         params = MagicMock()
         params.thinking_token_budget = self.BUDGET
+        params.reasoning_marker_penalty = None
         batch_update = MagicMock(
             removed=[],
             added=[(0, params, prompt_tok_ids, [])],

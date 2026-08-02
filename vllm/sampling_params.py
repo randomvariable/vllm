@@ -55,9 +55,32 @@ def validate_thinking_token_budget(value: int | float | bool | None) -> int | No
     return value
 
 
+def validate_reasoning_marker_penalty(value: float | int | None) -> float | None:
+    """Validate the per-request reasoning marker penalty."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite non-negative float.",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    if not math.isfinite(value) or value < 0:
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite non-negative float.",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    return float(value)
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
+]
+ReasoningMarkerPenalty = Annotated[
+    float | None,
+    BeforeValidator(validate_reasoning_marker_penalty),
 ]
 
 
@@ -348,6 +371,8 @@ class SamplingParams(
     skip_reading_prefix_cache: bool | None = None
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
+    reasoning_marker_penalty: ReasoningMarkerPenalty = None
+    """Penalty applied to configured reasoning markers while thinking."""
 
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
@@ -372,6 +397,7 @@ class SamplingParams(
         stop_token_ids: list[int] | None = None,
         bad_words: list[str] | None = None,
         thinking_token_budget: int | None = None,
+        reasoning_marker_penalty: float | None = None,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
@@ -434,6 +460,7 @@ class SamplingParams(
             stop_token_ids=stop_token_ids,
             bad_words=bad_words,
             thinking_token_budget=thinking_token_budget,
+            reasoning_marker_penalty=reasoning_marker_penalty,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -470,6 +497,9 @@ class SamplingParams(
 
         self.thinking_token_budget = validate_thinking_token_budget(
             self.thinking_token_budget
+        )
+        self.reasoning_marker_penalty = validate_reasoning_marker_penalty(
+            self.reasoning_marker_penalty
         )
 
         if self.stop is None:
