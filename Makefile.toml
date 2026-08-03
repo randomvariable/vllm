@@ -34,7 +34,7 @@ command = "cargo"
 args = ["build", "--quiet", "--manifest-path", "${DEVLOOP}/Cargo.toml"]
 
 [tasks.doctor]
-description = "Report devloop environment state without building"
+description = "Build the devloop harness and report environment state"
 dependencies = ["devloop-build"]
 command = "${DEVLOOP}/target/debug/vllm-devloop"
 args = ["doctor"]

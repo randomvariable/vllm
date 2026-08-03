@@ -32,15 +32,14 @@ pub const HARNESS_EXIT: u8 = 125;
 pub fn probe_source(mount: &str) -> String {
     let mut checks = String::new();
     for module in EXTENSIONS {
-        let _ = writeln!(checks, "    check({module:?})");
+        let _ = writeln!(checks, "check({module:?})");
     }
     format!(
-        r#"import importlib, sys
+        r#"import importlib, importlib.metadata, sys
 
 strict = "strict" in sys.argv[1:]
 mount = {mount:?}
 failed = []
-
 
 def check(name):
     try:
@@ -57,6 +56,8 @@ def check(name):
             print(f"devloop-probe: ext.{{name}}=OK {{resolved}}")
 
 
+{checks}
+
 try:
     import vllm
 except Exception as exc:
@@ -67,7 +68,18 @@ else:
     print(f"devloop-probe: vllm_file={{resolved}}")
     if not resolved.startswith(mount + "/"):
         failed.append(f"vllm resolved to {{resolved}}, outside the mounted checkout {{mount}}")
-{checks}
+try:
+    dist = importlib.metadata.distribution("vllm")
+    version = dist.version or ""
+    metadata_path = str(getattr(dist, "_path", ""))
+    print(f"devloop-probe: vllm_metadata=version={{version}} path={{metadata_path}}")
+    if not version:
+        failed.append("vllm distribution has an empty version")
+    if not metadata_path or metadata_path.startswith(mount + "/"):
+        failed.append(f"vllm metadata resolved under mounted checkout: {{metadata_path or '?'}}")
+except Exception as exc:
+    print(f"devloop-probe: vllm_metadata=FAIL {{type(exc).__name__}}")
+    failed.append(f"vllm distribution metadata failed ({{type(exc).__name__}})")
 print(f"devloop-probe: python={{sys.version.split()[0]}} executable={{sys.executable}}")
 
 if failed and strict:
@@ -99,6 +111,8 @@ pub struct ProbeReport {
     pub extensions: Vec<(String, Result<String, String>)>,
     /// Interpreter version reported by the probe.
     pub python: Option<String>,
+    /// Distribution version and metadata directory.
+    pub vllm_metadata: Option<Result<(String, String), String>>,
 }
 
 impl ProbeReport {
@@ -120,6 +134,21 @@ impl ProbeReport {
                 }
                 "python" => {
                     report.python = value.split_whitespace().next().map(str::to_string);
+                }
+                "vllm_metadata" => {
+                    report.vllm_metadata = match value.strip_prefix("FAIL ") {
+                        Some(reason) => Some(Err(reason.to_string())),
+                        None => {
+                            let fields: Vec<_> = value.split_whitespace().collect();
+                            match (fields.first(), fields.get(1)) {
+                                (Some(version), Some(path)) => Some(Ok((
+                                    version.strip_prefix("version=").unwrap_or(version).into(),
+                                    path.strip_prefix("path=").unwrap_or(path).into(),
+                                ))),
+                                _ => Some(Err(value.to_string())),
+                            }
+                        }
+                    };
                 }
                 _ => {
                     if let Some(module) = key.strip_prefix("ext.") {
@@ -145,6 +174,22 @@ impl ProbeReport {
                 "vllm resolved to {path}, outside the mounted checkout {mount}"
             )),
             Some(_) => {}
+        }
+        match &self.vllm_metadata {
+            None => faults.push("vllm distribution metadata was not probed".into()),
+            Some(Err(reason)) => {
+                faults.push(format!("vllm distribution metadata failed ({reason})"))
+            }
+            Some(Ok((version, path))) if version.is_empty() => {
+                faults.push("vllm distribution has an empty version".into())
+            }
+            Some(Ok((_, path))) if path.is_empty() || path.starts_with(&format!("{mount}/")) => {
+                faults.push(format!(
+                    "vllm metadata resolved under mounted checkout: {}",
+                    if path.is_empty() { "?" } else { path }
+                ))
+            }
+            Some(Ok(_)) => {}
         }
         for expected in EXTENSIONS {
             match self.extensions.iter().find(|(m, _)| m == expected) {
@@ -199,6 +244,7 @@ mod tests {
     const HEALTHY: &str = "\
 WARNING 07-30 11:45:49 [rocm.py:42] Failed to import from amdsmi
 devloop-probe: vllm_file=/src/vllm/vllm/__init__.py
+devloop-probe: vllm_metadata=version=0.1 path=/opt/venv/lib/python3.12/site-packages/vllm-0.1.dist-info
 devloop-probe: ext.vllm._C=OK /src/vllm/vllm/_C.abi3.so
 devloop-probe: ext.vllm._rocm_C=OK /src/vllm/vllm/_rocm_C.abi3.so
 devloop-probe: ext.vllm._C_stable_libtorch=OK /src/vllm/vllm/_C_stable_libtorch.abi3.so
@@ -228,8 +274,25 @@ devloop-probe: ext.vllm._rocm_C=FAIL ImportError
 devloop-probe: ext.vllm._C_stable_libtorch=OK /src/vllm/vllm/_C_stable_libtorch.abi3.so
 ";
         let faults = ProbeReport::parse(stdout).faults(MOUNT);
-        assert_eq!(faults.len(), 1, "{faults:?}");
-        assert!(faults[0].contains("vllm._rocm_C"), "{faults:?}");
+        assert_eq!(faults.len(), 2, "{faults:?}");
+        assert!(
+            faults.iter().any(|fault| fault.contains("vllm._rocm_C")),
+            "{faults:?}"
+        );
+    }
+
+    #[test]
+    fn vllm_import_failure_still_reports_extension_records() {
+        let stdout = "\
+devloop-probe: vllm_file=FAIL ImportError
+devloop-probe: ext.vllm._C=FAIL ImportError
+devloop-probe: ext.vllm._rocm_C=OK /src/vllm/vllm/_rocm_C.abi3.so
+devloop-probe: ext.vllm._C_stable_libtorch=FAIL ImportError
+";
+        let report = ProbeReport::parse(stdout);
+
+        assert_eq!(report.extensions.len(), EXTENSIONS.len());
+        assert_eq!(report.faults(MOUNT).len(), 4);
     }
 
     /// Testing an installed copy instead of the checkout is the other half of
@@ -243,7 +306,7 @@ devloop-probe: ext.vllm._rocm_C=OK /opt/venv/lib/python3.12/site-packages/vllm/_
 devloop-probe: ext.vllm._C_stable_libtorch=OK /opt/venv/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so
 ";
         let faults = ProbeReport::parse(stdout).faults(MOUNT);
-        assert_eq!(faults.len(), 4, "{faults:?}");
+        assert_eq!(faults.len(), 5, "{faults:?}");
         assert!(
             faults[0].contains("outside the mounted checkout"),
             "{faults:?}"
@@ -265,12 +328,13 @@ devloop-probe: ext.vllm._C_stable_libtorch=OK /opt/venv/lib/python3.12/site-pack
     #[test]
     fn empty_output_is_a_fault_not_a_pass() {
         let faults = ProbeReport::parse("").faults(MOUNT);
-        assert_eq!(faults.len(), 4, "{faults:?}");
+        assert_eq!(faults.len(), 5, "{faults:?}");
     }
 
     #[test]
     fn strict_source_exits_with_harness_code_and_covers_every_extension() {
         let source = probe_source(MOUNT);
+        assert_eq!(source.matches("check(\"vllm.").count(), EXTENSIONS.len());
         assert!(source.contains(&format!("sys.exit({HARNESS_EXIT})")));
         for module in EXTENSIONS {
             assert!(source.contains(&format!("check({module:?})")), "{module}");

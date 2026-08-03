@@ -216,7 +216,7 @@ fn with_strict_probe(payload: &[String]) -> Vec<String> {
     let mut command: Vec<String> = [
         "bash",
         "-c",
-        "set -eu; py=\"$1\"; probe=\"$2\"; shift 2; \"$py\" -c \"$probe\" strict; exec \"$@\"",
+        "set -eu; py=\"$1\"; probe=\"$2\"; shift 2; \"$py\" -P -c \"$probe\" strict; exec \"$@\"",
         "vllm-devloop",
         PYTHON,
     ]
@@ -260,8 +260,19 @@ fn build(env: &Env, args: &[String]) -> Result<ExitCode> {
 }
 
 fn test(env: &Env, args: &[String]) -> Result<ExitCode> {
-    if args.is_empty() {
-        bail!("no pytest arguments given; e.g. `cargo make test -- tests/kernels/attention`");
+    let args = strip_cargo_make_separator(args);
+    if args
+        .iter()
+        .any(|arg| arg == "--import-mode" || arg.starts_with("--import-mode="))
+    {
+        bail!("--import-mode is controlled by vllm-devloop and must not be provided");
+    }
+    if !has_target(args) {
+        bail!(
+            "pytest target path or node ID required; flags alone (including `-k foo`) ".to_string()
+                + "would run the whole suite; e.g. `cargo make test -- "
+                + "tests/kernels/attention -k sliding_window`"
+        );
     }
     let image_id = require_ready(env)?;
     // Let Ninja decide whether anything is stale, but never let pytest observe
@@ -272,9 +283,12 @@ fn test(env: &Env, args: &[String]) -> Result<ExitCode> {
     if build_code != ExitCode::SUCCESS {
         return Ok(build_code);
     }
-    println!("  command           {PYTHON} -m pytest {}", args.join(" "));
+    println!(
+        "  command           {PYTHON} -P -m pytest --import-mode=importlib {}",
+        args.join(" ")
+    );
 
-    let mut payload: Vec<String> = [PYTHON, "-m", "pytest"]
+    let mut payload: Vec<String> = [PYTHON, "-P", "-m", "pytest", "--import-mode=importlib"]
         .iter()
         .map(|s| (*s).to_string())
         .collect();
@@ -282,10 +296,82 @@ fn test(env: &Env, args: &[String]) -> Result<ExitCode> {
     run_in_container(env, &with_strict_probe(&payload), false)
 }
 
+/// Remove cargo-make's argument separator without changing direct invocations.
+fn strip_cargo_make_separator(args: &[String]) -> &[String] {
+    args.strip_prefix(&["--".to_string()]).unwrap_or(args)
+}
+
+/// Require a path-like pytest target or node ID, while allowing flags.
+fn has_target(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return args[index + 1..].iter().any(is_target);
+        }
+        if !arg.starts_with('-') && is_target(arg) {
+            return true;
+        }
+        index += if arg.starts_with('-') && !arg.contains('=') && option_consumes_next(arg) {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+fn is_target(arg: &String) -> bool {
+    arg.contains("::")
+        || arg.ends_with(".py")
+        || arg.contains('/')
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || std::path::Path::new(arg).is_dir()
+}
+
+fn option_consumes_next(arg: &str) -> bool {
+    if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+        return false;
+    }
+    !matches!(
+        arg,
+        "-q" | "-v"
+            | "-s"
+            | "-x"
+            | "-l"
+            | "-f"
+            | "-h"
+            | "--quiet"
+            | "--verbose"
+            | "--capture"
+            | "--no-capture"
+            | "--exitfirst"
+            | "--showlocals"
+            | "--failed-first"
+            | "--last-failed"
+            | "--strict-markers"
+            | "--strict-config"
+            | "--disable-warnings"
+            | "--no-header"
+            | "--no-summary"
+            | "--collect-only"
+            | "--trace-config"
+            | "--debug"
+            | "--version"
+            | "--help"
+            | "--pdb"
+            | "--pdbcls"
+            | "--setup-plan"
+            | "--setup-show"
+    )
+}
+
 /// Run the probe alone and capture it, for `doctor` and post-build reporting.
 fn probe(env: &Env) -> Result<ProbeReport> {
     let command: Vec<String> = vec![
         PYTHON.to_string(),
+        "-P".to_string(),
         "-c".to_string(),
         probe::probe_source(MOUNT),
     ];
@@ -436,7 +522,80 @@ mod tests {
     fn test_without_paths_is_rejected() {
         let env = Env::discover("/home/dev/vllm/homelab/devloop", None).unwrap();
         let err = test(&env, &[]).expect_err("empty args must be refused");
-        assert!(err.to_string().contains("no pytest arguments"), "{err}");
+        assert!(
+            err.to_string().contains("pytest target path or node ID"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn option_only_pytest_invocation_is_rejected() {
+        let args = ["-k", "foo"].map(String::from);
+        assert!(!has_target(&args));
+    }
+
+    #[test]
+    fn path_like_pytest_option_values_are_not_targets() {
+        for args in [
+            ["--basetemp", "/tmp/run"],
+            ["-k", "tests/foo"],
+            ["--junitxml", "report.xml"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(!has_target(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_option_values_and_equals_forms_are_not_targets() {
+        for args in [vec!["--ignore", "/tmp/tests"], vec!["--foo=tests/foo"]] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(!has_target(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn combined_short_flags_do_not_consume_targets() {
+        for flag in ["-vv", "-qf", "-xq"] {
+            let args = [flag, "tests/foo.py"].map(String::from);
+            assert!(has_target(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn setup_plan_does_not_consume_target() {
+        let args = ["--setup-plan", "tests/foo.py"].map(String::from);
+        assert!(has_target(&args), "{args:?}");
+    }
+
+    #[test]
+    fn setup_show_does_not_consume_target() {
+        let args = ["--setup-show", "tests/foo.py"].map(String::from);
+        assert!(has_target(&args), "{args:?}");
+    }
+
+    #[test]
+    fn cargo_make_separator_is_stripped() {
+        let args = ["--", "tests/kernels/attention", "-k", "foo"].map(String::from);
+        assert_eq!(strip_cargo_make_separator(&args), &args[1..]);
+    }
+
+    #[test]
+    fn value_only_pytest_invocation_is_rejected() {
+        let args = ["--junitxml", "report.xml"].map(String::from);
+        assert!(!has_target(&args));
+    }
+
+    #[test]
+    fn pytest_target_and_flags_are_accepted() {
+        let args = ["tests/kernels/attention", "-k", "foo"].map(String::from);
+        assert!(has_target(&args));
+    }
+
+    #[test]
+    fn pytest_node_id_is_accepted() {
+        let args = ["tests/test_engine.py::test_start", "-q"].map(String::from);
+        assert!(has_target(&args));
     }
 
     /// Both lanes must fail closed, not fall back to a default image.

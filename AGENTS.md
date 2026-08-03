@@ -79,6 +79,11 @@ uv pip install -r requirements/test/cuda.in
 .venv/bin/python -m pytest tests/path/to/test_file.py -v
 ```
 
+For AMD Strix Halo (`gfx1151`) ROCm work, use `cargo make test -- <pytest
+args>`. It supports paths, node IDs, and `-k`, rejects a bare command, and
+uses a container rather than the host `.venv`; keep the generic command above
+for non-ROCm environments.
+
 When adding tests:
 
 - **Design before you write.** Answer four questions first: what is the module

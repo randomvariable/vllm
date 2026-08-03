@@ -20,6 +20,8 @@ pub const DEVICES: [&str; 2] = ["/dev/kfd", "/dev/dri"];
 pub const BUILD_CMD: &str = "vllm-hip-build";
 /// The release venv, whose torch has the InitDma-safe HSA runtime.
 pub const PYTHON: &str = "/opt/venv/bin/python";
+/// Hide host-generated package metadata from the container's import path.
+pub const METADATA_TMPFS: &str = "/src/vllm/vllm.egg-info";
 
 /// Where the container looks for things, and where the harness runs.
 #[derive(Debug, Clone)]
@@ -93,6 +95,7 @@ impl Env {
             .map(ToString::to_string),
         );
         args.push(format!("{}:{}", self.repo.display(), crate::probe::MOUNT));
+        args.extend(["--tmpfs".to_string(), METADATA_TMPFS.to_string()]);
         args.extend(
             [
                 "-v",
@@ -263,6 +266,21 @@ mod tests {
     #[test]
     fn checkout_mount_is_read_write() {
         assert!(args_of(&[BUILD_CMD], false).contains(&"/home/dev/vllm:/src/vllm".to_string()));
+    }
+
+    #[test]
+    fn host_package_metadata_is_hidden_by_disposable_tmpfs() {
+        let args = args_of(&[BUILD_CMD], false);
+        let checkout_mount = args
+            .iter()
+            .position(|arg| arg == "/home/dev/vllm:/src/vllm")
+            .expect("checkout mount present");
+        assert_eq!(args[checkout_mount + 1], "--tmpfs");
+        assert_eq!(args[checkout_mount + 2], METADATA_TMPFS);
+        assert!(
+            args.iter()
+                .all(|arg| !arg.contains("egg-info") || arg == METADATA_TMPFS)
+        );
     }
 
     /// The image bakes every variable this harness would otherwise set, and a

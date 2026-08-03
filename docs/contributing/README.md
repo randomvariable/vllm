@@ -140,6 +140,12 @@ For additional features and advanced configurations, refer to the:
 
 vLLM uses `pytest` to test the codebase.
 
+For AMD Strix Halo (`gfx1151`) ROCm kernel work, use the [Strix Halo
+cargo-make devloop](incremental_build.md#strix-halo-cargo-make-devloop), the
+sanctioned local containerized test entrypoint. Do not use the host `.venv` for
+this ROCm surface. There is currently no equivalent containerized harness for
+CUDA or DGX Spark `sm_121a` targets.
+
 ```bash
 # Install the test dependencies used in CI (CUDA only)
 uv pip install -r requirements/common.txt -r requirements/dev.txt --torch-backend=auto

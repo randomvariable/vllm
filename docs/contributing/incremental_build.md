@@ -55,7 +55,7 @@ ROCm development.
   permission to use those devices.
 - Install `cargo-make` (`cargo install cargo-make`) and run from repository root.
 
-Devloop refuses to run when Docker, GPU devices, devtools image, or either named
+Devloop builds its harness before each `cargo make` task. It refuses to run when Docker, GPU devices, devtools image, or either named
 volume is unavailable. It prints image and checkout provenance before
 build/test actions, and test lane probes that mounted checkout Python and
 compiled extensions are the ones being tested. This fail-closed behavior avoids
@@ -64,7 +64,7 @@ treating stale installed package as passing test.
 ### Commands
 
 ```console
-# Check prerequisites and in-container provenance
+# Build harness, then check prerequisites and in-container provenance
 cargo make doctor
 
 # Build devtools image and create persistent volumes if needed
@@ -73,8 +73,25 @@ cargo make setup
 # Incrementally build HIP/C++ extensions
 cargo make build
 
-# Pass targeted pytest paths and flags through unchanged
+# Pass targeted pytest paths and flags through unchanged; cargo-make's separator
+# is removed before pytest runs
 cargo make test -- tests/kernels/attention/test_prefix_prefill.py -k sliding_window
+```
+
+The devloop invokes Python with `-P` and pytest with
+`--import-mode=importlib`. This prevents the mounted checkout and its temporary
+`vllm.egg-info` directory from shadowing the installed distribution metadata.
+Pytest still requires an explicit path or node ID; option values such as
+`--basetemp /tmp/run`, `-k tests/foo`, and `--junitxml report.xml` are not
+targets.
+
+`cargo make` does not forward global harness options. Invoke the compiled
+harness directly, placing `--image <name>` before the subcommand:
+
+```console
+cargo build --quiet --manifest-path homelab/devloop/Cargo.toml && \
+  homelab/devloop/target/debug/vllm-devloop --image vllm-strix-devtools test \
+  tests/kernels/attention
 ```
 
 Build artifacts and compiler cache persist in deterministic checkout-scoped Docker
@@ -84,10 +101,17 @@ shared across clones. The test lane runs `vllm-hip-build` first, letting Ninja
 rebuild changed sources while keeping current trees as no-ops, then runs pytest
 only after that build succeeds. Use `cargo make build -- -j 8` to pass build
 arguments. Do not run bare `cargo make test`: devloop requires explicit pytest
-arguments.
+target paths or node IDs, and rejects empty or option-only invocations (such as
+`cargo make test -- -k foo`) to prevent an accidental whole-suite run.
+After the incremental build succeeds, the test lane uses the container's
+hard-coded `/opt/venv/bin/python`. Before pytest starts, it verifies that the
+checkout package and `vllm._C`, `vllm._rocm_C`, and
+`vllm._C_stable_libtorch` all resolve under `/src/vllm`; any provenance failure
+exits 125, so stale installed extensions cannot produce a passing result.
 
 Compatibility wrapper `homelab/rocm-dev-test.sh` remains available for existing
-scripts, but new commands should use `cargo make test`.
+scripts, but is deprecated and prints a warning directing new commands to
+`cargo make test`.
 
 ## Setting up the CMake Build Environment
 
