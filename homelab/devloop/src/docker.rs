@@ -9,6 +9,7 @@
 //! deliberately passes no `-e` flags: a variable set here would either be a
 //! silent no-op or would shadow a value the image chose for a reason.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,6 +30,58 @@ pub struct Env {
     /// Host checkout, bind-mounted read-write at [`probe::MOUNT`].
     pub repo: PathBuf,
     pub image: String,
+    pub hub_cache: Option<PathBuf>,
+}
+
+const HUB_CACHE_CONTAINER: &str = "/root/.cache/huggingface/hub";
+
+fn resolve_hub_cache(values: &[(&str, Option<&OsStr>)]) -> anyhow::Result<Option<PathBuf>> {
+    let get = |name: &str| {
+        values
+            .iter()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| *value)
+    };
+    for (name, raw, suffix) in [
+        ("HF_HUB_CACHE", get("HF_HUB_CACHE"), None),
+        ("HUGGINGFACE_HUB_CACHE", get("HUGGINGFACE_HUB_CACHE"), None),
+        ("HF_HOME", get("HF_HOME"), Some("hub")),
+        (
+            "XDG_CACHE_HOME",
+            get("XDG_CACHE_HOME"),
+            Some("huggingface/hub"),
+        ),
+        ("HOME", get("HOME"), Some(".cache/huggingface/hub")),
+    ] {
+        let Some(raw) = raw else { continue };
+        let mut path = PathBuf::from(raw);
+        if let Some(suffix) = suffix {
+            path.push(suffix);
+        }
+        if name == "HOME" && !path.is_absolute() {
+            return Ok(None);
+        }
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "{name} resolves to relative path {}; set an absolute existing directory",
+                path.display()
+            );
+        }
+        if !path.is_dir() {
+            if name == "HOME" {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "{name} resolves to {}; create it or unset {name} to disable Hub cache discovery",
+                path.display()
+            );
+        }
+        if path.to_str().is_none() {
+            anyhow::bail!("{name} resolves to a non-UTF-8 path; set it to a UTF-8 directory path");
+        }
+        return Ok(Some(path));
+    }
+    Ok(None)
 }
 
 impl Env {
@@ -60,9 +113,24 @@ impl Env {
             .nth(2)
             .ok_or_else(|| anyhow::anyhow!("cannot derive repo root from {manifest_dir}"))?
             .to_path_buf();
+        let vars: Vec<(&str, Option<OsString>)> = [
+            "HF_HUB_CACHE",
+            "HUGGINGFACE_HUB_CACHE",
+            "HF_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        let vars: Vec<(&str, Option<&OsStr>)> = vars
+            .iter()
+            .map(|(name, value)| (*name, value.as_deref()))
+            .collect();
         Ok(Self {
             repo,
             image: image.unwrap_or_else(|| IMAGE.to_string()),
+            hub_cache: resolve_hub_cache(&vars)?,
         })
     }
 
@@ -96,6 +164,22 @@ impl Env {
         );
         args.push(format!("{}:{}", self.repo.display(), crate::probe::MOUNT));
         args.extend(["--tmpfs".to_string(), METADATA_TMPFS.to_string()]);
+        if let Some(cache) = &self.hub_cache {
+            args.extend([
+                "-v".to_string(),
+                format!(
+                    "{}:{}:ro",
+                    cache
+                        .to_str()
+                        .expect("hub cache path validated as UTF-8 by discover"),
+                    HUB_CACHE_CONTAINER
+                ),
+                "-e".to_string(),
+                format!("HF_HUB_CACHE={HUB_CACHE_CONTAINER}"),
+                "-e".to_string(),
+                format!("HUGGINGFACE_HUB_CACHE={HUB_CACHE_CONTAINER}"),
+            ]);
+        }
         args.extend(
             [
                 "-v",
@@ -160,6 +244,16 @@ pub fn checks(env: &Env) -> Vec<Check> {
             _ => Check::fail("docker daemon", "start docker: `systemctl start docker`"),
         },
     ];
+    checks.push(match &env.hub_cache {
+        Some(path) => Check::ok(
+            "Hugging Face Hub cache",
+            format!("{} (read-only)", path.display()),
+        ),
+        None => Check::ok(
+            "Hugging Face Hub cache",
+            "unavailable; fully cached models required offline",
+        ),
+    });
 
     for device in DEVICES {
         checks.push(if Path::new(device).exists() {
@@ -214,6 +308,7 @@ mod tests {
         Env {
             repo: PathBuf::from("/home/dev/vllm"),
             image: IMAGE.to_string(),
+            hub_cache: None,
         }
     }
 
@@ -226,8 +321,50 @@ mod tests {
         let other = Env {
             repo: PathBuf::from("/home/dev/other-vllm"),
             image: IMAGE.to_string(),
+            hub_cache: None,
         };
         assert_ne!(volumes, other.volumes());
+    }
+
+    #[test]
+    fn hub_cache_resolution_uses_priority_and_rejects_explicit_invalid() {
+        let root = std::env::temp_dir().join(format!("vllm-devloop-test-{}", std::process::id()));
+        let explicit = root.join("explicit");
+        let fallback = root.join("fallback");
+        std::fs::create_dir_all(&explicit).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let explicit = explicit.as_os_str();
+        let fallback = fallback.as_os_str();
+        let values = [
+            ("HUGGINGFACE_HUB_CACHE", Some(explicit)),
+            ("HF_HOME", Some(fallback)),
+        ];
+        assert_eq!(
+            resolve_hub_cache(&values).unwrap(),
+            Some(PathBuf::from(explicit))
+        );
+        let invalid = [("HUGGINGFACE_HUB_CACHE", Some(OsStr::new("relative/cache")))];
+        let error = resolve_hub_cache(&invalid).unwrap_err().to_string();
+        assert!(error.contains("absolute"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hub_cache_mount_is_read_only_and_optional() {
+        let mut env = env();
+        let no_cache = env.run_args(&[BUILD_CMD.to_string()], false);
+        assert!(!no_cache.iter().any(|arg| arg == "-e"));
+        env.hub_cache = Some(PathBuf::from("/cache/hub"));
+        let args = env.run_args(&[BUILD_CMD.to_string()], false);
+        assert!(args.contains(&"/cache/hub:/root/.cache/huggingface/hub:ro".to_string()));
+        assert!(args.contains(&format!("HF_HUB_CACHE={HUB_CACHE_CONTAINER}")));
+        assert!(args.contains(&format!("HUGGINGFACE_HUB_CACHE={HUB_CACHE_CONTAINER}")));
+    }
+
+    #[test]
+    fn relative_home_is_optional_fallback() {
+        let values = [("HOME", Some(OsStr::new("relative-home")))];
+        assert_eq!(resolve_hub_cache(&values).unwrap(), None);
     }
 
     fn args_of(command: &[&str], stdin: bool) -> Vec<String> {

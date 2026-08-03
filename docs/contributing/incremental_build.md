@@ -55,6 +55,8 @@ ROCm development.
   permission to use those devices.
 - Install `cargo-make` (`cargo install cargo-make`) and run from repository root.
 
+Devloop optionally mounts a caller-selected Hugging Face Hub cache read-only. Resolution priority is `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `$HF_HOME/hub`, `$XDG_CACHE_HOME/huggingface/hub`, then `$HOME/.cache/huggingface/hub`. Explicit cache variables must resolve to absolute existing directories; they identify directories selected by the caller and are not a claim that arbitrary selected paths contain no credentials. The derived `$HF_HOME` and `$XDG_CACHE_HOME` locations select only the Hub cache subdirectory, not `HF_HOME` credential files. An unavailable default under `HOME` is informational and does not block setup. Only the selected Hub cache directory mounts at `/root/.cache/huggingface/hub`. The read-only cache cannot be populated during a run, so deterministic/offline model tests require a complete cached model closure. Core non-model build, doctor, setup, and kernel-test commands work without a cache; networking is not disabled.
+
 Devloop builds its harness before each `cargo make` task. It refuses to run when Docker, GPU devices, devtools image, or either named
 volume is unavailable. It prints image and checkout provenance before
 build/test actions, and test lane probes that mounted checkout Python and
