@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include <torch/csrc/stable/macros.h>
 
 int32_t get_sm_version_num(int device) {
   int32_t major_capability, minor_capability;
