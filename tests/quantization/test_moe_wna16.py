@@ -12,6 +12,12 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     WNA16MoEBackend,
     _backend_incompatibility_reason,
@@ -20,8 +26,18 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     map_wna16_backend,
 )
 from vllm.model_executor.layers.quantization import moe_wna16
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    compressed_tensors_moe_wna16,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
+    CompressedTensorsWNA16MoEMethod,
+)
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    INT8_DTYPE,
+    kInt8StaticGroupScale,
+)
 from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
     MoeWNA16Method,
@@ -30,6 +46,47 @@ from vllm.model_executor.layers.quantization.moe_wna16 import (
 
 def test_map_wna16_backend_supports_triton():
     assert map_wna16_backend("triton") == WNA16MoEBackend.TRITON
+
+
+def test_compressed_tensors_wna16_accepts_grouped_int8(monkeypatch):
+    quant_args = QuantizationArgs(
+        num_bits=8, type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP, symmetric=True,
+        dynamic=False, group_size=128,
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=8, experts_per_token=2, hidden_dim=256,
+        intermediate_size=256, num_local_experts=8, num_logical_experts=8,
+        activation=MoEActivation.SILU, in_dtype=torch.bfloat16, device="cpu",
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    )
+    backend_selection = {}
+
+    def select_backend(**kwargs):
+        backend_selection.update(kwargs)
+        return WNA16MoEBackend.TRITON, object
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_wna16, "select_wna16_moe_backend",
+        select_backend,
+    )
+
+    method = CompressedTensorsWNA16MoEMethod(quant_args, None, moe_config)
+
+    assert method.group_size == 128
+    assert method.wna16_backend == WNA16MoEBackend.TRITON
+    assert backend_selection["config"] is moe_config
+    assert backend_selection["quant_config"] is quant_args
+    assert backend_selection["may_have_zp"] is False
+    assert backend_selection["may_have_bias"] is False
+    assert backend_selection["allow_tile_padding"] is True
+
+    weight_key = backend_selection["weight_key"]
+    assert quant_args.group_size == 128
+    assert weight_key.dtype == INT8_DTYPE
+    assert weight_key.scale == kInt8StaticGroupScale
+    assert weight_key.symmetric is True
 
 
 @pytest.mark.parametrize(
