@@ -5,6 +5,7 @@ vllm/model_executor/layers/quantization/base_config.py
 vllm/model_executor/layers/quantization/mxfp4.py
   s_8852b93935ea61::t_0ea53f4be273e3 757
   s_8852b93935ea61::t_05534e4f4a34ad 545-547,733,735-746,756,758-766
+  s_944a416814ea17::t_0bde88d38e1b16 734
 tests/model_executor/model_loader/test_reload.py
   s_8852b93935ea61::t_05534e4f4a34ad 578-601
 tests/model_executor/test_b12x_mxfp4_moe.py
@@ -27,6 +28,14 @@ vllm/model_executor/model_loader/reload/__init__.py
         "tool": "opencode",
         "id": "ses_04556fb65ffe83TA909nR7aueb",
         "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_944a416814ea17": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_031ab1099ffeYcZZgV1mdqXqXK",
+        "model": "claude-opus-5"
       },
       "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
     }
