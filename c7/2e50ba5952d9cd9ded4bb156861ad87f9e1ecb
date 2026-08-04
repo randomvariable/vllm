@@ -1,0 +1,21 @@
+tests/kernels/attention/test_rocm_triton_attn_dsv4.py
+  s_944a416814ea17::t_cb7b40270a018e 4,720-1018
+vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+  s_944a416814ea17::t_cb7b40270a018e 14,22-23,25,27,378-467,502-503,506,512-515,538-540,561-563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "c72e50ba5952d9cd9ded4bb156861ad87f9e1ecb",
+  "prompts": {},
+  "sessions": {
+    "s_944a416814ea17": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_031ab1099ffeYcZZgV1mdqXqXK",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
