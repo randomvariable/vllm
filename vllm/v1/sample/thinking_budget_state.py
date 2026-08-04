@@ -6,12 +6,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     MoveDirectionality,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
@@ -53,6 +56,9 @@ class ThinkingBudgetStateHolder:
         # No separate enable flag: a non-``None`` ``reasoning_config`` is the switch.
         self.is_enabled = reasoning_config is not None
 
+        self.think_start_token_ids: list[int]
+        self.think_end_token_ids: list[int]
+        self.reasoning_marker_token_ids: list[int]
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
@@ -663,6 +669,17 @@ class ThinkingBudgetStateHolder:
         else:
             self._advance_end_sequence(state)
 
+    def _row_span(self, spec_tokens: list[int], predict_bonus_token: bool) -> int:
+        """Number of logits rows a single request owns in this call.
+
+        The bonus-token tensor gives every request exactly one row. The target
+        tensor gives each request one row per draft token, or one row when it
+        has no drafts. Outside spec mode there is always exactly one row.
+        """
+        if not self.in_spec_mode or predict_bonus_token:
+            return 1
+        return max(1, len(spec_tokens))
+
     def _apply_forcing_to_logits(
         self,
         logits: torch.Tensor,
@@ -676,6 +693,7 @@ class ThinkingBudgetStateHolder:
         if self._state:
             n_layout = max(n_layout, max(self._state.keys()) + 1)
 
+        row_spans: dict[int, int] = {}
         for index in range(n_layout):
             self.cu_num_tokens[index] = cumulative_total
             spec_tokens = (
@@ -683,12 +701,8 @@ class ThinkingBudgetStateHolder:
                 if index < len(spec_token_ids_for_layout)
                 else []
             )
-            if self.in_spec_mode:
-                cumulative_total += (
-                    max(1, len(spec_tokens)) if not predict_bonus_token else 1
-                )
-            else:
-                cumulative_total += 1
+            row_spans[index] = self._row_span(spec_tokens, predict_bonus_token)
+            cumulative_total += row_spans[index]
 
         # Build the active index / forced-token lists entirely on CPU so we
         # avoid per-iteration scalar sync writes to GPU tensors.
@@ -720,10 +734,29 @@ class ThinkingBudgetStateHolder:
                     if len(force_index) == 0:
                         continue
                     end_count = state.get("end_count", 0)
+                    row_start = self.cu_num_tokens[seq_idx]
+                    row_span = row_spans.get(seq_idx, 1)
                     for force_idx in force_index:
                         if end_count < len(self.think_end_token_ids):
-                            mask_idx = self.cu_num_tokens[seq_idx] + force_idx
-                            if (
+                            mask_idx = row_start + force_idx
+                            if not 0 <= force_idx < row_span:
+                                # Outside the owning request's rows. Writing
+                                # here forces the end-of-thinking token into a
+                                # different sequence's logits, or is clipped
+                                # away on the last request. Both are bugs in
+                                # force_index selection rather than runtime
+                                # conditions, so report and skip the write.
+                                logger.warning_once(
+                                    "Thinking-budget force index %d is outside "
+                                    "request %d's row span (%d row(s) from row "
+                                    "%d); skipping the forced token. This is a "
+                                    "bug in force_index selection.",
+                                    force_idx,
+                                    seq_idx,
+                                    row_span,
+                                    row_start,
+                                )
+                            elif (
                                 mask_idx < self._mask_capacity
                                 and mask_idx < logits.shape[0]
                             ):

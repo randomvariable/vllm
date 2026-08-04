@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import random
 from collections.abc import Callable
 from typing import NamedTuple, TypeAlias
@@ -2497,6 +2498,142 @@ class TestReasoningAnswerReserve:
         assert not holder._state[0]["in_end"], (
             "State must reset once the whole close marker has been emitted"
         )
+
+    # --- row-span guard (fork issue #34) ---
+    #
+    # ``_apply_forcing_to_logits`` bounds the write row by the owning request's
+    # row span, not by the tensor. Without that bound an out-of-span
+    # ``force_index`` writes the end-of-thinking token into the *next*
+    # request's rows, or is clipped away entirely on the last request in the
+    # batch. Both are silent. These tests drive a real out-of-span index
+    # through the guard.
+
+    def _two_request_holder(
+        self, num_spec: int
+    ) -> tuple[ThinkingBudgetStateHolder, list[list[int]]]:
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        outputs = [[THINK_START_TOKEN_ID], [THINK_START_TOKEN_ID]]
+        params = SamplingParams(
+            max_tokens=self.MAX_TOKENS,
+            reasoning_answer_reserve=self.RESERVE,
+        )
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=2,
+                removed=(),
+                added=[
+                    (0, params, None, outputs[0]),
+                    (1, params, None, outputs[1]),
+                ],
+                moved=(),
+            )
+        )
+        return holder, outputs
+
+    def _drive_to_forcing(
+        self,
+        holder: ThinkingBudgetStateHolder,
+        outputs: list[list[int]],
+        drafts: list[list[int]],
+    ) -> None:
+        """Advance both requests until each one is inside the close marker."""
+        for _ in range(self.MAX_TOKENS):
+            self._apply_step(holder, outputs, drafts)
+            if all(holder._state[i].get("in_end", False) for i in range(len(outputs))):
+                return
+            for i, out in enumerate(outputs):
+                out.extend(drafts[i])
+                out.append(self.THINK_TOKEN)
+        raise AssertionError("Requests never entered the forced-close state")
+
+    def test_out_of_span_force_index_does_not_write_into_next_request(self):
+        """An index past request 0's rows must not land in request 1's rows."""
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        # Request 0 owns target rows 0..2; row 3 is the first row of request 1.
+        holder._state[0]["force_index"] = [num_spec]
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [], (
+            "Out-of-span force index must be rejected, not written into the "
+            "next request's rows"
+        )
+
+    def test_out_of_span_force_index_on_last_request_is_rejected(self, caplog):
+        """On the last request the overshoot is clipped away, not written.
+
+        Clipping is silent: the forced token simply never lands and the
+        reasoning block runs past its budget. The guard must report it, so
+        this test asserts on the log rather than only on the (unchanged)
+        logits, which the pre-existing tensor bound would also produce.
+        """
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        holder._state[0]["force_index"] = []
+        holder._state[0]["bonus_token_forced"] = True
+        holder._state[1]["force_index"] = [num_spec]
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        with caplog.at_level(logging.WARNING):
+            holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == []
+        assert any("outside request 1" in r.message for r in caplog.records), (
+            "An overshoot on the last request must be reported, not silently "
+            f"clipped; got {[r.message for r in caplog.records]}"
+        )
+
+    def test_out_of_span_force_index_with_differing_draft_lengths(self):
+        """Uneven spans: request 0 owns one row, request 1 owns num_spec rows.
+
+        A zero-draft request owns a single target row, so index 2 lands inside
+        the drafted neighbour's rows. This is the uneven-span shape the tensor
+        bound cannot catch, because the index is well inside the tensor.
+        """
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts: list[list[int]] = [[], [self.THINK_TOKEN] * num_spec]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        # Request 0 has no drafts, so it owns exactly one target row (row 0).
+        # Index 2 would land in request 1's rows, which start at row 1.
+        holder._state[0]["force_index"] = [2]
+        holder._state[0]["bonus_token_forced"] = False
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(1 + num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [], (
+            "A zero-draft request owns one row; index 2 belongs to request 1"
+        )
+
+    def test_in_span_force_index_still_writes(self):
+        """The guard must not reject legitimate indices."""
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        holder._state[0]["force_index"] = [num_spec - 1]
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [(num_spec - 1, THINK_END_TOKEN_ID)]
 
 
 @pytest.mark.parametrize(
