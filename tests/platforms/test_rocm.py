@@ -69,3 +69,28 @@ def test_rocm_device_count_cache_keys_are_isolated():
 
         assert amdsmi_count.call_count == 3
         hip_count.assert_not_called()
+
+
+
+def test_amdsmi_context_raises_controlled_error_when_amdsmi_missing():
+    from vllm.platforms import rocm
+
+    @rocm.with_amdsmi_context
+    def query():
+        return "queried"
+
+    with patch.object(
+        rocm, "amdsmi_init", side_effect=RuntimeError("amdsmi is unavailable")
+    ):
+        with pytest.raises(RuntimeError, match="amdsmi is unavailable"):
+            query()
+
+
+def test_get_device_name_falls_back_to_torch_when_amdsmi_missing():
+    from vllm.platforms.rocm import RocmPlatform
+
+    RocmPlatform.get_device_name.cache_clear()
+    with patch.object(RocmPlatform, "_get_device_name_from_amdsmi",
+                      side_effect=RuntimeError("amdsmi is unavailable")):
+        with patch("torch.cuda.get_device_name", return_value="mock-device"):
+            assert RocmPlatform.get_device_name() == "mock-device"

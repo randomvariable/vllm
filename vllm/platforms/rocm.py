@@ -39,6 +39,19 @@ try:
         amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
+    AmdSmiException = RuntimeError
+
+    def _amdsmi_unavailable(*args, **kwargs):
+        raise RuntimeError("amdsmi is unavailable")
+
+    amdsmi_get_gpu_asic_info = _amdsmi_unavailable
+    amdsmi_get_gpu_device_uuid = _amdsmi_unavailable
+    amdsmi_get_gpu_memory_total = _amdsmi_unavailable
+    amdsmi_get_processor_handles = _amdsmi_unavailable
+    amdsmi_init = _amdsmi_unavailable
+    amdsmi_shut_down = _amdsmi_unavailable
+    amdsmi_topo_get_link_type = _amdsmi_unavailable
+    amdsmi_topo_get_numa_node_number = _amdsmi_unavailable
     logger.warning("Failed to import from amdsmi with %r", e)
 
 try:
@@ -885,14 +898,26 @@ class RocmPlatform(Platform):
     @classmethod
     @with_amdsmi_context
     @lru_cache(maxsize=8)
-    def get_device_name(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+    def _get_device_name_from_amdsmi(cls, physical_device_id: int) -> str:
         handle = amdsmi_get_processor_handles()[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:
             return _ROCM_DEVICE_ID_NAME_MAP[asic_info_device_id]
         return asic_info["market_name"]
+
+    @classmethod
+    @lru_cache(maxsize=8)
+    def get_device_name(cls, device_id: int = 0) -> str:
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        try:
+            return cls._get_device_name_from_amdsmi(physical_device_id)
+        except AmdSmiException as error:
+            logger.warning_once(
+                "Failed to get device name from amdsmi, falling back to torch.cuda: %s",
+                error,
+            )
+            return torch.cuda.get_device_name(device_id)
 
     @classmethod
     @with_amdsmi_context
