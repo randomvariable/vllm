@@ -47,7 +47,9 @@ The control is not supported by the V2 model runner; use
 rows are included in penalty application, while marker-token and
 reasoning-block semantics remain unchanged.
 
-`reasoning_marker_penalty` and `thinking_token_budget` are independent and can
-be set together. The penalty discourages selected tokens; the budget counts
-reasoning tokens separately and forces `reasoning_end_str` when its limit is
-reached.
+`reasoning_marker_penalty`, `thinking_token_budget` and
+[`reasoning_answer_reserve`](../features/reasoning_outputs.md#answer-reserve)
+are independent and can be set together. The penalty discourages selected
+tokens; the budget counts reasoning tokens separately and forces
+`reasoning_end_str` when the limit is reached; the reserve forces
+`reasoning_end_str` once the remaining output budget drops to it.

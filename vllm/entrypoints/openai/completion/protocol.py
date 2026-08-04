@@ -26,6 +26,7 @@ from vllm.logprobs import Logprob
 from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
+    ReasoningAnswerReserve,
     RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
@@ -245,6 +246,18 @@ class CompletionRequest(OpenAIBaseModel):
     reasoning_marker_penalty: Annotated[
         float | None, BeforeValidator(validate_reasoning_marker_penalty)
     ] = None
+    reasoning_answer_reserve: ReasoningAnswerReserve = Field(
+        default=None,
+        description=(
+            "Number of output tokens to reserve for the final answer. While "
+            "inside a reasoning block, the reasoning-end token is forced once "
+            "the remaining output budget drops to this value, so the model "
+            "cannot spend all of max_tokens thinking. The close marker is "
+            "emitted from the reserved tokens, so answer text gets "
+            "reserve minus the marker length. Positive integer; -1 means "
+            "unset."
+        ),
+    )
 
     stream_interval: Annotated[int, Field(ge=1)] | None = Field(
         default=None,
@@ -398,6 +411,7 @@ class CompletionRequest(OpenAIBaseModel):
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
             reasoning_marker_penalty=self.reasoning_marker_penalty,
+            reasoning_answer_reserve=self.reasoning_answer_reserve,
         )
 
     @model_validator(mode="before")

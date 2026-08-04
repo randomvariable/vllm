@@ -44,6 +44,7 @@ from vllm.logprobs import Logprob
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     BeamSearchParams,
+    ReasoningAnswerReserve,
     RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
@@ -260,6 +261,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
     reasoning_marker_penalty: Annotated[
         float | None, BeforeValidator(validate_reasoning_marker_penalty)
     ] = None
+    reasoning_answer_reserve: ReasoningAnswerReserve = Field(
+        default=None,
+        description=(
+            "Number of output tokens to reserve for the final answer. While "
+            "inside a reasoning block, the reasoning-end token is forced once "
+            "the remaining output budget drops to this value, so the model "
+            "cannot spend all of max_tokens thinking. The close marker is "
+            "emitted from the reserved tokens, so answer text gets "
+            "reserve minus the marker length. Positive integer; -1 means "
+            "unset."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -742,6 +755,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
             reasoning_marker_penalty=self.reasoning_marker_penalty,
+            reasoning_answer_reserve=self.reasoning_answer_reserve,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
