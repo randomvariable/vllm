@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
+    _get_priority_backends,
     select_fp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -77,9 +78,7 @@ def cutlass_support(monkeypatch):
         (kFp8StaticTensorSym, kFp8DynamicTensorSym),
     ],
 )
-def test_fp8_explicit_cutlass_supports_standard_schemes(
-    weight_key, activation_key
-):
+def test_fp8_explicit_cutlass_supports_standard_schemes(weight_key, activation_key):
     config = _make_fp8_moe_config(moe_backend="cutlass")
     backend, experts_cls = select_fp8_moe_backend(
         config,
@@ -163,3 +162,99 @@ def test_fp8_moe_method_computes_cutlass_gate(
     fp8_quant.Fp8MoEMethod(quant_config, layer)
 
     assert selections == [{"allow_vllm_cutlass": expected_allow}]
+
+
+@pytest.fixture
+def mock_capability(monkeypatch):
+    """Pin the platform to CUDA at a chosen compute capability.
+
+    Lets the auto-selection ordering be exercised on CPU-only machines.
+    """
+
+    def _apply(capability: int) -> None:
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+        monkeypatch.setattr(
+            current_platform,
+            "is_device_capability",
+            lambda cap, device_id=0: cap == capability,
+        )
+        monkeypatch.setattr(
+            current_platform,
+            "is_device_capability_family",
+            lambda cap, device_id=0: cap // 10 == capability // 10,
+        )
+
+    return _apply
+
+
+# Consumer-class Blackwell: the vLLM CUTLASS grouped-MoE kernel measured slower
+# than Triton on sm_120 and no better on sm_121a, so auto must prefer Triton.
+@pytest.mark.parametrize("capability", [120, 121])
+def test_auto_prefers_triton_over_cutlass_on_blackwell_12x(mock_capability, capability):
+    mock_capability(capability)
+    backends = _get_priority_backends(
+        _make_fp8_moe_config(),
+        weight_key=kFp8StaticTensorSym,
+        activation_key=kFp8DynamicTensorSym,
+    )
+    assert backends.index(Fp8MoeBackend.TRITON) < backends.index(
+        Fp8MoeBackend.VLLM_CUTLASS
+    )
+
+
+@pytest.mark.parametrize("capability", [90, 100])
+def test_auto_keeps_cutlass_ahead_of_triton_on_other_capabilities(
+    mock_capability, capability
+):
+    mock_capability(capability)
+    backends = _get_priority_backends(
+        _make_fp8_moe_config(),
+        weight_key=kFp8StaticTensorSym,
+        activation_key=kFp8DynamicTensorSym,
+    )
+    assert backends.index(Fp8MoeBackend.VLLM_CUTLASS) < backends.index(
+        Fp8MoeBackend.TRITON
+    )
+
+
+def test_hopper_block_fp8_still_prefers_triton(mock_capability):
+    """The pre-existing Hopper block-FP8 TP branch is unaffected."""
+    mock_capability(90)
+    backends = _get_priority_backends(
+        _make_fp8_moe_config(),
+        weight_key=kFp8Static128BlockSym,
+        activation_key=kFp8Dynamic128Sym,
+    )
+    assert backends.index(Fp8MoeBackend.TRITON) < backends.index(
+        Fp8MoeBackend.VLLM_CUTLASS
+    )
+
+
+@pytest.mark.parametrize("capability", [120, 121])
+def test_batched_cutlass_order_unchanged_on_blackwell_12x(mock_capability, capability):
+    """Only the standard-format pair is reordered; batched order is untouched."""
+    mock_capability(capability)
+    backends = _get_priority_backends(
+        _make_fp8_moe_config(),
+        weight_key=kFp8StaticTensorSym,
+        activation_key=kFp8DynamicTensorSym,
+    )
+    assert backends.index(Fp8MoeBackend.BATCHED_VLLM_CUTLASS) < backends.index(
+        Fp8MoeBackend.BATCHED_TRITON
+    )
+
+
+@pytest.mark.usefixtures("cutlass_support")
+@pytest.mark.parametrize("capability", [120, 121])
+def test_explicit_cutlass_still_selected_on_blackwell_12x(mock_capability, capability):
+    mock_capability(capability)
+    backend, experts_cls = select_fp8_moe_backend(
+        _make_fp8_moe_config(moe_backend="cutlass"),
+        weight_key=kFp8StaticTensorSym,
+        activation_key=kFp8DynamicTensorSym,
+        allow_vllm_cutlass=True,
+    )
+    assert backend == Fp8MoeBackend.VLLM_CUTLASS
+    assert experts_cls is not None

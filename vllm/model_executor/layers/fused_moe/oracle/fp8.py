@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -120,6 +120,13 @@ def _get_priority_backends(
             _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.FLASHINFER_CUTLASS)
         else:
             _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.TRITON)
+
+    # On consumer-class Blackwell (12.x), the vLLM CUTLASS grouped-MoE kernel
+    # is slower than Triton at every measured batch size, so prefer Triton.
+    # ``is_device_capability_family(120)`` intentionally covers both 12.0 and
+    # 12.1. An explicit ``--moe-backend cutlass`` still selects CUTLASS.
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.TRITON)
 
     if current_platform.is_xpu():
         # XPU platform supports TritonExperts and XPUExpertsFp8,
@@ -317,6 +324,7 @@ def select_fp8_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[Fp8MoeBackend, type[mk.FusedMoEExperts]]:
+        reason: str | None = None
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
@@ -479,7 +487,7 @@ def convert_to_fp8_moe_kernel_format(
             w2,
             w13_scale,
             w2_scale,
-            tuple(layer.weight_block_size),
+            tuple(cast(list[int], layer.weight_block_size)),
         )
     elif fp8_backend == Fp8MoeBackend.AITER:
         w13, w2 = rocm_aiter_ops.shuffle_weights(w13, w2)
@@ -499,10 +507,10 @@ def convert_to_fp8_moe_kernel_format(
         convert_to_humming_moe_kernel_format(
             layer, quant_config=_humming_fp8_weight_schema(layer, w13, w13_scale)
         )
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
+        w13 = cast(torch.Tensor, layer.w13_weight)
+        w2 = cast(torch.Tensor, layer.w2_weight)
+        w13_scale = cast(torch.Tensor, layer.w13_weight_scale)
+        w2_scale = cast(torch.Tensor, layer.w2_weight_scale)
     elif fp8_backend == Fp8MoeBackend.MARLIN:
         weight_block_size = getattr(layer, "weight_block_size", None)
         if weight_block_size == [1, 32]:
@@ -697,7 +705,7 @@ def make_fp8_moe_kernel(
 
     logger.info_once("Using %s", prepare_finalize.__class__.__name__)
 
-    extra_kwargs = {}
+    extra_kwargs: dict[str, Any] = {}
     if fp8_backend == Fp8MoeBackend.HUMMING:
         assert layer is not None
         extra_kwargs = {"layer": layer}

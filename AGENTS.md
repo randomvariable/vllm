@@ -138,6 +138,20 @@ The line length limit for Python code is 88 characters. If you are not sure, use
 
 Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) (`Args:`/`Returns:`/`Raises:` sections), not reStructuredText/Sphinx fields (`:param:`, `:return:`, `:rtype:`).
 
+### Choosing a kernel implementation
+
+Prefer, in order, and justify skipping a tier: an existing
+[AITER](https://github.com/ROCm/aiter) operator on ROCm; then Triton, which vLLM
+V1 uses as the portable layer so one implementation serves CUDA and ROCm; then
+hand-written CUDA/HIP or CUTLASS, only where the hardware exposes something with
+no portable expression. Compiling is not justification — measure against Triton
+before making anything the selected default.
+
+AITER changes belong in the fork at `github.com/randomvariable/aiter`, branch
+`homelabs-main`, consumed as a submodule — not patched in-tree here. See
+[the kernel targets guide](docs/contributing/kernel_targets/README.md) for what
+AITER does and does not give you on RDNA.
+
 ### Coding style guidelines
 
 - Match existing code style

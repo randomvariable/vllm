@@ -1154,7 +1154,7 @@ def prepare_fp8_moe_layer_for_deepgemm(
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    block_shape: tuple[int],
+    block_shape: tuple[int, ...],
 ):
     w13, w13_scale = deepgemm_post_process_fp8_weight_block(
         wq=w13,
