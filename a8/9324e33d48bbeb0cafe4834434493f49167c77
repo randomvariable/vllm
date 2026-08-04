@@ -1,0 +1,21 @@
+vllm/platforms/rocm.py
+  s_944a416814ea17::t_c03bcb21baac2b 257-266,407-409
+vllm/v1/worker/gpu_model_runner.py
+  s_944a416814ea17::t_c03bcb21baac2b 6433-6465,6467-6471,6473-6476,6478-6483
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "a89324e33d48bbeb0cafe4834434493f49167c77",
+  "prompts": {},
+  "sessions": {
+    "s_944a416814ea17": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_031ab1099ffeYcZZgV1mdqXqXK",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
