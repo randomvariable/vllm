@@ -303,7 +303,14 @@ class ModelConfig:
     (stored in `~/.cache/huggingface/token`)."""
     hf_overrides: HfOverrides = field(default_factory=dict)
     """If a dictionary, contains arguments to be forwarded to the Hugging Face
-    config. If a callable, it is called to update the HuggingFace config."""
+    config. If a callable, it is called to update the HuggingFace config.
+
+    Dict-valued keys (e.g. `{"text_config": {...}}`) target the matching
+    sub-config. Flat keys are applied to the config that already defines them,
+    preferring the top-level config and falling back to the text config of a
+    multimodal wrapper, so that a key such as `num_experts_per_tok` reaches the
+    language model instead of being set on an object it never reads. Keys that
+    match neither are still applied at the top level but logged as a warning."""
     model_class_overrides: dict[str, str] = field(default_factory=dict)
     """Override the model class used for one or more architectures, mapping the
     architecture name to a `"module:class"` target (the same format accepted by
