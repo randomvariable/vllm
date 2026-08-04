@@ -1,0 +1,53 @@
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+  s_0b1aeea33cf97a::t_66c5bd30ef62cb 18-20,93,146,148
+  s_0b1aeea33cf97a::t_a747f9207f3f7e 40-44,147
+vllm/v1/attention/backends/mla/indexer.py
+  s_0b1aeea33cf97a::t_66c5bd30ef62cb 451-452,454-455
+  s_0b1aeea33cf97a::t_ce2be5b379bbce 444-445
+  s_0b1aeea33cf97a::t_a4046cd0ded013 458
+  s_5f22b51e860ab9::t_d794e81c05ad51 448-449
+  s_0b1aeea33cf97a::t_03de020cc91698 446-447
+vllm/v1/attention/backends/mla/flashmla_sparse.py
+  s_0b1aeea33cf97a::t_66c5bd30ef62cb 230-232
+  s_0b1aeea33cf97a::t_a4046cd0ded013 227-228,234
+  s_0b1aeea33cf97a::t_ce2be5b379bbce 223-224
+  s_0b1aeea33cf97a::t_03de020cc91698 225-226
+tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+  s_0b1aeea33cf97a::t_a4046cd0ded013 23-27,68-69,71-75,88-90,93-94,100-102,105-107,110-111,113
+  s_0b1aeea33cf97a::t_560c7c7d0c5a9e 70
+  s_0b1aeea33cf97a::t_a747f9207f3f7e 99
+  s_0b1aeea33cf97a::t_592985d3926452 6,76,87,91-92,95,103-104,108-109,112
+  s_0b1aeea33cf97a::t_e68ce71bcde192 10
+  s_0b1aeea33cf97a::t_03de020cc91698 77-86,114-145
+  s_0b1aeea33cf97a::t_85a7bf86b98a2e 21-22
+  s_0b1aeea33cf97a::t_900aaf8c329b27 96-98
+  s_0b1aeea33cf97a::t_6caa54503e3fcc 13-17
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+  s_0b1aeea33cf97a::t_66c5bd30ef62cb 300-302
+  s_0b1aeea33cf97a::t_f5adb03b4704ec 310,314
+  s_0b1aeea33cf97a::t_03de020cc91698 304-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "d22ed17152bd6385600258bf9d926cd4ceb5a6b8",
+  "prompts": {},
+  "sessions": {
+    "s_0b1aeea33cf97a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04878f471ffe0eOC4sNr0BAsGc",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_5f22b51e860ab9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_048515ecbffeAJ2DT8NbKQG6hU",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

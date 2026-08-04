@@ -1,0 +1,34 @@
+vllm/v1/worker/gpu_model_runner.py
+  s_8852b93935ea61::t_05534e4f4a34ad 77,5549
+vllm/model_executor/layers/quantization/base_config.py
+  s_8852b93935ea61::t_05534e4f4a34ad 74-77
+vllm/model_executor/layers/quantization/mxfp4.py
+  s_8852b93935ea61::t_0ea53f4be273e3 757
+  s_8852b93935ea61::t_05534e4f4a34ad 545-547,733,735-746,756,758-766
+tests/model_executor/model_loader/test_reload.py
+  s_8852b93935ea61::t_05534e4f4a34ad 578-601
+tests/model_executor/test_b12x_mxfp4_moe.py
+  s_8852b93935ea61::t_05534e4f4a34ad 15,108-174,232-237
+vllm/model_executor/layers/fused_moe/experts/b12x_mxfp4_moe.py
+  s_8852b93935ea61::t_05534e4f4a34ad 93,237-242
+vllm/model_executor/model_loader/reload/layerwise.py
+  s_8852b93935ea61::t_05534e4f4a34ad 36,84-103,120-121
+vllm/model_executor/model_loader/reload/__init__.py
+  s_8852b93935ea61::t_05534e4f4a34ad 22,31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "c46c72dd279d85b238542ddd205e628f3faf0d9c",
+  "prompts": {},
+  "sessions": {
+    "s_8852b93935ea61": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04556fb65ffe83TA909nR7aueb",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
