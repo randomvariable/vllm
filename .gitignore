@@ -119,6 +119,9 @@ ipython_config.py
 # generated files
 **/generated/**
 
+# Disposable Laguna reasoning benchmark artifacts.
+/artifacts/laguna-reasoning/
+
 # uv
 uv.lock
 
