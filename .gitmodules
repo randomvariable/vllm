@@ -2,3 +2,7 @@
 	path = third_party/flashinfer
 	url = https://github.com/randomvariable/flashinfer.git
 	branch = homelab/v0.6.15.post1-dspark-topk256
+[submodule "third_party/deep_gemm"]
+	path = third_party/deep_gemm
+	url = https://github.com/vllm-project/DeepGEMM.git
+	branch = codex/cuda129-fp8-include-5f33a180

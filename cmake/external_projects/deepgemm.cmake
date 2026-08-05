@@ -29,8 +29,13 @@ if(DEEPGEMM_SRC_DIR)
 else()
   # Keep in sync with tools/install_deepgemm.sh
   set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # TODO: switch to nv_dev branch after it support situ
-  set(_DEEPGEMM_UPSTREAM_TAG "e21c821f39a2056d68067a466c64ddc942200106")
+  # FetchContent fallback only used when DEEPGEMM_SRC_DIR is not set (i.e.
+  # host builds without the submodule). Production images set
+  # DEEPGEMM_SRC_DIR=/src/vllm/third_party/deep_gemm (the pinned submodule,
+  # currently codex/cuda129-fp8-include-5f33a180 = nv_dev+situ + CUDA header
+  # fix) so this FetchContent path is not exercised in CI. Kept in sync with
+  # tools/install_deepgemm.sh for host/dev builds.
+  set(_DEEPGEMM_UPSTREAM_TAG "2fd67329ec2942f65ba35d561256ab6ed3b903cb")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)

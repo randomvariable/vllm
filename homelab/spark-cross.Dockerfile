@@ -22,6 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch \
     DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/lib \
     DEEPGEMM_TORCH_CXX11_ABI=1 \
+    DEEPGEMM_SRC_DIR=/src/vllm/third_party/deep_gemm \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.0 12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
