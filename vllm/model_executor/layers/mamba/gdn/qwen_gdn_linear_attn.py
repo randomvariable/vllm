@@ -400,26 +400,74 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # projection of the input hidden states
         # Qwen3-Next and Qwen3.5 has a different qkv_proj layout,
-        # we need to create qkvz_proj adaptively here.
-        # When create_in_proj_qkvz is False (e.g. LoRA enabled in Qwen3.5),
-        # in_proj_qkv and in_proj_z are created separately instead.
-        self.in_proj_qkvz = self.create_qkvz_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
+        # so we need to create qkvz_proj adaptively here.
+        #
+        # create_in_proj_qkvz / create_in_proj_ba (read from the HF
+        # text_config) toggle a split-projection path: when False the qkvz
+        # (resp. ba) projection is materialized as the separate
+        # in_proj_qkv + in_proj_z (resp. in_proj_b + in_proj_a) layers
+        # instead of a single fused layer. This keeps each projection on
+        # its own per-tensor quant group so GGUF models with mixed
+        # quantization (e.g. attn_qkv=type100, attn_gate=type101) can stay
+        # quantized end-to-end instead of being force-dequantized into one
+        # merged group. The merged layers (in_proj_qkvz / in_proj_ba) are
+        # NOT created on the split path; downstream code differentiates
+        # via the flags themselves. Defaults preserve the prior
+        # fully-merged behavior.
+        self.create_in_proj_qkvz = getattr(
+            config, "create_in_proj_qkvz", True
         )
+        self.create_in_proj_ba = getattr(config, "create_in_proj_ba", True)
+
+        if self.create_in_proj_qkvz:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvz",
+            )
+        else:
+            # Split path: q/k/v fused (3 outputs, NOT 4) and a separate z.
+            # Mirrors the non-interleaved Qwen3.5 [q, k, v] + [z] layout;
+            # the merged path's interleaved variant is not supported here.
+            self.in_proj_qkv = self.create_qkv_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_z = self.create_z_proj(
+                hidden_size=self.hidden_size,
+                value_dim=self.value_dim,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_z",
+            )
 
         # ba_proj doesn't support blockwise fp8 quantization.
         # Qwen3-Next and Qwen3.5 have different in_proj_ba checkpoint
         # layouts, so we use a factory method to create the projection.
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
-            num_v_heads=self.num_v_heads,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
+        if self.create_in_proj_ba:
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
+        else:
+            self.in_proj_b = self.create_b_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_b",
+            )
+            self.in_proj_a = self.create_a_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_a",
+            )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
 
         query_key_settings = (self.key_dim, 0, False)
@@ -539,6 +587,106 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
         )
+
+    def create_qkv_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        # Split path counterpart of create_qkvz_proj: only q/k/v (3
+        # outputs), z lives in its own in_proj_z layer. Non-interleaved
+        # Qwen3.5 layout only.
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[key_dim, key_dim, value_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_z_proj(
+        self,
+        hidden_size: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> ColumnParallelLinear:
+        # Split path counterpart of the z slice of in_proj_qkvz.
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=value_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_b_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> ColumnParallelLinear:
+        # Split path counterpart of the b slice of in_proj_ba. Mirrors the
+        # merged path's Marlin-friendly TP-disable logic.
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_v_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=self.maybe_disable_tp(quant_config),
+        )
+
+    def create_a_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> ColumnParallelLinear:
+        # Split path counterpart of the a slice of in_proj_ba. Mirrors the
+        # merged path's Marlin-friendly TP-disable logic.
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_v_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=self.maybe_disable_tp(quant_config),
+        )
+
+    def _input_projection(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project hidden states into the (qkvz, ba) pair consumed by all
+        forward paths.
+
+        On the merged path (create_in_proj_qkvz / create_in_proj_ba True)
+        this is a direct call through in_proj_qkvz / in_proj_ba. On the
+        split path each projection is its own layer; the q/k/v and z
+        outputs (and the b / a outputs) are concatenated back into the
+        exact same [q, k, v, z] / [b, a] layout the merged path produces,
+        so all downstream code (fix_query_key_value_ordering, split_ba,
+        core attention) is unchanged.
+        """
+        if self.create_in_proj_qkvz:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        else:
+            qkv, _ = self.in_proj_qkv(hidden_states)
+            z, _ = self.in_proj_z(hidden_states)
+            mixed_qkvz = torch.cat([qkv, z], dim=-1)
+
+        if self.create_in_proj_ba:
+            ba, _ = self.in_proj_ba(hidden_states)
+        else:
+            b, _ = self.in_proj_b(hidden_states)
+            a, _ = self.in_proj_a(hidden_states)
+            ba = torch.cat([b, a], dim=-1)
+        return mixed_qkvz, ba
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
         """Whether to replicate ba_proj instead of TP-sharding it.
@@ -801,8 +949,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         available, otherwise falling back to the generic CUDA path."""
         if GDN_AITER_TRITON_AVAILABLE:
             num_tokens = hidden_states.size(0)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, projected_states_ba = (
+                self._input_projection(hidden_states)
+            )
             projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
             projected_states_ba = projected_states_ba.view(num_tokens, -1)
             core_attn_out = torch.empty(
@@ -843,8 +992,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._input_projection(hidden_states)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -904,8 +1052,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        projected_states_qkvz, projected_states_ba = (
+            self._input_projection(hidden_states)
+        )
 
         # ============================================================
         # Part 2: Core Attention
@@ -942,10 +1091,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on CPU."
-
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        # Note: the split-projection path (in_proj_qkv / in_proj_z /
+        # in_proj_b / in_proj_a) is plain Linear layers and is fully
+        # supported on CPU. The old `in_proj_qkv` LoRA check is no
+        # longer a reliable LoRA proxy now that split projections are
+        # first-class, so it has been removed.
+        mixed_qkvz, ba = self._input_projection(hidden_states)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
