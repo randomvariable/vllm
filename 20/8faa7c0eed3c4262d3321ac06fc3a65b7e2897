@@ -1,0 +1,19 @@
+csrc/libtorch_stable/cutlass_extensions/common.cpp
+  s_c23e8af7dea474::t_e791e9f7410262 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "208faa7c0eed3c4262d3321ac06fc3a65b7e2897",
+  "prompts": {},
+  "sessions": {
+    "s_c23e8af7dea474": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d35febfffePUx6sgKj4oCyMx",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_helper.hpp
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 33,42
+csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 617,707
+csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_entry.cu
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 50
+csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_entry.cu
+  s_417621c3aaae3e::t_65e81f641bd2eb 392
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 239,302,345,367-368,452
+csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu
+  s_01c23daf7a0af5::t_0228490f343c81 164,167
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 63-64,82,84,128,130,146,148
+csrc/libtorch_stable/cutlass_extensions/common.hpp
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 28
+csrc/libtorch_stable/cutlass_extensions/common.cpp
+  s_7278873b76e0dd::t_351929a7120804 5-8,11
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 3
+csrc/libtorch_stable/quantization/fp4/mxfp4_blockwise_moe_kernel.cu
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 379
+csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu
+  s_a7b662ab742bb6::t_79d5e5b611b8f8 393,431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "1d8b29633ab02828f3e764ffc99d5d9b270aa5ff",
+  "prompts": {},
+  "sessions": {
+    "s_01c23daf7a0af5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0490c03beffevd4E5p1lz650tB",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_7278873b76e0dd": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04a62b55affeohwd9Y2eBAbhHq",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_a7b662ab742bb6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04a5739efffeX6gsJKSgHwh2EE",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

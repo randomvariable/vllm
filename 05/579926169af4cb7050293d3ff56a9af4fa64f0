@@ -1,0 +1,28 @@
+AGENTS.md
+  s_f63b4e055795cf::t_406cb97066916e 89-94
+  s_f456fb3a1b3006::t_a7ef84bea649a4 105-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "05579926169af4cb7050293d3ff56a9af4fa64f0",
+  "prompts": {},
+  "sessions": {
+    "s_f456fb3a1b3006": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_043570976ffeuK5Q8AIrOGba3n",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_f63b4e055795cf": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0433fdfc5ffeq1F8YfptIku4jb",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

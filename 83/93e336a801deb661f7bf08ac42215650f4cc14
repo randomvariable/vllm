@@ -1,0 +1,23 @@
+vllm/v1/sample/thinking_budget_state.py
+  s_ce939b200abc05::t_14f40ab876597e 9,17-18,672-682,696,704-705,737-738,741-759
+  s_ce939b200abc05::t_3010e81112d6a5 59-61
+tests/v1/logits_processors/test_correctness.py
+  s_ce939b200abc05::t_14f40ab876597e 4,2502-2636
+  s_ce939b200abc05::t_5e960bbec2f865 2637
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "8393e336a801deb661f7bf08ac42215650f4cc14",
+  "prompts": {},
+  "sessions": {
+    "s_ce939b200abc05": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_034af0955ffeAfUxrGz1xJ6LrO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

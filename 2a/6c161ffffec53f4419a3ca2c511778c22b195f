@@ -1,0 +1,29 @@
+vllm/model_executor/warmup/kernel_warmup.py
+  s_8852b93935ea61::t_da5377b53f5d10 20-25
+  s_1de53c38d2d5b9::t_03ebd92b6423fd 343-345
+  s_1de53c38d2d5b9::t_13803135a1a3b7 9,311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "2a6c161ffffec53f4419a3ca2c511778c22b195f",
+  "prompts": {},
+  "sessions": {
+    "s_1de53c38d2d5b9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_045450655ffe9PnMJDCVBxrcx6",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_8852b93935ea61": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04556fb65ffe83TA909nR7aueb",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

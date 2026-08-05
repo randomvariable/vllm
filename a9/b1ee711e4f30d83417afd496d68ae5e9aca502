@@ -1,0 +1,75 @@
+vllm/model_executor/warmup/dflash_spec_decode_warmup.py
+  s_3c644cf33f69a1::t_91483bf7d6bd87 1-2,4,7-21,24-25
+  s_3c644cf33f69a1::t_dbea48668719dc 3,5-6,22-23,26
+AGENTS.md
+  s_417621c3aaae3e::t_051ff3ecf782b4 139
+vllm/model_executor/warmup/eagle_spec_decode_warmup.py
+  s_3c644cf33f69a1::t_91483bf7d6bd87 1-2,6-21,30,36-38,45-61,63-65,68-69,71-73
+  s_3c644cf33f69a1::t_dbea48668719dc 3-5,22,24,26-28,32-33,35,40,42-44,62,66-67,70
+  s_3c644cf33f69a1::t_0414200180fd65 23,25,29,31,39,41
+  s_3c644cf33f69a1::t_66ba2b6d7e36b0 34
+vllm/v1/worker/cpu_model_runner.py
+  s_3c644cf33f69a1::t_5d560725eb491a 80,89
+  s_3c644cf33f69a1::t_a8bab01c417725 5,83,86,103
+tests/model_executor/test_jit_warmup.py
+  s_3c644cf33f69a1::t_5ccd5f5ebf1bcc 5
+  s_3c644cf33f69a1::t_1a3d50ab3c24bb 43,178,197,227,243,264
+  s_3c644cf33f69a1::t_77f6027d2a78b6 419-426,431-435
+  s_3c644cf33f69a1::t_7f93a3ddf8f82e 427-430
+  s_3c644cf33f69a1::t_47acc05e121288 308-418
+vllm/model_executor/warmup/kernel_warmup.py
+  s_3c644cf33f69a1::t_871ad57a827fd3 137,147
+  s_3c644cf33f69a1::t_c5a2e34f60089e 130-136,138-146,148-160
+vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+  s_3c644cf33f69a1::t_d4e2d0db30aeb5 5,809
+  s_3c644cf33f69a1::t_42409c81a89c13 14-15
+  s_3c644cf33f69a1::t_b2d7afedfac6cf 4
+  s_3c644cf33f69a1::t_5d560725eb491a 480-697,708,731-808,810-846
+  s_3c644cf33f69a1::t_1a3d50ab3c24bb 201,215,343,361,424
+  s_3c644cf33f69a1::t_13caae82c73c87 56-58
+  s_3c644cf33f69a1::t_68231c4039b8b4 882
+  s_3c644cf33f69a1::t_9779ea6710aa07 396-397,866-869
+  s_3c644cf33f69a1::t_b41af97e117b70 881,889-891,894-897,900,906
+  s_3c644cf33f69a1::t_7f9f337668d02a 479
+  s_3c644cf33f69a1::t_8f48d4de95a29c 698-707,709-730
+  s_3c644cf33f69a1::t_54e2b2cf7a6d17 398-399
+  s_8852b93935ea61::t_f7a16792dc53c4 350-356
+vllm/v1/spec_decode/utils.py
+  s_3c644cf33f69a1::t_5d560725eb491a 3-5,7,10-11,14,19-21,39,42,44-45,48-183,185-199,216,220-221,224,228,231-300,302-311,313,316,318,321-325,327-356,358,360-453,455-468
+  s_3c644cf33f69a1::t_d4e2d0db30aeb5 6,184,301,454
+  s_3c644cf33f69a1::t_0414200180fd65 202-203,312,314-315,317,469-472
+  s_3c644cf33f69a1::t_7f9f337668d02a 40,229,319
+  s_3c644cf33f69a1::t_e92ca97e0abeef 200-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "a9b1ee711e4f30d83417afd496d68ae5e9aca502",
+  "prompts": {},
+  "sessions": {
+    "s_3c644cf33f69a1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0481ef785ffebMi1NDJTup7ytU",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_8852b93935ea61": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04556fb65ffe83TA909nR7aueb",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

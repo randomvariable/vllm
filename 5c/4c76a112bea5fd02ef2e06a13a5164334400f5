@@ -1,0 +1,19 @@
+docs/contributing/homelab-hard-requirements.md
+  s_417621c3aaae3e::t_13c19104feb867 61-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "5c4c76a112bea5fd02ef2e06a13a5164334400f5",
+  "prompts": {},
+  "sessions": {
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

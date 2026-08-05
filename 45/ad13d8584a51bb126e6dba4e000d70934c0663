@@ -1,0 +1,79 @@
+vllm/v1/sample/thinking_budget_state.py
+  s_4516a8177d3b39::t_f997d7c39f01ba 271,279-280
+  s_4516a8177d3b39::t_7263559e714097 59,66,96,100,165,168-175,189-194,199,210
+  s_4516a8177d3b39::t_f7691dce2586b4 65
+  s_4516a8177d3b39::t_309a1a7128cc20 95
+  s_4516a8177d3b39::t_701cb444996617 272-278
+  s_4516a8177d3b39::t_3bdaa852357d66 240-241,244-246
+  s_4516a8177d3b39::t_2a5cd9b5cd0b94 552
+  s_4516a8177d3b39::t_15ca31a96e99dc 551,553
+  s_4516a8177d3b39::t_129f1f4f8a9376 176,183-188,195-198
+  s_4516a8177d3b39::t_7c6a3fba56636c 177-182
+tests/v1/logits_processors/test_correctness.py
+  s_4516a8177d3b39::t_a19540fb85bfbe 974
+  s_4516a8177d3b39::t_5d18d95820b88e 979-986,992
+  s_4516a8177d3b39::t_174600c90529ba 1033-1038,1040-1045
+  s_4516a8177d3b39::t_e1ab6fd69ccfe6 1025-1032,1039,1046-1051,1054-1055
+  s_4516a8177d3b39::t_ab13bab296dd12 108,971-973,975-978,987-991,993-1022
+  s_4516a8177d3b39::t_15ca31a96e99dc 1052
+  s_4516a8177d3b39::t_904cc5342b0579 1053
+  s_4516a8177d3b39::t_f7691dce2586b4 1533,1835
+  s_3a709f174eeccd::t_0a5b5bb1e21a43 1023-1024
+vllm/config/reasoning.py
+  s_4516a8177d3b39::t_e5f63ee5961493 12-13,31-32,42-44,70-73,79,113,117-118,120,122-125
+  s_4516a8177d3b39::t_aa150ca0315b20 112,115-116,119,121,126
+  s_4516a8177d3b39::t_309a1a7128cc20 114
+  s_4516a8177d3b39::t_629d6e3030a53f 8
+vllm/v1/engine/input_processor.py
+  s_4516a8177d3b39::t_e5f63ee5961493 111-114,120,126
+vllm/entrypoints/openai/completion/protocol.py
+  s_4516a8177d3b39::t_29a40f1200ee8c 9,245-247
+  s_4516a8177d3b39::t_e5f63ee5961493 400
+  s_4516a8177d3b39::t_2a1760cdffa9aa 34
+vllm/v1/sample/rejection_sampler.py
+  s_4516a8177d3b39::t_15ca31a96e99dc 341-344
+tests/entrypoints/openai/chat_completion/test_thinking_token_budget_validation.py
+  s_4516a8177d3b39::t_174600c90529ba 45,102
+  s_4516a8177d3b39::t_97c27b40f49b53 46-67,100-101,103-122
+docs/configuration/README.md
+  s_5dd55edbbcc69a::t_52c3c5240f9713 10-53
+vllm/sampling_params.py
+  s_4516a8177d3b39::t_e5f63ee5961493 58-76,81-84,374-375,400,463
+  s_4516a8177d3b39::t_701cb444996617 501-503
+vllm/entrypoints/openai/chat_completion/protocol.py
+  s_4516a8177d3b39::t_29a40f1200ee8c 52,260-262
+  s_4516a8177d3b39::t_7c6a3fba56636c 13-16,18-20
+  s_4516a8177d3b39::t_e5f63ee5961493 744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "45ad13d8584a51bb126e6dba4e000d70934c0663",
+  "prompts": {},
+  "sessions": {
+    "s_3a709f174eeccd": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03cd8ef88ffeoXPg9FBpT0Glg1",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_4516a8177d3b39": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d16c1a9ffeQQWJo4ktI0CSM4",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_5dd55edbbcc69a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d025140ffeOxAsnh2CFNCLkg",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+vllm/v1/spec_decode/step3p5.py
+  s_51914fc7cfe0f7::t_df0804034c7770 340-345
+tests/v1/spec_decode/test_mtp.py
+  s_51914fc7cfe0f7::t_f748628e0c27cd 223-232
+  s_51914fc7cfe0f7::t_f906b35e1790f7 35-37,131,133,257
+  s_51914fc7cfe0f7::t_757cfa31f6ab6d 48,64
+  s_51914fc7cfe0f7::t_df0804034c7770 29,246-248,250,256
+  s_51914fc7cfe0f7::t_083df7f27acbe3 140
+  s_51914fc7cfe0f7::t_6c7e57ee45e75b 173
+  s_51914fc7cfe0f7::t_4aeeb2187c7740 121,132,172,213-218,220-222,233-243,249,251-253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "6063c559d5d99ad9166c479c502e56d3dbaddaa7",
+  "prompts": {},
+  "sessions": {
+    "s_51914fc7cfe0f7": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0402a7109ffeU3vOHFX01dNlJj",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

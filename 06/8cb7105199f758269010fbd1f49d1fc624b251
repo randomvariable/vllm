@@ -1,0 +1,19 @@
+.gitignore
+  s_6d26c22b327356::t_384af0bea803fe 122-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "068cb7105199f758269010fbd1f49d1fc624b251",
+  "prompts": {},
+  "sessions": {
+    "s_6d26c22b327356": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0381458a2ffe77a5KdPUlcAaMr",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

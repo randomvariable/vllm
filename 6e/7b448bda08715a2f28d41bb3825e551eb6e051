@@ -1,0 +1,78 @@
+homelab/devloop/src/artifacts.rs
+  s_b207f263356cd9::t_91758609bf17d6 76-80
+  s_b207f263356cd9::t_c755e40d5652ea 131
+  s_b207f263356cd9::t_7da3c6b48b96ce 1-15,17-47,49-50,52-75,85-130,132-145
+  s_b207f263356cd9::t_7e7052ea9ec84e 16,48,51,81-84
+homelab/devloop/src/docker.rs
+  s_b207f263356cd9::t_d87a09e1a1e7e3 1-32,53-73,76-92,94-98,100,102-104,106-121,126-128,133-153,160-192,194-214,228-230,232-248,251,256-293,298-308,311-313
+  s_b207f263356cd9::t_c755e40d5652ea 75,93,105,231
+  s_b207f263356cd9::t_f12d44f7a1830f 122-125,129-132,154-159,252-255,294-297,309-310
+  s_eaff2fd1a9bf11::t_f115d4b2c32edd 33-52,74,99,101,193,215-227,249-250
+homelab/devloop/Cargo.toml
+  s_b207f263356cd9::t_20f998ae21dd90 1-21
+docs/contributing/incremental_build.md
+  s_eaff2fd1a9bf11::t_f115d4b2c32edd 80-87
+  s_612a96d4df4f98::t_435154a7262486 45-79,88-91
+homelab/rocm-dev-test.sh
+  s_612a96d4df4f98::t_435154a7262486 32-34
+homelab/devloop/src/probe.rs
+  s_b207f263356cd9::t_0bf859d6641c36 13,33-36,84
+  s_eaff2fd1a9bf11::t_854831f599f811 160-162
+  s_b207f263356cd9::t_19192360deb3cb 1-12,14-24,26-32,37-51,58-83,85-117,120-152,158-159,163-171,173-174,180-182,185-187,189-230,232-245,262-279
+  s_b207f263356cd9::t_2e4520b99f5917 172,175-176,183-184,188
+  s_eaff2fd1a9bf11::t_5cf28c5d941238 255-258
+  s_b207f263356cd9::t_72eff68f1a247c 25
+  s_b207f263356cd9::t_f12d44f7a1830f 118-119,153-157,177-179,247-250
+  s_eaff2fd1a9bf11::t_a3c20d69ee5723 231,246
+  s_eaff2fd1a9bf11::t_f115d4b2c32edd 52-57,251-254,259-261
+homelab/devloop/src/main.rs
+  s_b207f263356cd9::t_bf3dff77d692e4 277-280
+  s_b207f263356cd9::t_832b1511f2389e 342-348
+  s_b207f263356cd9::t_b9a68071567d7c 210-211,226-230,281
+  s_b207f263356cd9::t_5bee7f9cc94838 89,192-198,205
+  s_eaff2fd1a9bf11::t_f115d4b2c32edd 25,118,130-135,267-269,271-274
+  s_b207f263356cd9::t_5492f134169bfc 14,208-209,212-225,237-248,257-259,282,455,462-463,465-468
+  s_b207f263356cd9::t_659708c3b649cf 1-13,15-24,26-88,90-104,109-115,117,119-120,126,150-156,174,178,180,182-191,199-204,206-207,231-236,260-266,270,275-276,283-341,349-363,368-407,414,422-427,431-448,470
+  s_b207f263356cd9::t_f12d44f7a1830f 105-108,364-367,408-413,415-421,428-430
+  s_b207f263356cd9::t_fc18179c551193 449-454,456-461,464,469
+  s_b207f263356cd9::t_05d23e26d37424 157-172,176-177
+  s_eaff2fd1a9bf11::t_4e2a11bae77348 142-143
+  s_b207f263356cd9::t_91758609bf17d6 249-256
+  s_b207f263356cd9::t_c80df405788158 116,121-125,127-129,136-141,144-149,173,175,179,181
+Makefile.toml
+  s_b207f263356cd9::t_b06245e0166b23 1-69
+homelab/devloop/Cargo.lock
+  s_b207f263356cd9::t_896fbb6bc87c18 1-325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "6e7b448bda08715a2f28d41bb3825e551eb6e051",
+  "prompts": {},
+  "sessions": {
+    "s_612a96d4df4f98": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04d08c955ffeDr0AJdeizEEQRr",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_b207f263356cd9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04d2afec3ffe1dJTcrfvR5b4pq",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_eaff2fd1a9bf11": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04a7fe82fffeLsZHuGG87plcs9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

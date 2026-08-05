@@ -1,0 +1,30 @@
+tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+  s_f1220a44ce5cf3::t_909294398ffc5e 1164-1165
+  s_f1220a44ce5cf3::t_8d277a6313be13 1144
+  s_e9d3f2b68a1986::t_f806dd60a5b8f1 1184-1185,1187-1190,1193-1196
+  s_f1220a44ce5cf3::t_982ec1942f050e 1183,1191-1192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "7c813934bb3639bdeb4b5ba65b869b96ea4808b5",
+  "prompts": {},
+  "sessions": {
+    "s_e9d3f2b68a1986": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_048d213f7ffeHEDxwc3EkNJSpH",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_f1220a44ce5cf3": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_048fe6860ffebEV1Mk50X1f0sY",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

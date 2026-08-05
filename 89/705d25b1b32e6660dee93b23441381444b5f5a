@@ -1,0 +1,30 @@
+tests/quantization/test_moe_wna16.py
+  s_b9952cca401f5c::t_9f7691fdacd929 15-20,29-34,51-63,70-71,73-78
+  s_5b3260e0dc33b9::t_00ef4993d4eacb 37-40
+  s_5b3260e0dc33b9::t_6b05ce7c28cec3 64-69,72,79-89
+  s_5b3260e0dc33b9::t_2bc77ae25f89e6 90-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "89705d25b1b32e6660dee93b23441381444b5f5a",
+  "prompts": {},
+  "sessions": {
+    "s_5b3260e0dc33b9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_038a7c0f2ffewTQ3DGTE7mzWtb",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_b9952cca401f5c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_038bcb3d3ffeRTwP77emhFsP2p",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

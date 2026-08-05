@@ -1,0 +1,25 @@
+vllm/config/model.py
+  s_04ffbbe14b3d15::t_71ee61cbf09a81 300-307
+vllm/transformers_utils/config.py
+  s_04ffbbe14b3d15::t_06bed0abf0317f 682-726,839
+tests/transformers_utils/test_hf_overrides_flat_routing.py
+  s_04ffbbe14b3d15::t_3b3d17fc21f2bc 1-77
+docs/configuration/model_resolution.md
+  s_04ffbbe14b3d15::t_84056ab06aeed9 24-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "da7bbda20a336f927ca9461cb0fe8ac2564f83a8",
+  "prompts": {},
+  "sessions": {
+    "s_04ffbbe14b3d15": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03170cc3fffe6z3zGNnt6qVa7v",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

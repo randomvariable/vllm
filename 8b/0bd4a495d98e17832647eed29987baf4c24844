@@ -1,0 +1,164 @@
+homelab/devloop/src/docker.rs
+  s_aee0270a8ca7f5::t_7f0ae13de7e70f 280-283
+  s_aee0270a8ca7f5::t_6ed094b2d2f464 23-24,98,271-279
+  s_3c68c427fce0d2::t_05506abb4eb289 284-285
+docs/contributing/README.md
+  s_9a86ea2ca946de::t_0d4bc42ee6f1f7 143-148
+docs/contributing/incremental_build.md
+  s_4ad22163c0cd59::t_98b02c38e5755f 81-87
+  s_8a425bfde4979a::t_b1019b5782733d 58,67
+  s_8a425bfde4979a::t_912222fe62e373 104-105
+  s_9a86ea2ca946de::t_0d4bc42ee6f1f7 90-91,95-96,106-110,113-114
+  s_f2c8d339b6a529::t_6c63346564c230 88-89,92-94
+  s_a7b36cfbfa13e3::t_30638d6405cdcd 76-77
+homelab/devloop/src/probe.rs
+  s_417621c3aaae3e::t_3b4ecc7c6f7cf2 59-60
+  s_4ad22163c0cd59::t_cbf885d9996402 180-182,187-190
+  s_4ad22163c0cd59::t_7b107c62c8d1fb 114-115,138-152,178,183-186,191-192
+  s_4ad22163c0cd59::t_4fd90404406019 179
+  s_a7c250dc700f11::t_da2fb4134a2e0f 284-294
+  s_4ad22163c0cd59::t_df80734f984055 278-281
+  s_4ad22163c0cd59::t_e215d1d6e4f181 337
+  s_4ad22163c0cd59::t_279575825ed919 38
+  s_4ad22163c0cd59::t_7b8b78d3983992 35
+  s_4ad22163c0cd59::t_41656c246ae8a6 247,295,309,331
+  s_4ad22163c0cd59::t_251fad9600f2fe 71-82
+  s_4ad22163c0cd59::t_5f99afe3a58b3c 277
+  s_4ad22163c0cd59::t_7671d81dc19bee 193
+  s_f1826d798cf76c::t_0eb37469bed219 282-283
+docs/contributing/homelab-hard-requirements.md
+  s_62b12f56be0d0e::t_a7ad1d485a6a8d 68
+AGENTS.md
+  s_9a86ea2ca946de::t_0d4bc42ee6f1f7 82-86
+.gitignore
+  s_ed26dd18a739d9::t_d2fefe3ed68ff8 4-6
+homelab/devloop/src/main.rs
+  s_4ad22163c0cd59::t_08dfb2272b75f2 366,568-573
+  s_a7b36cfbfa13e3::t_3a78dadd1e8495 263,299-300,302-304,534,547-549,578-585
+  s_4ad22163c0cd59::t_cbf885d9996402 286-289,338,367
+  s_4ad22163c0cd59::t_1deb3b74a9352c 566-567,574-577
+  s_4ad22163c0cd59::t_3fb6099ff67525 268-269
+  s_4ad22163c0cd59::t_9e2fc41f8fa799 365
+  s_4ad22163c0cd59::t_524fddf29acf44 306-310,312-313,315-321,324-333,337,368
+  s_4ad22163c0cd59::t_531d70276d356f 550,553-557
+  s_4ad22163c0cd59::t_af6a450c185e71 558-565
+  s_4ad22163c0cd59::t_f0c94a8b54de80 219,291,374
+  s_4ad22163c0cd59::t_f6bca217bebd1c 544
+  s_8a425bfde4979a::t_b1019b5782733d 270-271,273-275,305,529-533,586-598
+  s_4ad22163c0cd59::t_24ae0dde8523dd 311,314,322-323,535-543,545-546
+  s_8a425bfde4979a::t_fd79ff70de4b02 272,525-528
+  s_4ad22163c0cd59::t_ade2379f435d5a 334-336
+  s_a7b36cfbfa13e3::t_30638d6405cdcd 301
+  s_4ad22163c0cd59::t_d83e8c2906bc7a 363-364
+  s_4ad22163c0cd59::t_7698aa11929498 551
+  s_4ad22163c0cd59::t_d80c4bcefb86f5 264-267
+  s_4ad22163c0cd59::t_f199529ba2800d 552
+  s_4ad22163c0cd59::t_369865b859d2f9 339-362
+  s_4ad22163c0cd59::t_35897e7cd0135e 369
+Makefile.toml
+  s_8a425bfde4979a::t_b1019b5782733d 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "8b0bd4a495d98e17832647eed29987baf4c24844",
+  "prompts": {},
+  "sessions": {
+    "s_3c68c427fce0d2": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d09fd7bffeJeS2VUcoXtdbht",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_417621c3aaae3e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0696072c9ffeUtcf1dR38L30zO",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_4ad22163c0cd59": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03aecb513ffeVusOJP4cGMSa94",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_62b12f56be0d0e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03a9dd4d0ffehZFZkjBdK6H1tL",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_8a425bfde4979a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b406bf3ffeKuim0jxMcfGcGd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_9a86ea2ca946de": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b79b5f7ffeFsJz7na9AEoa2M",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_a7b36cfbfa13e3": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b340bb1ffeLBKahPiGkKRMZ6",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_a7c250dc700f11": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b20f22bffeZMiAdBychM6Af7",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_aee0270a8ca7f5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b23f25effejcQ9BZJcMrma2g",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_ed26dd18a739d9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b50bc99ffeRFhFJEH9YkCmPq",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_f1826d798cf76c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_f1826d798cf76c",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_f2c8d339b6a529": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03b50bdbeffeyVRMR0Va6BlH8p",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

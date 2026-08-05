@@ -1,0 +1,31 @@
+tests/v1/core/kv_policy_replay.py
+  s_983819113de6cc::t_950ea2ec62f8e3 59,174-176,256-258,322-328
+tests/v1/core/test_kv_policy_replay.py
+  s_983819113de6cc::t_20e3d4f4070e23 76,79-80,110-111,229-233
+  s_983819113de6cc::t_950ea2ec62f8e3 109
+  s_b5eb1e44c4bd86::t_c94e8709587611 107-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "bfa59c35f49dd41e20ebc74a6d1f533abd0bf1a3",
+  "prompts": {},
+  "sessions": {
+    "s_983819113de6cc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d576f98ffeYo01Vb524JrqIE",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_b5eb1e44c4bd86": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03d53c141ffeUo5OZrt3cvoMG0",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

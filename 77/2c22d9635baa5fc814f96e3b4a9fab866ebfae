@@ -1,0 +1,70 @@
+vllm/v1/worker/cpu_model_runner.py
+  s_1c112d1d88e7a8::t_c62e70ddda0040 83,86
+tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+  s_69e71cc59c5345::t_e11c96bba8c5bc 241
+  s_69e71cc59c5345::t_0f1b0334dd584b 23
+  s_69e71cc59c5345::t_de12f369942cc6 645,660,664,668-672,689-694,696-697,699,702,763,777-778
+  s_69e71cc59c5345::t_6ac38e5af217f5 182,257,334,414,475,522,570,626,801,881,940,1014,1097,1171,1341
+  s_69e71cc59c5345::t_aa4b97022d9858 768-769,771
+  s_69e71cc59c5345::t_5536f541e86604 8,704-713,759,775
+  s_69e71cc59c5345::t_00cd43b8077db0 1208-1212,1219
+  s_69e71cc59c5345::t_f9789bc68d724d 37-43,183,258,335,415,476,523,571,627,802,882,941,1015,1098,1172,1342
+  s_69e71cc59c5345::t_071e9a674a1f9b 746-752
+  s_69e71cc59c5345::t_0265a95bed36c7 16
+  s_69e71cc59c5345::t_8081703369c541 734
+  s_69e71cc59c5345::t_59c4e16eea1e52 760-761,776
+  s_69e71cc59c5345::t_5424276b2c5566 605-625,628-637,641,643,736,738-743,745,758,767,770,772,774,779-780
+  s_69e71cc59c5345::t_a97b4568ea34b1 673-685
+  s_69e71cc59c5345::t_d20f80931682ee 714-730
+  s_69e71cc59c5345::t_f4f42b99bee3d9 644,661-663,665,698,701,703
+  s_69e71cc59c5345::t_79bc4459884ac4 646,649-651,653,657,659,695,731-733,735,762,764
+  s_69e71cc59c5345::t_6c88a7f11e7bfa 757
+  s_69e71cc59c5345::t_a0092a0a20e7c5 686-688
+  s_69e71cc59c5345::t_8f56fabbfecc56 666-667
+  s_69e71cc59c5345::t_78ae8cc74e1f10 51,58,95,102,131,140,305
+  s_69e71cc59c5345::t_2eda9784c6c096 737
+  s_69e71cc59c5345::t_e1ce8fb953dfc3 700
+  s_69e71cc59c5345::t_6c2b100efca2b5 753-754
+  s_69e71cc59c5345::t_d0ead1e143c4ed 756
+  s_69e71cc59c5345::t_1fb163d91cfed1 642,744,773
+  s_69e71cc59c5345::t_53d8a9037ac1ff 765
+  s_69e71cc59c5345::t_091cc40c86693e 652,654-656,658
+  s_69e71cc59c5345::t_f12706a6772b76 638-640
+  s_69e71cc59c5345::t_d1f0c1023cac05 766
+  s_69e71cc59c5345::t_a49c949be0b8dd 587,755
+  s_69e71cc59c5345::t_fdce06bcf83303 647-648
+vllm/v1/spec_decode/llm_base_proposer.py
+  s_92076760e097e4::t_03cddc0b13c3d7 56-57,1084,1123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "772c22d9635baa5fc814f96e3b4a9fab866ebfae",
+  "prompts": {},
+  "sessions": {
+    "s_1c112d1d88e7a8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0426b7c1bffeUKPrhohJbR3zSO",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_69e71cc59c5345": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_043a7cc48ffe6vnvkXdlHblBWr",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_92076760e097e4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0427b2d74ffe8Lrqhj5HVLd4m9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
