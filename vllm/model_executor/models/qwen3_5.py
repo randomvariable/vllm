@@ -243,7 +243,17 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.embed_tokens",
         )
+
+        # When the GDN layers use the split-projection path, the checkpoint's
+        # separate in_proj_{qkv,z,b,a} tensors map 1:1 onto the split layers,
+        # so the qkvz/ba stacking in the class-level mapper must not apply.
+        if not getattr(config, "create_in_proj_qkvz", True) or not getattr(
+            config, "create_in_proj_ba", True
+        ):
+            self.hf_to_vllm_mapper = Qwen3NextModel.hf_to_vllm_mapper
 
         def get_layer(prefix: str):
             return Qwen3_5DecoderLayer(
