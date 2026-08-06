@@ -42,10 +42,9 @@ response = client.chat.completions.create(
 )
 ```
 
-The control is not supported by the V2 model runner; use
-`VLLM_USE_V2_MODEL_RUNNER=0`. With speculative decoding, speculative-token
-rows are included in penalty application, while marker-token and
-reasoning-block semantics remain unchanged.
+Under speculative decoding, speculative-token rows are included in penalty
+application, while marker-token and reasoning-block semantics remain
+unchanged.
 
 `reasoning_marker_penalty`, `thinking_token_budget` and
 [`reasoning_answer_reserve`](../features/reasoning_outputs.md#answer-reserve)
