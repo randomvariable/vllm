@@ -3237,6 +3237,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
 
     scheduler.perf_metrics = None
     scheduler.connector = None
+    scheduler.spec_telemetry = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (

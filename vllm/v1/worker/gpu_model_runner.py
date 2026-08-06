@@ -201,6 +201,7 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.forward_timer import SpecForwardTimer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -717,6 +718,14 @@ class GPUModelRunner(
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
+
+        # Allocated only when the flag is on: default off means no CUDA events
+        # exist and nothing is recorded.
+        self.spec_forward_timer: SpecForwardTimer | None = None
+        if self.observability_config.spec_decode_telemetry and (
+            self.speculative_config is not None
+        ):
+            self.spec_forward_timer = SpecForwardTimer()
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -4489,6 +4498,13 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if self.spec_forward_timer is not None:
+                self.spec_forward_timer.start_step(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_spec_tokens=scheduler_output.num_spec_tokens_to_schedule,
+                )
+                self.spec_forward_timer.record_target_start()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4496,6 +4512,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if self.spec_forward_timer is not None:
+                self.spec_forward_timer.record_target_end()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4653,6 +4671,8 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                if self.spec_forward_timer is not None:
+                    self.spec_forward_timer.record_draft_start()
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4664,6 +4684,11 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                # Closed after the proposer returns, including at K == 0: the
+                # proposer still runs a cache-sync forward before returning an
+                # empty tensor, and that is the cost that makes K == 0 non-free.
+                if self.spec_forward_timer is not None:
+                    self.spec_forward_timer.record_draft_end()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -4806,6 +4831,11 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        spec_forward_timings = None
+        if self.spec_forward_timer is not None:
+            # Reads the step recorded two steps ago; never the current one.
+            spec_forward_timings = self.spec_forward_timer.take_ready()
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4819,6 +4849,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_forward_timings=spec_forward_timings,
                 routed_experts=None,
             )
 
@@ -6483,6 +6514,7 @@ class GPUModelRunner(
                         skip_encoder_profiling = False
                         if current_platform.is_rocm():
                             from vllm.platforms.rocm import on_consumer_rdna
+
                             if on_consumer_rdna():
                                 try:
                                     device_name = current_platform.get_device_name()

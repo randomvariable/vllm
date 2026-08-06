@@ -31,6 +31,7 @@ def _make_scheduler_with_dynamic_sd(
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 8192,
     runtime_num_speculative_tokens: int = 3,
+    spec_decode_telemetry: bool = False,
 ) -> Scheduler:
     base_scheduler = create_scheduler(
         max_num_seqs=max_num_seqs,
@@ -41,6 +42,9 @@ def _make_scheduler_with_dynamic_sd(
     speculative_config = base_scheduler.vllm_config.speculative_config
     assert speculative_config is not None
     speculative_config.num_speculative_tokens_per_batch_size = schedule
+    base_scheduler.vllm_config.observability_config.spec_decode_telemetry = (
+        spec_decode_telemetry
+    )
 
     return Scheduler(
         vllm_config=base_scheduler.vllm_config,
@@ -245,3 +249,30 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     assert len(scheduler.dynamic_sd_lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+@pytest.mark.parametrize("spec_decode_telemetry", [False, True])
+def test_scheduler_allocates_telemetry_only_when_flag_is_set(spec_decode_telemetry):
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3), (64, 128, 2), (256, 4096, 0)],
+        spec_decode_telemetry=spec_decode_telemetry,
+    )
+
+    assert (scheduler.spec_telemetry is not None) is spec_decode_telemetry
+
+
+def test_telemetry_does_not_change_k_selection():
+    schedule = [(1, 16, 3), (64, 128, 2), (256, 4096, 0)]
+    for num_requests in (4, 64, 256):
+        selected = []
+        for spec_decode_telemetry in (False, True):
+            scheduler = _make_scheduler_with_dynamic_sd(
+                schedule,
+                max_num_seqs=num_requests,
+                max_num_batched_tokens=num_requests * 10,
+                spec_decode_telemetry=spec_decode_telemetry,
+            )
+            output = _add_requests_and_schedule(scheduler, num_requests)
+            selected.append(output.num_spec_tokens_to_schedule)
+
+        assert selected[0] == selected[1]

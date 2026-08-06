@@ -656,6 +656,7 @@ class EngineArgs:
         ObservabilityConfig, "kv_cache_metrics_sample"
     )
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
+    spec_decode_telemetry: bool = ObservabilityConfig.spec_decode_telemetry
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
@@ -1477,6 +1478,10 @@ class EngineArgs:
             **observability_kwargs["cudagraph_metrics"],
         )
         observability_group.add_argument(
+            "--spec-decode-telemetry",
+            **observability_kwargs["spec_decode_telemetry"],
+        )
+        observability_group.add_argument(
             "--enable-layerwise-nvtx-tracing",
             **observability_kwargs["enable_layerwise_nvtx_tracing"],
         )
@@ -1925,6 +1930,7 @@ class EngineArgs:
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,
+            spec_decode_telemetry=self.spec_decode_telemetry,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,

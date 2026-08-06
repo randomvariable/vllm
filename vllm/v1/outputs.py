@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.timing import SpecForwardTimings
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -295,6 +296,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # target/draft forward durations, when spec decode telemetry is enabled
+    spec_forward_timings: SpecForwardTimings | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

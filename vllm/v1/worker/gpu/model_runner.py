@@ -59,7 +59,7 @@ from vllm.utils.mem_utils import (
     format_gib,
     get_device_memory_info,
 )
-from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import (
@@ -68,6 +68,7 @@ from vllm.v1.outputs import (
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.spec_decode.forward_timer import SpecForwardTimer
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -217,6 +218,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # Allocated only when the flag is on: default off means no CUDA events
+        # exist and nothing is recorded.
+        self.spec_forward_timer: SpecForwardTimer | None = None
+        if self.observability_config.spec_decode_telemetry and (
+            self.speculative_config is not None
+        ):
+            self.spec_forward_timer = SpecForwardTimer()
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -1435,7 +1443,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
-        # Run model.
+        # Run the model.
+        if self.spec_forward_timer is not None:
+            self.spec_forward_timer.start_step(
+                num_tokens=input_batch.num_tokens,
+                num_reqs=len(scheduler_output.num_scheduled_tokens),
+                num_spec_tokens=scheduler_output.num_spec_tokens_to_schedule,
+            )
+            self.spec_forward_timer.record_target_start()
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1475,6 +1490,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self.spec_forward_timer is not None:
+            self.spec_forward_timer.record_target_end()
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1575,6 +1592,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prompt_len.np,
         )
 
+        spec_forward_timings = None
+        if self.spec_forward_timer is not None:
+            # Reads the step recorded two steps ago; never the current one.
+            spec_forward_timings = self.spec_forward_timer.take_ready()
+
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
@@ -1583,6 +1605,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            spec_forward_timings=spec_forward_timings,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1630,6 +1653,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            if self.spec_forward_timer is not None:
+                self.spec_forward_timer.record_draft_start()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1644,6 +1669,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            # Closed after propose returns, including at K == 0: the proposer
+            # still runs a cache-sync forward before returning an empty tensor,
+            # and that is the cost that makes K == 0 non-free.
+            if self.spec_forward_timer is not None:
+                self.spec_forward_timer.record_draft_end()
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:

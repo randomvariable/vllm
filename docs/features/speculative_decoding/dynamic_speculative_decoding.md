@@ -69,6 +69,33 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 ```
 
+## Telemetry
+
+Dynamic SD currently reads its K values from a static, hand-written schedule. Choosing those numbers well requires knowing what acceptance the drafter actually achieves and what the target and draft forwards actually cost at each concurrency level. `--spec-decode-telemetry` measures both.
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --spec-decode-telemetry ...
+```
+
+When enabled, the scheduler keeps, bucketed by batch size:
+
+* an exponentially weighted acceptance rate, including per draft position, so a position that is never drafted reads as "no evidence" rather than as zero acceptance;
+* exponentially weighted target and draft forward durations, measured with CUDA events in the worker rather than wall clock, because kernel launches and CUDA graph replays return before the GPU work completes.
+
+Bucketing by batch size is what makes `K = 0` recoverable: nothing is drafted at `K = 0`, so acceptance there is unobservable, and a single global estimate would never learn its way back out. What was learned at `B = 8` survives `K = 0` at `B = 200`.
+
+The drafter timer also runs at `K = 0`. The proposer still performs a cache-sync forward before returning an empty draft, so `K = 0` is cheaper than drafting but is not free.
+
+### Cost
+
+Default off. With the flag off, no CUDA events are allocated, nothing is recorded, and the worker reports no timings. With it on, the per-step cost is a fixed number of CUDA event records, a deferred read of events from two steps earlier (never a blocking wait), and O(K) arithmetic per drafting request, which is the same order as the acceptance counting that `SpecDecodingStats` already performs.
+
+### Relationship to other flags
+
+`--spec-decode-telemetry` is deliberately independent of `--disable-log-stats`. It is instrumentation for a future depth governor that will select K, not a reporting surface, so disabling statistics logging must not silently degrade control. It requires a speculative configuration; without one it allocates nothing.
+
+Phase 1 records these signals and nothing more. K is still chosen entirely by `num_speculative_tokens_per_batch_size`, and enabling telemetry does not change which K is selected.
+
 ## Limitations
 
 * Tested with Eagle, Eagle-3, and DFlash. Other SD methods may or may not work out of the box

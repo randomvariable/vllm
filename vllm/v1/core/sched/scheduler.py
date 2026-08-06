@@ -58,6 +58,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.telemetry import (
+    ForwardCostSample,
+    SpecDecodeTelemetry,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -269,6 +273,19 @@ class Scheduler(SchedulerInterface):
                 # anchor itself is the first prediction position (no separate bonus
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
+
+        # Telemetry is gated independently of log_stats: a future depth governor
+        # reads these signals to pick K, so riding on --disable-log-stats would
+        # silently degrade control rather than only degrading reporting.
+        self.spec_telemetry: SpecDecodeTelemetry | None = None
+        if (
+            self.observability_config.spec_decode_telemetry
+            and speculative_config is not None
+        ):
+            self.spec_telemetry = SpecDecodeTelemetry(
+                max_spec_tokens=self.num_spec_tokens,
+                max_batch_size=self.scheduler_config.max_num_seqs,
+            )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1689,6 +1706,12 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        if self.spec_telemetry is not None:
+            timings = model_runner_output.spec_forward_timings
+            if timings is not None:
+                self.spec_telemetry.observe_forward(
+                    ForwardCostSample.from_timings(timings)
+                )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1739,6 +1762,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # Hoisted: the telemetry load bucket is a property of the step, not of
+        # any one request. Must not be recomputed inside the loop below.
+        batch_size = len(num_scheduled_tokens)
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1791,6 +1817,16 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                    # Telemetry follows the same rollback semantics: a stale
+                    # acceptance is real, but recording it double-counts the
+                    # same draft across the preemption/resume boundary.
+                    request.spec_num_drafts += 1
+                    request.spec_num_draft_tokens += num_draft_tokens
+                    request.spec_num_accepted_tokens += num_accepted
+                    if self.spec_telemetry is not None:
+                        self.spec_telemetry.observe_acceptance(
+                            batch_size, num_draft_tokens, num_accepted
+                        )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
