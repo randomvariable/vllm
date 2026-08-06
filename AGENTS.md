@@ -42,6 +42,35 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 - **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
 
+### Fast local dev loop (MANDATORY before image builds)
+
+The full Tekton image build is a 4+ hour cross-compile from x86 to aarch64.
+**Never trigger it to iterate on a change.** It exists for producing deployable
+images after work is validated, not for getting feedback on edits. The first
+reflex when a change needs verifying is a local loop on a GPU box, not a build.
+
+Two loops exist and are the default — pick by what the change touches:
+
+1. **Pure Python / Triton (no CUDA sources, no `setup.py` rebuild).** Most
+   sampler, scheduler, config, and reasoning-control work. Edit on the host
+   checkout, sync to the box, restart `vllm`. No compile. This is seconds.
+2. **HIP/C++ on Strix Halo (gfx1151).** Uses the `cargo make` devloop harness
+   (`cargo make doctor` → `setup` → `build` → `test`). Incremental, ccache-warm,
+   minutes not hours. See `Makefile.toml` and
+   `docs/contributing/kernel_targets/rdna35.md`.
+
+For GB10/CUDA work that genuinely needs a native build, SSH to a free GB10
+node (e.g. `server18`/`server20`, IP under `kubectl get nodes -o wide`),
+clone the checkout, `uv venv` + `VLLM_USE_PRECOMPILED=1 uv pip install -e .`,
+and iterate with `.venv/bin/python -m pytest` or `vllm serve` against a small
+model (e.g. `Qwen/Qwen3.5-4B`, cached on the `qwen35-test-cache` PVC).
+`.venv/bin/python -c "import vllm"` succeeding is the gate before any image
+build is even contemplated.
+
+Trigger `spark-build-on-push` / `strix-build-on-push` only when local loops
+are green **and** a deployable image is actually needed. The 4h build is the
+publish step, not the feedback step.
+
 ### Environment setup
 
 ```bash
