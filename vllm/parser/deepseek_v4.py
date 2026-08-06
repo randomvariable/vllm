@@ -48,6 +48,12 @@ DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
 DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+# <｜DSML｜tool_thoughts> blocks are the model's reasoning about which tool
+# to call. Without terminals for them the lexer matches nothing and they
+# fall through to EventType.TEXT_CHUNK (randomvariable/vllm#37). Route them
+# through REASONING state the same way the think markers 
+DSML_TOOL_THOUGHTS_START = f"<{_DSML}tool_thoughts>"
+DSML_TOOL_THOUGHTS_END = f"</{_DSML}tool_thoughts>"
 
 _ESCAPED_DSML = re.escape(_DSML)
 _PARAM_RE = re.compile(
@@ -135,12 +141,16 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
             "INVOKE_END": DSML_INVOKE_END,
             "PARAM_CLOSE": DSML_PARAM_CLOSE,
+            "TOOL_THOUGHTS_START": DSML_TOOL_THOUGHTS_START,
+            "TOOL_THOUGHTS_END": DSML_TOOL_THOUGHTS_END,
         },
         token_id_terminals={
             "THINK_START": DSML_THINK_START,
             "THINK_END": DSML_THINK_END,
             "TOOL_START": DSML_TOOL_START,
             "TOOL_END": DSML_TOOL_END,
+            "TOOL_THOUGHTS_START": DSML_TOOL_THOUGHTS_START,
+            "TOOL_THOUGHTS_END": DSML_TOOL_THOUGHTS_END,
         },
         transitions={
             (ParserState.CONTENT, "THINK_START"): Transition(
@@ -194,6 +204,28 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (),
+            ),
+            # tool_thoughts blocks (#37): route through REASONING so they reach
+            # the reasoning sink instead of falling through as visible text.
+            (ParserState.CONTENT, "TOOL_THOUGHTS_START"): Transition(
+                ParserState.REASONING,
+                (EventType.REASONING_START,),
+            ),
+            (ParserState.CONTENT, "TOOL_THOUGHTS_END"): Transition(
+                ParserState.CONTENT,
+                (),
+            ),
+            (ParserState.REASONING, "TOOL_THOUGHTS_START"): Transition(
+                ParserState.REASONING,
+                (),
+            ),
+            (ParserState.REASONING, "TOOL_THOUGHTS_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.REASONING_END,),
+            ),
+            (ParserState.TOOL_BETWEEN, "TOOL_THOUGHTS_START"): Transition(
+                ParserState.REASONING,
+                (EventType.REASONING_START,),
             ),
         },
         content_events={
