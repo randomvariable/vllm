@@ -57,6 +57,11 @@ class ObservabilityConfig:
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
     dispatch modes, and their observed frequencies at every logging interval)."""
 
+    spec_decode_telemetry: bool = False
+    """Enable speculative decoding telemetry (per-load acceptance estimates and
+    draft/target forward cost samples). Default off means no timing events are
+    allocated and no measurable overhead is added."""
+
     enable_layerwise_nvtx_tracing: bool = False
     """Enable layerwise NVTX tracing. This traces the execution of each layer or
     module in the model and attach information such as input/output shapes to
