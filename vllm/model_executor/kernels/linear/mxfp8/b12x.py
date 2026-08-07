@@ -20,8 +20,10 @@ from vllm.utils.torch_utils import current_stream
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
+
 def _b12x_mxfp8_expected_m(tokens: int) -> int:
     return max(1, int(tokens))
+
 
 
 

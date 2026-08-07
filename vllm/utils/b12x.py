@@ -54,19 +54,19 @@ def _get_submodule(module_name: str) -> ModuleType | None:
 
 
 def get_b12x_blockscaled() -> ModuleType | None:
-    return _get_submodule("sparkinfer.gemm.blockscaled")
+    return _get_submodule("b12x.gemm.blockscaled")
 
 
 def get_b12x_intrinsics() -> ModuleType | None:
-    return _get_submodule("sparkinfer._lib.intrinsics")
+    return _get_submodule("b12x._lib.intrinsics")
 
 
 def get_b12x_mxfp8_linear() -> ModuleType | None:
-    return _get_submodule("sparkinfer.gemm.mxfp8_linear")
+    return _get_submodule("b12x.gemm.mxfp8_linear")
 
 
 def get_b12x_tensor_fp8_linear() -> ModuleType | None:
-    return _get_submodule("sparkinfer.gemm.tensor_fp8_linear")
+    return _get_submodule("b12x.gemm.tensor_fp8_linear")
 
 
 def get_b12x_fused_moe() -> ModuleType | None:
