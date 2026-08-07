@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.sample import thinking_budget as tb
 
 requires_cuda = pytest.mark.skipif(
@@ -143,25 +144,87 @@ def test_remove_request_resets_kmp_and_force_state():
     state.add_request(0, prompt_len=3, all_token_ids=[10, 5, 5], sampling_params=sp)
     assert state._has_tracked[0]
 
-    # Simulate mid-marker KMP/force state leaking on the slot.
-    state.kmp_start.np[0] = 1
-    state.kmp_end.np[0] = 1
-    state.force_offset.np[0] = 3
-    state.force_end_count.np[0] = 2
-
     state.remove_request(0)
 
+    # remove_request must stage a clear for every field a prior occupant could
+    # have dirtied, KMP progress and force output included. Assert on the
+    # staged writes rather than the flushed device values: applying them needs
+    # a Triton launch, and this invariant is about what gets staged.
+    for name in (
+        "in_think",
+        "in_end",
+        "think_count",
+        "countdown",
+        "end_count",
+        "seen_len",
+        "kmp_start",
+        "kmp_end",
+        "force_active",
+        "force_offset",
+        "force_end_count",
+    ):
+        tensor = getattr(state, name)
+        assert 0 in tensor._staged_write_indices, f"{name} not cleared"
+
     assert not state._has_tracked[0]
-    assert state.kmp_start.np[0] == 0
-    assert state.kmp_end.np[0] == 0
-    assert state.force_offset.np[0] == 0
-    assert state.force_end_count.np[0] == 0
-    assert state.in_think.np[0] == False  # noqa: E712
-    assert state.force_active.np[0] == False  # noqa: E712
-    # Config lives in StagedWriteTensors (no ``.np`` view); the CPU mirror is
-    # what the host gating path reads, so assert the reset landed there.
     assert state._marker_penalty_cpu[0] == 0.0
-    assert not state._has_tracked[0]
+
+
+@requires_cuda
+def test_kernel_written_state_is_not_uva_backed():
+    """Kernel-written state must not live in a UvaBackedTensor.
+
+    ``UvaBackedTensor.np`` is not aliased to ``.gpu``: ``copy_to_uva()`` copies
+    the host array into a pooled device buffer and rebinds ``.gpu``. For state
+    the kernel writes, that means (a) every host read is stale and (b) the next
+    flush overwrites the kernel's accumulated device state, resetting in-flight
+    requests to their prompt-scan values. Under continuous batching a flush
+    happens on most steps, so budgets never reached exhaustion and forcing
+    never fired.
+
+    Asserting the type is the cheap invariant: StagedWriteTensor applies only
+    the rows actually staged and leaves everything else on device untouched.
+    """
+    req_states = SimpleNamespace(max_num_reqs=4, device=torch.device("cuda"))
+    state = tb.ThinkingBudgetState(req_states, reasoning_config=_MockReasoningConfig())
+
+    kernel_written = (
+        "in_think",
+        "in_end",
+        "think_count",
+        "countdown",
+        "end_count",
+        "seen_len",
+        "kmp_start",
+        "kmp_end",
+        "force_active",
+        "force_offset",
+        "force_end_count",
+    )
+    for name in kernel_written:
+        tensor = getattr(state, name)
+        assert isinstance(tensor, StagedWriteTensor), (
+            f"{name} is {type(tensor).__name__}; kernel-written state in a "
+            "UvaBackedTensor is clobbered on the next flush"
+        )
+
+
+@requires_cuda
+def test_flush_without_new_requests_launches_nothing():
+    """A step with no new requests must not touch device state at all.
+
+    This is the other half of the clobber fix: ``apply_write`` early-returns
+    when nothing is staged, so a decode-only step cannot disturb in-flight
+    counters even before considering which rows it would write.
+    """
+    req_states = SimpleNamespace(max_num_reqs=4, device=torch.device("cuda"))
+    state = tb.ThinkingBudgetState(req_states, reasoning_config=_MockReasoningConfig())
+
+    for name in ("countdown", "think_count", "kmp_start"):
+        assert not getattr(state, name)._staged_write_indices
+
+    # No add_request has run, so no rows are staged and no kernel may launch.
+    state.apply_staged_writes()
 
 
 def test_sampler_module_has_no_unresolved_names():

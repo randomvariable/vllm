@@ -27,7 +27,7 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.states import RequestState
 
 if TYPE_CHECKING:
@@ -60,6 +60,9 @@ class ThinkingBudgetState:
         self.num_speculative_tokens = num_speculative_tokens
 
         self._enabled = reasoning_config is not None and reasoning_config.enabled
+        # Allocated before the disabled early-return: Sampler's per-step gate
+        # reads this mask unconditionally.
+        self._has_tracked = np.zeros(self.max_num_reqs, dtype=bool)
         if not self._enabled:
             return
 
@@ -115,11 +118,26 @@ class ThinkingBudgetState:
         self.reasoning_marker_penalty.gpu.fill_(0.0)
 
         # --- Per-request running state (GPU-resident, updated by kernel) ---
-        def _state_tensor(dtype):
-            return UvaBackedTensor(self.max_num_reqs, dtype=dtype)
+        # These MUST NOT be UvaBackedTensor. That type's ``.np`` host array is
+        # not aliased to ``.gpu``: ``copy_to_uva()`` copies host -> a pooled
+        # device buffer and rebinds ``.gpu``. For kernel-written state that
+        # would leave every host read stale, and would clobber the kernel's
+        # accumulated device state on the next flush, resetting in-flight
+        # requests to their prompt-scan values. Every other UvaBackedTensor in
+        # the tree holds host-authored config, which is why the type is right
+        # there and wrong here.
+        #
+        # StagedWriteTensor has the shape this needs: the device tensor is the
+        # single source of truth and host writes are applied per-row, touching
+        # only the rows actually staged.
+        def _state_tensor(dtype: torch.dtype) -> StagedWriteTensor:
+            return StagedWriteTensor(
+                (self.max_num_reqs,), dtype=dtype, device=self.device
+            )
 
-        self.in_think = _state_tensor(torch.bool)
-        self.in_end = _state_tensor(torch.bool)
+        # bool is not a StagedWriteTensor dtype; flags are int32 0/1.
+        self.in_think = _state_tensor(torch.int32)
+        self.in_end = _state_tensor(torch.int32)
         self.think_count = _state_tensor(torch.int32)
         self.countdown = _state_tensor(torch.int32)
         self.end_count = _state_tensor(torch.int32)
@@ -127,21 +145,22 @@ class ThinkingBudgetState:
         self.kmp_start = _state_tensor(torch.int32)  # KMP progress for <think>
         self.kmp_end = _state_tensor(torch.int32)  # KMP progress for </think>
 
-        # Force output buffer (written by kernel, read by Python scatter).
-        self.force_active = UvaBackedTensor(self.max_num_reqs, dtype=torch.bool)
-        self.force_offset = UvaBackedTensor(
-            self.max_num_reqs, dtype=torch.int32
-        )  # offset within request's row span
-        self.force_end_count = UvaBackedTensor(
-            self.max_num_reqs, dtype=torch.int32
-        )  # which end-token to force (multi-token markers)
+        # Force output (written by kernel, read back by the Python scatter).
+        self.force_active = _state_tensor(torch.int32)
+        self.force_offset = _state_tensor(torch.int32)
+        self.force_end_count = _state_tensor(torch.int32)
+        self.countdown.gpu.fill_(-1)
 
         # CPU mirror for fast gating (avoids GPU readback in hot path).
-        self._has_tracked = np.zeros(self.max_num_reqs, dtype=bool)
         # CPU mirror of the marker penalty. The device copy lives in a
         # StagedWriteTensor, which exposes no ``.np`` view, and the host path
         # must not read back from the device to decide whether to do work.
         self._marker_penalty_cpu = np.zeros(self.max_num_reqs, dtype=np.float32)
+        # CPU mirror of in_think at add_request time. NOTE: this reflects the
+        # prompt scan only -- the kernel's live updates stay on device. It is
+        # therefore usable as a cheap "could this request ever be in think
+        # mode" pre-filter, never as the authoritative gate.
+        self._in_think_cpu = np.zeros(self.max_num_reqs, dtype=bool)
 
         # Upload constant marker tensors to device.
         self._start_gpu = torch.tensor(
@@ -225,17 +244,18 @@ class ThinkingBudgetState:
                 if budget is not None:
                     countdown = max(0, budget - think_count)
 
-        self.in_think.np[req_idx] = in_think
-        self.in_end.np[req_idx] = False
-        self.think_count.np[req_idx] = think_count
-        self.countdown.np[req_idx] = countdown
-        self.end_count.np[req_idx] = 0
-        self.seen_len.np[req_idx] = seen_len
-        self.kmp_start.np[req_idx] = kmp_start
-        self.kmp_end.np[req_idx] = kmp_end
-        self.force_active.np[req_idx] = False
-        self.force_offset.np[req_idx] = 0
-        self.force_end_count.np[req_idx] = 0
+        self.in_think.stage_write_elem(req_idx, int(in_think))
+        self.in_end.stage_write_elem(req_idx, 0)
+        self.think_count.stage_write_elem(req_idx, think_count)
+        self.countdown.stage_write_elem(req_idx, countdown)
+        self.end_count.stage_write_elem(req_idx, 0)
+        self.seen_len.stage_write_elem(req_idx, seen_len)
+        self.kmp_start.stage_write_elem(req_idx, kmp_start)
+        self.kmp_end.stage_write_elem(req_idx, kmp_end)
+        self.force_active.stage_write_elem(req_idx, 0)
+        self.force_offset.stage_write_elem(req_idx, 0)
+        self.force_end_count.stage_write_elem(req_idx, 0)
+        self._in_think_cpu[req_idx] = in_think
 
     @staticmethod
     def _find_last_match(tokens: list[int], pattern: list[int]) -> int:
@@ -260,32 +280,36 @@ class ThinkingBudgetState:
         self.max_tokens.stage_write_elem(req_idx, -1)
         self.reasoning_marker_penalty.stage_write_elem(req_idx, 0.0)
         self._marker_penalty_cpu[req_idx] = 0.0
-        self.in_think.np[req_idx] = False
-        self.in_end.np[req_idx] = False
-        self.think_count.np[req_idx] = 0
-        self.countdown.np[req_idx] = -1
-        self.end_count.np[req_idx] = 0
-        self.seen_len.np[req_idx] = 0
-        self.force_active.np[req_idx] = False
+        self.in_think.stage_write_elem(req_idx, 0)
+        self.in_end.stage_write_elem(req_idx, 0)
+        self.think_count.stage_write_elem(req_idx, 0)
+        self.countdown.stage_write_elem(req_idx, -1)
+        self.end_count.stage_write_elem(req_idx, 0)
+        self.seen_len.stage_write_elem(req_idx, 0)
+        self.force_active.stage_write_elem(req_idx, 0)
         # Reset KMP partial-match and force-output state too: a recycled
         # req_idx must not inherit mid-marker progress from a prior occupant,
         # or a stale partial think match could spuriously toggle think mode.
-        self.kmp_start.np[req_idx] = 0
-        self.kmp_end.np[req_idx] = 0
-        self.force_offset.np[req_idx] = 0
-        self.force_end_count.np[req_idx] = 0
+        self.kmp_start.stage_write_elem(req_idx, 0)
+        self.kmp_end.stage_write_elem(req_idx, 0)
+        self.force_offset.stage_write_elem(req_idx, 0)
+        self.force_end_count.stage_write_elem(req_idx, 0)
+        self._in_think_cpu[req_idx] = False
 
     def apply_staged_writes(self) -> None:
-        """Sync staged CPU data to GPU UVA buffers."""
+        """Flush staged per-request writes to the device tensors.
+
+        Every tensor here is a StagedWriteTensor, so this applies only the rows
+        actually staged this step and leaves kernel-accumulated state for
+        in-flight requests untouched.
+        """
         if not self._enabled:
             return
-        self.thinking_token_budget.apply_write()
-        self.reasoning_answer_reserve.apply_write()
-        self.max_tokens.apply_write()
-        self.reasoning_marker_penalty.apply_write()
-
-        # UvaBackedTensor np -> uva sync
         for t in (
+            self.thinking_token_budget,
+            self.reasoning_answer_reserve,
+            self.max_tokens,
+            self.reasoning_marker_penalty,
             self.in_think,
             self.in_end,
             self.think_count,
@@ -298,7 +322,17 @@ class ThinkingBudgetState:
             self.force_offset,
             self.force_end_count,
         ):
-            t.copy_to_uva()
+            t.apply_write()
+
+    @property
+    def tracked_np(self) -> np.ndarray:
+        """Per-request bool mask of requests with any reasoning control set.
+
+        Read by ``Sampler._requires_logits_processing`` so that a request
+        using only reasoning controls -- greedy or temperature 1.0, no
+        penalties, no bad words -- still enters the logits-processing path.
+        """
+        return self._has_tracked
 
     @property
     def has_tracked_requests(self) -> bool:
@@ -367,12 +401,39 @@ class ThinkingBudgetState:
             num_reqs=num_reqs,
         )
 
+        # The kernel just wrote in_think and the force triple on device. Both
+        # host-side phases below need those values, so take ONE explicit D2H
+        # copy rather than four implicit ones. This is a real synchronisation
+        # point; Phase 2 removes it by moving the marker penalty into a kernel.
+        state_np = (
+            torch.stack(
+                (
+                    self.in_think.gpu,
+                    self.force_active.gpu,
+                    self.force_offset.gpu,
+                    self.force_end_count.gpu,
+                )
+            )
+            .cpu()
+            .numpy()
+        )
+        in_think_np, force_active_np, force_offset_np, force_end_count_np = state_np
+
         # Phase 2: apply marker penalty (scatter-subtract on penalised rows).
         if self._num_markers > 0:
-            self._apply_marker_penalty(logits, expanded_idx_mapping, idx_mapping_np)
+            self._apply_marker_penalty(
+                logits, expanded_idx_mapping, idx_mapping_np, in_think_np
+            )
 
         # Phase 3: apply forcing (set forced end-token to 1e9, mask row).
-        self._apply_forcing(logits, expanded_idx_mapping, idx_mapping_np)
+        self._apply_forcing(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            force_active_np,
+            force_offset_np,
+            force_end_count_np,
+        )
 
         return logits
 
@@ -381,6 +442,7 @@ class ThinkingBudgetState:
         logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
+        in_think_np: np.ndarray,
     ) -> None:
         """Scatter-subtract marker penalty on hesitation tokens inside <think>."""
         # Build CPU index lists (small: only tracked + in_think requests).
@@ -395,8 +457,7 @@ class ThinkingBudgetState:
         for req_idx in idx_mapping_np:
             if not self._has_tracked[req_idx]:
                 continue
-            in_think = bool(self.in_think.np[req_idx])
-            if not in_think:
+            if not bool(in_think_np[req_idx]):
                 continue
             pen = float(self._marker_penalty_cpu[req_idx])
             if pen == 0.0:
@@ -424,6 +485,9 @@ class ThinkingBudgetState:
         logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
+        force_active: np.ndarray,
+        force_offset: np.ndarray,
+        force_end_count: np.ndarray,
     ) -> None:
         """Force end-of-thinking tokens on requests whose budget is exhausted.
 
@@ -431,11 +495,6 @@ class ThinkingBudgetState:
         force_offset within the request's row span) and set it to one-hot
         on the end-token.
         """
-        # Sync force buffers to CPU for scatter computation.
-        force_active = self.force_active.np
-        force_offset = self.force_offset.np
-        force_end_count = self.force_end_count.np
-
         active_rows: list[int] = []
         force_tokens: list[int] = []
 
