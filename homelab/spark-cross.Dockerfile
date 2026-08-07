@@ -41,9 +41,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_INDEX="https://flashinfer.ai/whl/ https://flashinfer.ai/whl/cu130/ https://download.pytorch.org/whl/cu130" \
     UV_INDEX_STRATEGY=unsafe-best-match \
     CCACHE_DIR=/root/.ccache-cross \
-    CCACHE_MAXSIZE=20G \
+    CCACHE_MAXSIZE=40G \
     CCACHE_NOHASHDIR=true \
     CCACHE_COMPILERCHECK=content \
+    CCACHE_EXTRAFILES=/root/.ccache-keyfile \
     CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime \
     VERBOSE=1 \
     CMAKE_VERBOSE_MAKEFILE=ON
@@ -162,27 +163,34 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     cd /src/vllm && \
+    printf '%s\n' "$NVCC_PREPEND_FLAGS" "$TORCH_CUDA_ARCH_LIST" > "$CCACHE_EXTRAFILES" && \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
-    ccache -s
+    ccache -s | tee /src/ccache-stats-vllm.txt
 
 # Build both FlashInfer packages from the pinned recursive submodule. The local
 # JIT-cache wheel carries the patched AArch64 SM121 native modules.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/flashinfer,sharing=locked \
     --mount=type=cache,target=/src/vllm/third_party/flashinfer/build/aot,sharing=locked \
     cd /src/vllm && \
     uv pip install --python /opt/venv/bin/python \
       'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests numpy \
       nvidia-ml-py 'apache-tvm-ffi>=0.1,<0.2' && \
+    FI_NVCC_PREPEND="-target-dir sbsa-linux" && \
+    printf '%s\n' "$FI_NVCC_PREPEND" 12.1a > "$CCACHE_EXTRAFILES" && \
+    ccache -z && \
     CUDA_VERSION=13.0 \
     CC=/usr/bin/aarch64-linux-gnu-gcc \
     CXX=/usr/bin/aarch64-linux-gnu-g++ \
     FLASHINFER_NVCC=/usr/local/cuda-13.0/bin/nvcc \
     FLASHINFER_FMHA_V2_HOST_BUILD=1 \
     FLASHINFER_FMHA_V2_HOST_CXX=/usr/bin/g++ \
-    NVCC_PREPEND_FLAGS="-target-dir sbsa-linux" \
+    NVCC_PREPEND_FLAGS="$FI_NVCC_PREPEND" \
+    FLASHINFER_NVCC_LAUNCHER=ccache \
+    FLASHINFER_CXX_LAUNCHER=ccache \
     LIBRARY_PATH="/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs" \
     FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.0/targets/sbsa-linux/lib -L/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.0/targets/sbsa-linux/lib" \
     FLASHINFER_SOURCE_DIR=/src/vllm/third_party/flashinfer \
@@ -192,7 +200,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
     MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
-    ./tools/flashinfer-build.sh
+    ./tools/flashinfer-build.sh && \
+    ccache -s | tee /src/ccache-stats-flashinfer.txt
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
@@ -253,6 +262,9 @@ COPY --from=builder /wheels-flashinfer /wheels-flashinfer
 COPY --from=builder /wheels-gguf /wheels-gguf
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
+# Verbose cross-compile logs exceed the CI log limit mid-build, so persist
+# ccache stats here: a low hit rate is the signal that keying regressed.
+COPY --from=builder /src/ccache-stats-vllm.txt /src/ccache-stats-flashinfer.txt /opt/
 
 # Resolve the local Python wheel's dependencies against the same indexes used by
 # requirements/cuda.txt. The JIT-cache wheel has no dependencies of its own.
