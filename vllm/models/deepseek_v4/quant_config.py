@@ -50,6 +50,7 @@ class DeepseekV4FP8Config(Fp8Config):
         super().__init__(*args, **kwargs)
         self._resolved_expert_dtype: str | None = None
         self._resolved_moe_quant_algo: str | None = None
+        self._resolved_nvfp4_expert_layers: frozenset[str] | None = None
         self._nvfp4_config: ModelOptNvFp4Config | None = None
         # ``is_scale_e8m0`` is a property that resolves on first read,
         # by which time the current vllm_config has been set.
@@ -93,11 +94,42 @@ class DeepseekV4FP8Config(Fp8Config):
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
         algo = (quant_cfg.get("moe_quant_algo") or "").upper() or None
         self._resolved_moe_quant_algo = algo or ""
+        self._resolved_nvfp4_expert_layers = frozenset(
+            quant_cfg.get("quantized_layers") or ()
+        )
 
     @property
     def moe_quant_algo(self) -> str:
         self._resolve_moe_overrides()
         return self._resolved_moe_quant_algo or ""
+
+    @property
+    def nvfp4_expert_layers(self) -> frozenset[str]:
+        """Layer prefixes the checkpoint declares as NVFP4-quantized.
+
+        ``quant_algo="MIXED_PRECISION"`` checkpoints requantize only a subset
+        of expert layers and list them positively under ``quantized_layers``
+        (e.g. ``{"layers.0.ffn.experts": {...}}``). Layers absent from that
+        list keep the checkpoint's base scheme.
+
+        The companion ``ignore`` key is *not* usable for this decision: it
+        means "not requantized", not "unquantized", so feeding it into
+        ``ignored_layers`` would strip block-FP8 attention and shared-expert
+        layers of their quant method.
+
+        An empty set means the checkpoint made no per-layer distinction and
+        ``moe_quant_algo`` applies model-wide.
+        """
+        self._resolve_moe_overrides()
+        return self._resolved_nvfp4_expert_layers or frozenset()
+
+    def _is_nvfp4_expert_layer(self, prefix: str) -> bool:
+        declared = self.nvfp4_expert_layers
+        if not declared:
+            return True
+        return any(
+            prefix == layer or prefix.endswith(f".{layer}") for layer in declared
+        )
 
     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
         if self._nvfp4_config is None:
@@ -179,7 +211,9 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                if self.moe_quant_algo == "NVFP4" and self._is_nvfp4_expert_layer(
+                    prefix
+                ):
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )
@@ -196,4 +230,4 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4"
+        return self.moe_quant_algo != "NVFP4" or not self._is_nvfp4_expert_layer(prefix)
