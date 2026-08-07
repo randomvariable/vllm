@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to vLLM project
 """Tensor-native ThinkingBudgetState for Model Runner V2.
 
@@ -19,10 +20,10 @@ delta-scanning committed+spec tokens with KMP partial-match carry).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
-
-from typing import TYPE_CHECKING
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
@@ -105,10 +106,13 @@ class ThinkingBudgetState:
             (self.max_num_reqs,), dtype=torch.float32, device=self.device
         )
         # -1 = no budget/reserve set (0 is a valid budget meaning "no thinking").
-        self.thinking_token_budget.np.fill(-1)
-        self.reasoning_answer_reserve.np.fill(-1)
-        self.max_tokens.np.fill(-1)
-        self.reasoning_marker_penalty.np.fill(0.0)
+        # These are StagedWriteTensors: initialize the device buffer directly.
+        # ``StagedWriteTensor`` exposes no ``.np`` view (UvaBackedTensor does);
+        # per-request values land via ``stage_write_elem`` + ``apply_write``.
+        self.thinking_token_budget.gpu.fill_(-1)
+        self.reasoning_answer_reserve.gpu.fill_(-1)
+        self.max_tokens.gpu.fill_(-1)
+        self.reasoning_marker_penalty.gpu.fill_(0.0)
 
         # --- Per-request running state (GPU-resident, updated by kernel) ---
         def _state_tensor(dtype):
@@ -134,6 +138,10 @@ class ThinkingBudgetState:
 
         # CPU mirror for fast gating (avoids GPU readback in hot path).
         self._has_tracked = np.zeros(self.max_num_reqs, dtype=bool)
+        # CPU mirror of the marker penalty. The device copy lives in a
+        # StagedWriteTensor, which exposes no ``.np`` view, and the host path
+        # must not read back from the device to decide whether to do work.
+        self._marker_penalty_cpu = np.zeros(self.max_num_reqs, dtype=np.float32)
 
         # Upload constant marker tensors to device.
         self._start_gpu = torch.tensor(
@@ -173,17 +181,24 @@ class ThinkingBudgetState:
         marker_pen = sampling_params.reasoning_marker_penalty
         mt = sampling_params.max_tokens
 
-        self.thinking_token_budget.np[req_idx] = budget if budget is not None else -1
-        self.reasoning_answer_reserve.np[req_idx] = (
-            reserve if reserve is not None else -1
+        self.thinking_token_budget.stage_write_elem(
+            req_idx, budget if budget is not None else -1
         )
-        self.max_tokens.np[req_idx] = mt if mt is not None else -1
-        self.reasoning_marker_penalty.np[req_idx] = (
+        self.reasoning_answer_reserve.stage_write_elem(
+            req_idx, reserve if reserve is not None else -1
+        )
+        self.max_tokens.stage_write_elem(req_idx, mt if mt is not None else -1)
+        self.reasoning_marker_penalty.stage_write_elem(
+            req_idx, marker_pen if marker_pen is not None else 0.0
+        )
+        self._marker_penalty_cpu[req_idx] = (
             marker_pen if marker_pen is not None else 0.0
         )
 
-        tracked = budget is not None or reserve is not None or (
-            marker_pen is not None and marker_pen != 0.0
+        tracked = (
+            budget is not None
+            or reserve is not None
+            or (marker_pen is not None and marker_pen != 0.0)
         )
         self._has_tracked[req_idx] = tracked
 
@@ -197,8 +212,12 @@ class ThinkingBudgetState:
 
         if tracked and self._start_len > 0:
             # Scan prompt for last complete <think> and </think>.
-            last_start = self._find_last_match(all_token_ids, self._start_padded[:self._start_len])
-            last_end = self._find_last_match(all_token_ids, self._end_padded[:self._end_len])
+            last_start = self._find_last_match(
+                all_token_ids, self._start_padded[: self._start_len]
+            )
+            last_end = self._find_last_match(
+                all_token_ids, self._end_padded[: self._end_len]
+            )
             if last_start >= 0 and (last_end < 0 or last_start > last_end):
                 in_think = True
                 marker_tail = last_start + self._start_len
@@ -234,10 +253,13 @@ class ThinkingBudgetState:
         if not self._enabled:
             return
         self._has_tracked[req_idx] = False
-        self.thinking_token_budget.np[req_idx] = -1
-        self.reasoning_answer_reserve.np[req_idx] = -1
-        self.max_tokens.np[req_idx] = -1
-        self.reasoning_marker_penalty.np[req_idx] = 0.0
+        # Config tensors are StagedWriteTensors: no ``.np`` view, so clear them
+        # through the same staged-write path add_request uses.
+        self.thinking_token_budget.stage_write_elem(req_idx, -1)
+        self.reasoning_answer_reserve.stage_write_elem(req_idx, -1)
+        self.max_tokens.stage_write_elem(req_idx, -1)
+        self.reasoning_marker_penalty.stage_write_elem(req_idx, 0.0)
+        self._marker_penalty_cpu[req_idx] = 0.0
         self.in_think.np[req_idx] = False
         self.in_end.np[req_idx] = False
         self.think_count.np[req_idx] = 0
@@ -245,6 +267,13 @@ class ThinkingBudgetState:
         self.end_count.np[req_idx] = 0
         self.seen_len.np[req_idx] = 0
         self.force_active.np[req_idx] = False
+        # Reset KMP partial-match and force-output state too: a recycled
+        # req_idx must not inherit mid-marker progress from a prior occupant,
+        # or a stale partial think match could spuriously toggle think mode.
+        self.kmp_start.np[req_idx] = 0
+        self.kmp_end.np[req_idx] = 0
+        self.force_offset.np[req_idx] = 0
+        self.force_end_count.np[req_idx] = 0
 
     def apply_staged_writes(self) -> None:
         """Sync staged CPU data to GPU UVA buffers."""
@@ -274,6 +303,8 @@ class ThinkingBudgetState:
     @property
     def has_tracked_requests(self) -> bool:
         """True when any active request has reasoning controls set."""
+        if not self._enabled:
+            return False
         return bool(self._has_tracked.any())
 
     # ------------------------------------------------------------------ #
@@ -338,14 +369,10 @@ class ThinkingBudgetState:
 
         # Phase 2: apply marker penalty (scatter-subtract on penalised rows).
         if self._num_markers > 0:
-            self._apply_marker_penalty(
-                logits, expanded_idx_mapping, idx_mapping_np
-            )
+            self._apply_marker_penalty(logits, expanded_idx_mapping, idx_mapping_np)
 
         # Phase 3: apply forcing (set forced end-token to 1e9, mask row).
-        self._apply_forcing(
-            logits, expanded_idx_mapping, idx_mapping_np, cu_num_logits
-        )
+        self._apply_forcing(logits, expanded_idx_mapping, idx_mapping_np)
 
         return logits
 
@@ -371,7 +398,7 @@ class ThinkingBudgetState:
             in_think = bool(self.in_think.np[req_idx])
             if not in_think:
                 continue
-            pen = float(self.reasoning_marker_penalty.np[req_idx])
+            pen = float(self._marker_penalty_cpu[req_idx])
             if pen == 0.0:
                 continue
             # Find this request's logit rows via expanded_idx_mapping.
@@ -397,7 +424,6 @@ class ThinkingBudgetState:
         logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
-        cu_num_logits: torch.Tensor,
     ) -> None:
         """Force end-of-thinking tokens on requests whose budget is exhausted.
 
@@ -528,7 +554,6 @@ def _thinking_budget_update_kernel(
     kmp_s = tl.load(kmp_start_ptr + req_idx)
     kmp_e = tl.load(kmp_end_ptr + req_idx)
 
-    output_base = all_token_ids_ptr + req_idx * all_token_ids_stride + prompt_len
     output_len = total_len - prompt_len
 
     # --- Delta scan: process tokens [seen_len, total_len) ---
