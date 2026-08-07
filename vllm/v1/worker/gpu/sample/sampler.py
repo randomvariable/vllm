@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import numpy as np
 import torch
 
@@ -32,9 +28,6 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.states import RequestState
 
-if TYPE_CHECKING:
-    from vllm.config.reasoning import ReasoningConfig
-
 
 class Sampler:
     def __init__(
@@ -58,27 +51,19 @@ class Sampler:
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+        self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
-        self.thinking_budget_state = ThinkingBudgetState(
-            req_states, reasoning_config, num_speculative_tokens
-        )
 
     def add_request(
-        self,
-        req_idx: int,
-        prompt_len: int,
-        all_token_ids: list[int],
-        sampling_params: SamplingParams,
+        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
         self.bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
-        self.thinking_budget_state.add_request(
-            req_idx, prompt_len, all_token_ids, sampling_params
-        )
+        self.thinking_budget_state.add_request(req_idx, sampling_params)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -205,10 +190,12 @@ class Sampler:
             expanded_local_pos,
         )
 
-        # Apply thinking budget / answer reserve / marker penalty in place.
-        self.thinking_budget_state.apply_thinking_budget(
+        # Force the reasoning end marker once a request's thinking budget is
+        # reached; applied before temperature so the forced token is always kept.
+        self.thinking_budget_state.apply(
             logits,
             expanded_idx_mapping,
+            idx_mapping,
             idx_mapping_np,
             input_ids,
             expanded_local_pos,
@@ -236,8 +223,6 @@ class Sampler:
         if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
             return True
         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
-            return True
-        if np.any(self.thinking_budget_state.tracked_np[idx_mapping_np]):
             return True
 
         states = self.sampling_states
