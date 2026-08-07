@@ -44,6 +44,27 @@ def _make_req_states(max_num_reqs: int = 4) -> SimpleNamespace:
     return SimpleNamespace(max_num_reqs=max_num_reqs, device=torch.device("cpu"))
 
 
+def test_sampler_passes_add_request_args_the_holder_expects():
+    """Pin the Sampler -> ThinkingBudgetState add_request contract.
+
+    The holder takes (req_idx, prompt_len, all_token_ids, sampling_params) but
+    the sampler passed only three of those, so every request raised TypeError
+    before it could even reach the NameError. An AST walk inside one function
+    cannot see a cross-module arity mismatch; comparing signatures can, and
+    needs no GPU.
+    """
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    holder_params = list(
+        inspect.signature(tb.ThinkingBudgetState.add_request).parameters
+    )
+    sampler_params = list(inspect.signature(Sampler.add_request).parameters)
+    assert holder_params == sampler_params, (
+        f"Sampler.add_request{sampler_params} cannot drive "
+        f"ThinkingBudgetState.add_request{holder_params}"
+    )
+
+
 def test_apply_thinking_budget_has_no_unresolved_names():
     """Guard the exact defect class that shipped the NameError.
 
@@ -141,3 +162,46 @@ def test_remove_request_resets_kmp_and_force_state():
     # what the host gating path reads, so assert the reset landed there.
     assert state._marker_penalty_cpu[0] == 0.0
     assert not state._has_tracked[0]
+
+
+def test_sampler_module_has_no_unresolved_names():
+    """Catch construction-time NameErrors in the MRV2 Sampler.
+
+    9fedae27 renamed ``LogprobTokenIdsState`` to ``LogitTokenIdsState`` at the
+    call site only, so constructing the sampler raised NameError for *every*
+    MRV2 model, not just reasoning ones. Production escaped it purely because
+    the deployed image predated the commit. Nothing else in the suite
+    constructs this class, so a static resolution check is the cheap guard.
+    """
+    import vllm.v1.worker.gpu.sample.sampler as sampler_mod
+
+    with open(sampler_mod.__file__) as f:
+        tree = ast.parse(f.read())
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update((a.asname or a.name).split(".")[0] for a in node.names)
+
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Sampler"
+    )
+    unresolved: dict[str, list[str]] = {}
+    for fn in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+        params = {a.arg for a in fn.args.args}
+        loaded = {
+            n.id
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        }
+        assigned = {
+            n.id
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        }
+        missing = sorted(loaded - params - assigned - imported - set(dir(builtins)))
+        if missing:
+            unresolved[fn.name] = missing
+
+    assert not unresolved, f"Sampler has unresolved names: {unresolved}"
