@@ -16,11 +16,13 @@ reasoning marker tokens, discouraging those tokens while generation is inside a
 reasoning block. The value must be finite and non-negative; `0` or an omitted
 value disables the penalty.
 
-Configure markers through `reasoning_marker_strs` in `--reasoning-config`. Each
-marker must encode as exactly one tokenizer token. Markers that encode as
-multiple tokens are ignored with a warning. The penalty applies only between
-the configured `reasoning_start_str` and `reasoning_end_str`, not to final
-answer content.
+Configure markers with `reasoning_marker_strs` in `--reasoning-config`. A
+marker may span several tokens, such as `"let me think"`. Multi-token markers
+are penalised only where they would complete: the preceding tokens must
+already match the generated text, and the penalty applies to the marker's
+final token alone, so a shared prefix is not discouraged on its own. The
+penalty applies only between the configured `reasoning_start_str` and
+`reasoning_end_str`, not to the final answer content.
 
 Reasoning controls require an enabled reasoning configuration. Start the
 server with `--reasoning-parser` and/or `--reasoning-config` so vLLM can
@@ -29,7 +31,7 @@ initialize the reasoning boundary tokens, for example:
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
     --reasoning-parser qwen3 \
-    --reasoning-config '{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>", "reasoning_marker_strs": ["."]}'
+    --reasoning-config '{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>", "reasoning_marker_strs": ["Wait", "let me think"]}'
 ```
 
 Pass the penalty in an OpenAI-compatible request through `extra_body`:

@@ -110,7 +110,14 @@ class MockReasoningConfig:
     reasoning_start_token_ids = [THINK_START_TOKEN_ID]
     reasoning_end_token_ids = [THINK_END_TOKEN_ID]
     enabled = True
-    reasoning_marker_token_ids = [42]
+    reasoning_marker_token_ids = [[42]]
+
+
+class MockMultiTokenMarkerReasoningConfig(MockReasoningConfig):
+    """Reasoning config whose hesitation marker spans several tokens."""
+
+    # A "let me think" style marker alongside a single-token one.
+    reasoning_marker_token_ids = [[70, 71, 72], [42]]
 
 
 def _generate_fake_sampling_metadata(
@@ -2717,3 +2724,75 @@ def test_resolve_max_tokens_rejects_reserve_unreachable_after_clamp():
     params = SamplingParams(max_tokens=8000, reasoning_answer_reserve=512)
     with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
         resolve_max_tokens(params, 256)
+
+
+def test_reasoning_marker_penalty_multi_token_needs_prefix_match():
+    """A multi-token marker is penalised only where it would complete.
+
+    The marker is [70, 71, 72]. After emitting [70, 71] the next token would
+    complete it, so 72 is penalised. With unrelated history 72 is a legitimate
+    continuation and must be untouched -- the distinction a flat per-token
+    penalty cannot make.
+    """
+    cfg = MockMultiTokenMarkerReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+
+    # History ends mid-marker: the next token completes it.
+    holder.update_state([[THINK_START_TOKEN_ID, 70, 71]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == -2
+    # Prefix tokens are not themselves penalised.
+    assert logits[0, 70] == 0
+    assert logits[0, 71] == 0
+    # The single-token marker still applies unconditionally inside <think>.
+    assert logits[0, 42] == -2
+
+    # Unrelated history: 72 does not complete the marker here.
+    holder.update_state([[THINK_START_TOKEN_ID, 5, 6]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == 0
+    assert logits[0, 42] == -2
+
+
+def test_reasoning_marker_penalty_multi_token_outside_thinking_block():
+    """Multi-token markers stop being penalised once reasoning has ended."""
+    cfg = MockMultiTokenMarkerReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+
+    holder.update_state([[THINK_START_TOKEN_ID, THINK_END_TOKEN_ID, 70, 71]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == 0
+    assert logits[0, 42] == 0

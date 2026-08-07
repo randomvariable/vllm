@@ -58,7 +58,7 @@ class ThinkingBudgetStateHolder:
 
         self.think_start_token_ids: list[int]
         self.think_end_token_ids: list[int]
-        self.reasoning_marker_token_ids: list[int]
+        self.reasoning_marker_token_ids: list[list[int]]
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
@@ -187,6 +187,10 @@ class ThinkingBudgetStateHolder:
     ) -> None:
         if not self.reasoning_marker_token_ids:
             return
+        vocab_size = logits.shape[1]
+        penalised_rows: list[int] = []
+        penalised_tokens: list[int] = []
+        penalties: list[float] = []
         cumulative_total = 0
         for seq_idx in range(
             max(len(spec_token_ids), max(self._state, default=-1) + 1)
@@ -201,15 +205,40 @@ class ThinkingBudgetStateHolder:
                 continue
             penalty = state.get("reasoning_marker_penalty", 0.0)
             if state.get("in_think") and penalty:
-                tokens = [
-                    token
-                    for token in self.reasoning_marker_token_ids
-                    if 0 <= token < logits.shape[1]
+                committed = [
+                    *(state.get("prompt_tok_ids") or []),
+                    *(state.get("output_tok_ids") or []),
                 ]
                 end = min(cumulative_total + count, logits.shape[0])
-                if tokens and cumulative_total < end:
-                    logits[cumulative_total:end, tokens] -= penalty
+                for row in range(cumulative_total, end):
+                    # Draft tokens ahead of this row are already decided, so
+                    # they form part of the history the marker matches against.
+                    local_pos = row - cumulative_total
+                    history = (
+                        committed
+                        if predict_bonus_token
+                        else [*committed, *spec_tokens[:local_pos]]
+                    )
+                    for marker in self.reasoning_marker_token_ids:
+                        last_token = marker[-1]
+                        if not 0 <= last_token < vocab_size:
+                            continue
+                        prefix = marker[:-1]
+                        if prefix and history[len(history) - len(prefix) :] != prefix:
+                            continue
+                        penalised_rows.append(row)
+                        penalised_tokens.append(last_token)
+                        penalties.append(penalty)
             cumulative_total += count
+
+        if not penalised_rows:
+            return
+        rows_t = torch.tensor(penalised_rows, dtype=torch.long, device=logits.device)
+        tokens_t = torch.tensor(
+            penalised_tokens, dtype=torch.long, device=logits.device
+        )
+        penalties_t = torch.tensor(penalties, dtype=logits.dtype, device=logits.device)
+        logits.index_put_((rows_t, tokens_t), -penalties_t, accumulate=True)
 
     @staticmethod
     def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:

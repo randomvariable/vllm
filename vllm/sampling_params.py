@@ -402,7 +402,12 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
     reasoning_marker_penalty: ReasoningMarkerPenalty = None
-    """Penalty applied to configured reasoning markers while thinking."""
+    """Penalty applied to configured reasoning markers while thinking.
+
+    A marker may span several tokens, in which case the penalty applies to its
+    final token only, and only where the preceding tokens already match, so a
+    shared prefix is not discouraged on its own.
+    """
     reasoning_answer_reserve: ReasoningAnswerReserve = None
     """Number of output tokens to reserve for the final answer.
 
