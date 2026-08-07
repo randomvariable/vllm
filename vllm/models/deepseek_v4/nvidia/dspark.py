@@ -9,7 +9,9 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable
+from typing import cast
 
 import regex as re
 import torch
@@ -48,6 +50,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 
+from ..attention import DeepseekV4Attention
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -112,6 +115,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 for i in range(self.num_dspark_layers)
             ]
         )
+        # ``nn.ModuleList`` iteration is typed as ``Tensor | Module``; the
+        # concrete element type is needed to reach decoder-layer attributes.
+        self.decoder_layers = cast(list[DeepseekV4DecoderLayer], list(self.layers))
 
         # Heads: final norm + hc_head, and the Markov head
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
@@ -166,7 +172,7 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self.decoder_layers):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
@@ -200,8 +206,12 @@ class DSparkDeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
-        residual = post_mix = res_mix = None
-        for layer in self.layers:
+        # The first layer runs mhc_pre and returns concrete tensors, so these
+        # are only None before the loop body executes.
+        residual: torch.Tensor | None = None
+        post_mix: torch.Tensor | None = None
+        res_mix: torch.Tensor | None = None
+        for layer in self.decoder_layers:
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -210,6 +220,8 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+        assert residual is not None, "draft model has no decoder layers"
+        assert post_mix is not None and res_mix is not None
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -226,7 +238,7 @@ class DSparkDeepseekV4Model(nn.Module):
 
 
 def _insert_context_kv(
-    attn: nn.Module,
+    attn: DeepseekV4Attention,
     kv: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -331,7 +343,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
         # layer, named by its prefix.
-        return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
+        return [
+            layer.attn.swa_cache_layer.prefix for layer in self.model.decoder_layers
+        ]
 
     def precompute_and_store_context_kv(
         self,
@@ -377,7 +391,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
-        first_layer = self.model.layers[0]
+        first_layer = self.model.decoder_layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
         if use_mega_moe:
             expert_mapping = make_deepseek_v4_expert_params_mapping(
@@ -407,6 +421,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Expert weight loaders decline silently: a shape/format mismatch
+        # returns False rather than raising. Under expert parallelism a False
+        # return is also legitimate (the shard is not local to this rank), so
+        # track acceptance per layer -- a layer offered expert weights that
+        # accepts none of them is broken in either mode.
+        experts_offered: Counter[str] = Counter()
+        experts_loaded: Counter[str] = Counter()
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -437,6 +458,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
+                expert_layer = name.split(".experts.", 1)[0]
+                experts_offered[expert_layer] += 1
                 if (
                     "weight_scale" in name
                     and loaded_weight.dtype == torch.float8_e8m0fnu
@@ -447,7 +470,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                         continue
                     name_mapped = name.replace(weight_name, param_name)
                     param = params_dict[name_mapped]
-                    success = param.weight_loader(
+                    expert_weight_loader = cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = expert_weight_loader(
                         param,
                         loaded_weight,
                         name_mapped,
@@ -457,6 +483,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     )
                     if success:
                         loaded_params.add(name_mapped)
+                        experts_loaded[expert_layer] += 1
                         break
                 continue
 
@@ -469,7 +496,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
+                stacked_weight_loader = cast(Callable[..., None], param.weight_loader)
+                stacked_weight_loader(param, loaded_weight, stacked_shard_id)
                 loaded_params.add(name)
                 break
             else:
@@ -487,12 +515,25 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        starved = sorted(
+            layer for layer in experts_offered if not experts_loaded[layer]
+        )
+        if starved:
+            raise RuntimeError(
+                f"DSpark draft model: expert layer(s) {starved} were offered "
+                f"checkpoint weights but their loader accepted none of them. "
+                f"This means the draft experts were bound to a quantization "
+                f"method that does not match their checkpoint format -- check "
+                f"which layers quantization_config.quantized_layers declares "
+                f"as requantized."
+            )
+
         self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
     def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
+        for layer in self.model.decoder_layers:
             layer.ffn.finalize_mega_moe_weights()
 
     def _remap_dspark_name(self, name: str) -> str | None:
