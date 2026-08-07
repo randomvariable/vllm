@@ -19,6 +19,7 @@ from vllm.utils.b12x import get_b12x_intrinsics as _import_b12x_intrinsics
 from .base import MxFp4LinearKernel, MxFp4LinearLayerConfig
 
 
+
 def _apply_b12x_mxfp4_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
