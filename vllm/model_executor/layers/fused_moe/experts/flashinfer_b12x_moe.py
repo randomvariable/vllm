@@ -43,6 +43,9 @@ class _B12xWrapperKey:
     output_dtype: torch.dtype
     device: str
     activation: str
+    swiglu_alpha: float
+    swiglu_beta: float
+    swiglu_limit: float | None
 
 
 _B12X_WRAPPERS: WeakValueDictionary[_B12xWrapperKey, Any] = WeakValueDictionary()
@@ -66,6 +69,9 @@ def _get_b12x_wrapper(key: _B12xWrapperKey) -> Any:
                 output_dtype=key.output_dtype,
                 device=key.device,
                 activation=key.activation,
+                swiglu_alpha=key.swiglu_alpha,
+                swiglu_beta=key.swiglu_beta,
+                swiglu_limit=key.swiglu_limit,
             )
             _B12X_WRAPPERS[key] = wrapper
         return wrapper
@@ -90,6 +96,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     _ACTIVATION_MAP: dict[MoEActivation, str] = {
         MoEActivation.SILU: "silu",
         MoEActivation.RELU2_NO_MUL: "relu2",
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE: "swigluoai_uninterleave",
     }
 
     def __init__(
@@ -126,6 +133,46 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             )
         self._activation_str = self._ACTIVATION_MAP[activation]
 
+        self._swiglu_alpha = getattr(quant_config, "gemm1_alpha", None)
+        if self._swiglu_alpha is None:
+            self._swiglu_alpha = getattr(moe_config, "swiglu_alpha", None)
+        self._swiglu_alpha = (
+            1.0 if self._swiglu_alpha is None else self._swiglu_alpha
+        )
+        self._swiglu_beta = getattr(quant_config, "gemm1_beta", None)
+        if self._swiglu_beta is None:
+            self._swiglu_beta = getattr(moe_config, "swiglu_beta", None)
+        self._swiglu_beta = 0.0 if self._swiglu_beta is None else self._swiglu_beta
+
+        # A SwiGLU clamp limit is expressed through the kernel's
+        # ``swigluoai_uninterleave`` activation, the only gated variant that
+        # honours ``swiglu_limit``. With swiglu_alpha=1.0/swiglu_beta=0.0 it
+        # reduces to silu(clamp(gate)) * clamp(up), matching the reference
+        # ``silu_and_mul_with_clamp`` op. Plain "silu" ignores the limit, so
+        # selecting it here would silently drop the clamp.
+        self._swiglu_limit = self.quant_config.gemm1_clamp_limit
+        if self._swiglu_limit is None:
+            self._swiglu_limit = moe_config.swiglu_limit
+        if self._swiglu_limit is not None:
+            if activation not in (
+                MoEActivation.SILU,
+                MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            ):
+                raise ValueError(
+                    f"FlashInferB12xExperts cannot apply a SwiGLU clamp limit "
+                    f"to activation {activation!r}; only "
+                    f"{MoEActivation.SILU!r} is supported."
+                )
+            self._activation_str = "swigluoai_uninterleave"
+        elif activation is MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            raise ValueError(
+                "FlashInferB12xExperts requires a SwiGLU clamp limit for "
+                f"activation {activation!r}."
+            )
+        if activation is MoEActivation.SILU:
+            self._swiglu_alpha = 1.0
+            self._swiglu_beta = 0.0
+
         self._wrapper = _get_b12x_wrapper(
             _B12xWrapperKey(
                 owner_id=id(get_current_vllm_config_or_none()),
@@ -138,6 +185,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 output_dtype=self.out_dtype,
                 device=self.device,
                 activation=self._activation_str,
+                swiglu_alpha=self._swiglu_alpha,
+                swiglu_beta=self._swiglu_beta,
+                swiglu_limit=self._swiglu_limit,
             )
         )
 
@@ -242,7 +292,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in (MoEActivation.SILU, MoEActivation.RELU2_NO_MUL)
+        return activation in (
+            MoEActivation.SILU,
+            MoEActivation.RELU2_NO_MUL,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        )
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:

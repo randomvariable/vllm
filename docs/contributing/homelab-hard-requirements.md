@@ -59,11 +59,22 @@ Keep `homelabs-main` close to `upstream/main` so fork changes stay small, mergea
 - Resolve conflicts by **preserving fork-unique work** — the SM120/SM121 CUTLASS grouped-MoE port, the vendored FlashInfer submodule and its build wiring, B12X MXFP4 integration, DeepGEMM/Spark cross-build changes, and the `homelab/` Dockerfiles. Never drop these to make a rebase "clean".
 - If a rebase hits non-trivial conflicts, stop and resolve them with fork context rather than blindly taking upstream or fork sides.
 
+## Compiled extensions live in the checkout, not the image
+
+The gfx1151 devtools image has an **empty** `/src/vllm`; build extensions land
+in the host checkout. First check that the devloop container bind-mounts the
+checkout. A missing `vllm._C` can have other causes, so then verify with the
+sanctioned explicit `.venv/bin/python` or devtools interpreter. Prefer the
+Strix devloop's mandatory `cargo make doctor`, `cargo make setup`,
+`cargo make build`, and `cargo make test` sequence. For other incremental
+C++/HIP/CUDA work, follow the [Incremental Build Setup](./incremental_build.md)
+guidance rather than duplicating its CMake commands.
+
 ## Optimise the development lifecycle daily, and build incrementally
 
 A slow edit-test loop is treated as a defect, not a cost of doing business. Rebuilding a whole image to test a source change is never acceptable as the routine path. (2026-07-30: "the development practice should force fast incremental build whenever we need to... aggressively optimise the development lifecycle daily.")
 
-- Use the **documented CMake path** in [Incremental Build Setup](./incremental_build.md) — `tools/generate_cmake_presets.py` plus a persistent build tree and `ccache` — for every C++/HIP/CUDA change. It supports both CUDA and ROCm.
+- Use the [Incremental Build Setup](./incremental_build.md) guidance for C++/HIP/CUDA changes. Strix work uses the mandatory cargo-make devloop above.
 - **Review the loop daily**, alongside the upstream rebase above. If any routine step has become slow, fix the tooling before continuing feature work.
 - **Environment staleness must fail closed.** A harness that cannot find the source it is meant to test, or that silently falls back to an installed package or a fallback kernel, must error rather than report success. Prove *which* files a run actually loaded — resolved package path and compiled extension imports — before trusting a pass. Test harnesses that overlay source into a container must run pytest with `--import-mode=importlib`, otherwise the mount shadows the installed package and its compiled extensions vanish silently. Devloop probes and pytest Python invocations must use safe-path mode (`python -P`) in addition to pytest `--import-mode=importlib`, so mounted checkout metadata cannot shadow image metadata.
 - **Do not add another language** to solve build orchestration. This tree is already Python, C++/HIP/CUDA and Rust; dev tooling belongs in Rust (`cargo-make`, already a dependency via `setuptools-rust`). A hermetic build system such as Bazel or Pants is not justified by polyglot pain alone: the recurring costs here have been SDK packaging, cross-compilation toolchain files and artefact staleness, none of which it addresses, and it would fight the ROCm SDK's layout harder than CMake does.

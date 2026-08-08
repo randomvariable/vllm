@@ -8,6 +8,7 @@ import inspect
 from typing import Any, cast
 
 import torch
+from packaging.version import InvalidVersion, Version
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -26,8 +27,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
+# b12x 1.1.0 renamed the package from sparkinfer and moved the planned MoE
+# API from b12x.integration.tp_moe to b12x.moe.fused_moe.
+B12X_VERSION = "1.1.0"
 
-def _run_b12x_moe_fp4(
+
+def _run_moe(
     *,
     a: torch.Tensor,
     experts: Any,
@@ -40,9 +45,7 @@ def _run_b12x_moe_fp4(
     unit_scale_contract: bool,
 ) -> None:
     """Call b12x MoE with preplanned, shared-workspace-owned scratch."""
-    from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
-        b12x_moe_fp4,
-    )
+    from b12x.moe.fused_moe import run  # type: ignore[import-not-found]
 
     binding = scratch_plan.bind(
         scratch=scratch,
@@ -54,7 +57,7 @@ def _run_b12x_moe_fp4(
         input_scales_static=input_scales_static,
         unit_scale_contract=unit_scale_contract,
     )
-    b12x_moe_fp4(binding=binding)
+    run(binding=binding)
 
 
 def _b12x_activation_name(activation: MoEActivation) -> str:
@@ -63,22 +66,6 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
     if activation == MoEActivation.RELU2:
         return "relu2"
     return activation.value
-
-
-def _plan_b12x_fp4_moe_weights(**kwargs):
-    from b12x.integration import (  # type: ignore[import-not-found]
-        plan_b12x_fp4_moe_weights,
-    )
-
-    return plan_b12x_fp4_moe_weights(**kwargs)
-
-
-def _prepare_b12x_fp4_moe_weights(**kwargs):
-    from b12x.integration import (  # type: ignore[import-not-found]
-        prepare_b12x_fp4_moe_weights,
-    )
-
-    return prepare_b12x_fp4_moe_weights(**kwargs)
 
 
 def _replace_parameter_with_empty(
@@ -111,11 +98,7 @@ def _set_quant_config_weight_scale(
 def _maybe_release_cuda_cache(device: torch.device) -> None:
     if device.type != "cuda" or _is_current_stream_capturing():
         return
-    accelerator = getattr(torch, "accelerator", None)
-    if accelerator is not None:
-        accelerator.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
 
 def _raise_if_capture_copy_required(tensor: torch.Tensor, description: str) -> None:
@@ -161,36 +144,82 @@ def _normalize_b12x_moe_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor
 
 
 def has_b12x_moe() -> bool:
-    """Return whether b12x 0.30.2 exposes the API used by this backend."""
+    """Return whether b12x exposes the planned MoE API used by this backend.
+
+    Returns:
+        False when b12x is not installed at all, which leaves other MoE
+        backends free to claim the layer.
+
+    Raises:
+        RuntimeError: When b12x is installed but too old to expose the
+            ``b12x.moe.fused_moe`` planned API. Downgrading to another
+            backend would silently trade the SM120/SM121 kernels for a
+            slower path, so an incompatible install fails loudly instead.
+    """
     try:
-        if importlib.metadata.version("b12x") != "0.30.2":
-            return False
-        integration = importlib.import_module("b12x.integration")
-        tp_moe = importlib.import_module("b12x.integration.tp_moe")
-        expected = {
-            integration.plan_b12x_fp4_moe_weights: {
-                "quant_modes",
-                "num_experts",
-                "hidden_size",
-                "intermediate_size",
-            },
-            integration.prepare_b12x_fp4_moe_weights: {"plan"},
-            integration.B12XFP4ExpertWeights: {
-                "plan",
-                "w1_fp4",
-                "w1_blockscale",
-                "w2_fp4",
-                "w2_blockscale",
-            },
-            tp_moe.TPMoEScratchCaps: {"weight_plan", "max_tokens"},
-            tp_moe.TPMoEScratchPlan.bind: {"experts", "scratch"},
-        }
-    except (ImportError, AttributeError, importlib.metadata.PackageNotFoundError):
+        installed = importlib.metadata.version("b12x")
+    except importlib.metadata.PackageNotFoundError:
         return False
-    return hasattr(integration, "B12XFP4ExpertWeights") and all(
-        required <= set(inspect.signature(obj).parameters)
-        for obj, required in expected.items()
-    )
+
+    try:
+        supported_version = Version(installed) == Version(B12X_VERSION)
+    except InvalidVersion as exc:
+        raise RuntimeError(f"Unsupported b12x version {installed!r}") from exc
+    if not supported_version:
+        raise RuntimeError(
+            f"Unsupported b12x version {installed}; this backend requires "
+            f"b12x=={B12X_VERSION}"
+        )
+
+    try:
+        fused_moe = importlib.import_module("b12x.moe.fused_moe")
+    except ImportError as exc:
+        raise RuntimeError(
+            f"b12x {installed} is installed but does not provide "
+            f"'b12x.moe.fused_moe'. This backend requires b12x "
+            f"=={B12X_VERSION}, which moved the planned MoE API out of "
+            f"the removed 'b12x.integration.tp_moe' module. "
+            f"Install b12x=={B12X_VERSION}."
+        ) from exc
+
+    expected = {
+        "plan_weights": {
+            "quant_modes",
+            "num_experts",
+            "hidden_size",
+            "intermediate_size",
+        },
+        "prepare_weights": {"plan"},
+        "ExpertWeights": {
+            "plan",
+            "w1_fp4",
+            "w1_blockscale",
+            "w2_fp4",
+            "w2_blockscale",
+        },
+        "Caps": {"weight_plan", "max_tokens"},
+        "Plan.bind": {"experts", "scratch"},
+    }
+    missing = []
+    for name, required in expected.items():
+        obj: Any = fused_moe
+        for part in name.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is None:
+            missing.append(name)
+            continue
+        params = set(inspect.signature(obj).parameters)
+        if not required <= params:
+            missing.append(f"{name}({sorted(required - params)})")
+    if missing:
+        raise RuntimeError(
+            f"b12x {installed} exposes 'b12x.moe.fused_moe' but is missing "
+            f"required API: {', '.join(missing)}. Install "
+            f"b12x=={B12X_VERSION}."
+        )
+    return True
 
 
 class B12xExperts(mk.FusedMoEExpertsModular):
@@ -263,11 +292,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return (
-            p.is_cuda()
-            and p.is_device_capability_family(120)
-            and has_b12x_moe()
-        )
+        return p.is_cuda() and p.is_device_capability_family(120) and has_b12x_moe()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -344,7 +369,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         unit_scale = self._unit_expert_scale(w1.device, int(w1.shape[0]))
-        self._weight_plan = _plan_b12x_fp4_moe_weights(
+        from b12x.moe.fused_moe import plan_weights  # type: ignore[import-not-found]
+
+        self._weight_plan = plan_weights(
             quant_modes="w4a16",
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),
@@ -354,7 +381,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             hidden_size=int(self.moe_config.hidden_dim),
             intermediate_size=int(self.moe_config.intermediate_size_per_partition),
         )
-        self._experts = _prepare_b12x_fp4_moe_weights(
+        from b12x.moe.fused_moe import prepare_weights  # type: ignore[import-not-found]
+
+        self._experts = prepare_weights(
             plan=self._weight_plan,
             w1_fp4=w1,
             w1_blockscale=self.w1_scale,
@@ -373,18 +402,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return self._experts
 
     def _plan_scratch(self, device: torch.device) -> None:
-        from b12x.integration.tp_moe import (  # type: ignore[import-not-found]
-            TPMoEScratchCaps,
-            plan_tp_moe_scratch,
-        )
+        from b12x.moe.fused_moe import Caps, plan  # type: ignore[import-not-found]
 
         max_tokens = max(
             1,
             int(self.moe_config.max_num_tokens) * int(self.moe_config.dp_size),
             int(self.moe_config.max_capture_size),
         )
-        self._scratch_plan = plan_tp_moe_scratch(
-            TPMoEScratchCaps(
+        self._scratch_plan = plan(
+            Caps(
                 max_tokens=max_tokens,
                 num_topk=int(self.moe_config.experts_per_token),
                 device=device,
@@ -398,9 +424,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         )
 
-    def _assert_owner_aliases_source(
-        self, w1: torch.Tensor, w2: torch.Tensor
-    ) -> None:
+    def _assert_owner_aliases_source(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
         assert self._experts is not None
         assert self.w1_scale is not None and self.w2_scale is not None
         w1_scale = self.w1_scale
@@ -532,7 +556,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         scratch = workspace2.view(torch.uint8)
         required_bytes = int(self._scratch_plan.scratch_specs()[0].shape[0])
         scratch = scratch[:required_bytes]
-        _run_b12x_moe_fp4(
+        _run_moe(
             a=hidden_states,
             experts=self._experts,
             scratch_plan=self._scratch_plan,

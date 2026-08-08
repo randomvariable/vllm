@@ -191,6 +191,7 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        NvFp4MoeBackend.FLASHINFER_B12X,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.MARLIN,
         NvFp4MoeBackend.EMULATION,
@@ -263,7 +264,8 @@ def select_nvfp4_moe_backend(
                 f"Model sets swiglu_limit={config.swiglu_limit}, but the "
                 f"explicitly requested moe_backend={runner_backend!r} does "
                 f"not apply the SwiGLU clamp. Use 'flashinfer_trtllm', "
-                f"'flashinfer_cutlass', 'flashinfer_cutedsl', 'cutlass', "
+                f"'flashinfer_cutlass', 'flashinfer_cutedsl', "
+                f"'flashinfer_b12x', 'cutlass', "
                 f"'marlin', or 'humming' instead."
             )
         return _return_or_raise(

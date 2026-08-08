@@ -29,47 +29,78 @@ def _signature(*names: str) -> inspect.Signature:
     )
 
 
-def test_probe_requires_exact_0302_plan_owner_bind_contract(monkeypatch):
-    integration = ModuleType("b12x.integration")
-    tp_moe = ModuleType("b12x.integration.tp_moe")
-    integration.__dict__["B12XFP4ExpertWeights"] = Mock(
+def _fake_fused_moe() -> ModuleType:
+    fused_moe = ModuleType("b12x.moe.fused_moe")
+    fused_moe.__dict__["ExpertWeights"] = Mock(
         __signature__=_signature(
             "plan", "w1_fp4", "w1_blockscale", "w2_fp4", "w2_blockscale"
         )
     )
-    integration.__dict__["plan_b12x_fp4_moe_weights"] = Mock(
+    fused_moe.__dict__["plan_weights"] = Mock(
         __signature__=_signature(
-            "quant_modes", "num_experts", "hidden_size", "intermediate_size"
+            "quant_modes",
+            "source_format",
+            "activation",
+            "params_dtype",
+            "num_experts",
+            "hidden_size",
+            "intermediate_size",
+            "w13_layout",
         )
     )
-    integration.__dict__["prepare_b12x_fp4_moe_weights"] = Mock(
-        __signature__=_signature("plan")
+    fused_moe.__dict__["prepare_weights"] = Mock(
+        __signature__=_signature("plan", "params_dtype", "w1_fp4", "w2_fp4")
     )
-    tp_moe.__dict__["TPMoEScratchCaps"] = Mock(
+    fused_moe.__dict__["Caps"] = Mock(
         __signature__=_signature("weight_plan", "max_tokens")
     )
-    tp_moe.__dict__["TPMoEScratchPlan"] = type(
-        "TPMoEScratchPlan",
+    fused_moe.__dict__["Plan"] = type(
+        "Plan",
         (),
         {"bind": Mock(__signature__=_signature("self", "experts", "scratch"))},
     )
-    monkeypatch.setattr(b12x.importlib.metadata, "version", lambda _: "0.30.2")
-    monkeypatch.setattr(
-        b12x.importlib,
-        "import_module",
-        lambda name: tp_moe if name.endswith("tp_moe") else integration,
-    )
+    return fused_moe
+
+
+def test_probe_accepts_planned_fused_moe_api(monkeypatch):
+    fused_moe = _fake_fused_moe()
+    monkeypatch.setattr(b12x.importlib.metadata, "version", lambda _: "1.1.0")
+    monkeypatch.setattr(b12x.importlib, "import_module", lambda _: fused_moe)
 
     assert b12x.has_b12x_moe()
-    cast(Any, tp_moe.__dict__["TPMoEScratchPlan"]).bind.__signature__ = _signature(
+
+
+def test_probe_raises_when_planned_bind_contract_is_missing(monkeypatch):
+    fused_moe = _fake_fused_moe()
+    monkeypatch.setattr(b12x.importlib.metadata, "version", lambda _: "1.1.0")
+    monkeypatch.setattr(b12x.importlib, "import_module", lambda _: fused_moe)
+    cast(Any, fused_moe.__dict__["Plan"]).bind.__signature__ = _signature(
         "self", "scratch"
     )
+
+    with pytest.raises(RuntimeError, match="Plan.bind"):
+        b12x.has_b12x_moe()
+
+
+def test_probe_returns_false_when_b12x_absent(monkeypatch):
+    def _absent(_):
+        raise b12x.importlib.metadata.PackageNotFoundError("b12x")
+
+    monkeypatch.setattr(b12x.importlib.metadata, "version", _absent)
     assert not b12x.has_b12x_moe()
 
 
-def test_probe_rejects_wrong_b12x_version(monkeypatch):
-    monkeypatch.setattr(b12x.importlib.metadata, "version", lambda _: "0.30.1")
-    assert not b12x.has_b12x_moe()
+def test_probe_raises_on_pre_rename_b12x(monkeypatch):
+    """An old b12x must fail loudly, never silently fall back to a slower MoE."""
+
+    def _no_module(_):
+        raise ImportError("No module named 'b12x.moe'")
+
+    monkeypatch.setattr(b12x.importlib.metadata, "version", lambda _: "0.30.2")
+    monkeypatch.setattr(b12x.importlib, "import_module", _no_module)
+
+    with pytest.raises(RuntimeError, match="Unsupported b12x version"):
+        b12x.has_b12x_moe()
 
 
 def test_swiglu_oai_is_not_claimed_as_silu():
@@ -101,8 +132,10 @@ def test_explicit_b12x_oracle_selection_is_fail_closed(monkeypatch):
     assert backend == Mxfp4MoeBackend.B12X_MXFP4
     assert experts_cls is FakeB12xExperts
 
-    FakeB12xExperts.is_supported_config = Mock(
-        return_value=(False, "b12x 0.30.2 is unavailable")
+    monkeypatch.setattr(
+        FakeB12xExperts,
+        "is_supported_config",
+        classmethod(lambda _cls, *args: (False, "b12x 0.30.2 is unavailable")),
     )
     with pytest.raises(ValueError, match="b12x 0.30.2 is unavailable"):
         oracle.select_deepseek_v4_mxfp4_moe_backend(config)
@@ -130,7 +163,10 @@ def test_b12x_processes_canonical_weights_without_generic_conversion(monkeypatch
     method._cache_permute_indices = {}
     method.moe_quant_config = None
     method.moe_kernel = None
-    method.moe = SimpleNamespace()
+    method.is_k3_situ_aiter = False
+    # w13 fuses gate and up for the gated SILU activation b12x requires, so
+    # the canonical w13_weight below is (2, intermediate_size * 2, 16).
+    method.moe = SimpleNamespace(w13_num_shards=2)
     method.experts_cls = object
     method.get_fused_moe_quant_config = Mock(return_value=SimpleNamespace())
 
@@ -185,13 +221,12 @@ def test_preparation_retains_owner_and_plans_scratch_without_allocating(monkeypa
     prepare_weights = Mock(return_value=owner)
     plan_scratch = Mock(return_value=scratch_plan)
     caps = Mock(side_effect=lambda **kwargs: kwargs)
-    monkeypatch.setattr(b12x, "_plan_b12x_fp4_moe_weights", plan_weights)
-    monkeypatch.setattr(b12x, "_prepare_b12x_fp4_moe_weights", prepare_weights)
-
-    tp_moe = ModuleType("b12x.integration.tp_moe")
-    tp_moe.__dict__["TPMoEScratchCaps"] = caps
-    tp_moe.__dict__["plan_tp_moe_scratch"] = plan_scratch
-    monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", tp_moe)
+    fused_moe = ModuleType("b12x.moe.fused_moe")
+    fused_moe.__dict__["plan_weights"] = plan_weights
+    fused_moe.__dict__["prepare_weights"] = prepare_weights
+    fused_moe.__dict__["Caps"] = caps
+    fused_moe.__dict__["plan"] = plan_scratch
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe", fused_moe)
 
     experts = cast(Any, object.__new__(b12x.B12xExperts))
     experts.moe_config = SimpleNamespace(
@@ -251,10 +286,10 @@ def test_apply_binds_owner_to_modular_workspace_without_allocating(monkeypatch):
     )
     run = Mock()
     plan_scratch = Mock(side_effect=AssertionError("scratch planned during apply"))
-    tp_moe = ModuleType("b12x.integration.tp_moe")
-    tp_moe.__dict__["b12x_moe_fp4"] = run
-    tp_moe.__dict__["plan_tp_moe_scratch"] = plan_scratch
-    monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", tp_moe)
+    fused_moe = ModuleType("b12x.moe.fused_moe")
+    fused_moe.__dict__["run"] = run
+    fused_moe.__dict__["plan"] = plan_scratch
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe", fused_moe)
 
     experts = cast(Any, object.__new__(b12x.B12xExperts))
     experts._experts = owner = object()
@@ -291,8 +326,7 @@ def test_apply_binds_owner_to_modular_workspace_without_allocating(monkeypatch):
     assert scratch.dtype == torch.uint8
     assert scratch.numel() == 5
     assert (
-        scratch.untyped_storage().data_ptr()
-        == workspace2.untyped_storage().data_ptr()
+        scratch.untyped_storage().data_ptr() == workspace2.untyped_storage().data_ptr()
     )
     allocate.assert_not_called()
     plan_scratch.assert_not_called()
@@ -368,7 +402,7 @@ def test_modular_workspace_keeps_output_and_odd_scratch_disjoint(monkeypatch):
 
 def test_distinct_experts_bind_same_modular_workspace(monkeypatch):
     run = Mock()
-    monkeypatch.setattr(b12x, "_run_b12x_moe_fp4", run)
+    monkeypatch.setattr(b12x, "_run_moe", run)
 
     hidden = torch.empty(2, 4)
     output = torch.empty_like(hidden)

@@ -6,3 +6,7 @@
 	path = third_party/deep_gemm
 	url = https://github.com/vllm-project/DeepGEMM.git
 	branch = codex/cuda129-fp8-include-5f33a180
+[submodule "third_party/b12x"]
+	path = third_party/b12x
+	url = https://github.com/randomvariable/b12x.git
+	branch = master

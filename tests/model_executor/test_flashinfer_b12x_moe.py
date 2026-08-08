@@ -23,6 +23,13 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 def _make_experts(
     activation: MoEActivation,
     max_num_tokens: int = 16,
+    *,
+    quant_alpha: float | None = None,
+    quant_beta: float | None = None,
+    quant_limit: float | None = None,
+    model_alpha: float | None = None,
+    model_beta: float | None = None,
+    model_limit: float | None = None,
 ) -> b12x.FlashInferB12xExperts:
     quant_config = cast(
         FusedMoEQuantConfig,
@@ -32,6 +39,9 @@ def _make_experts(
             g2_alphas=torch.full((2,), 2.0),
             w1_scale=torch.full((2,), 3.0),
             w2_scale=torch.full((2,), 4.0),
+            gemm1_alpha=quant_alpha,
+            gemm1_beta=quant_beta,
+            gemm1_clamp_limit=quant_limit,
         ),
     )
     moe_config = cast(
@@ -47,6 +57,11 @@ def _make_experts(
             dp_size=2,
             device=torch.device("cpu"),
             activation=activation,
+            swiglu_alpha=model_alpha,
+            swiglu_beta=model_beta,
+            swiglu_limit=model_limit,
+            activation_situ_beta=None,
+            activation_situ_linear_beta=None,
         ),
     )
     experts = b12x.FlashInferB12xExperts(moe_config, quant_config)
@@ -61,6 +76,7 @@ def _make_experts(
     [
         (MoEActivation.SILU, "silu"),
         (MoEActivation.RELU2_NO_MUL, "relu2"),
+        (MoEActivation.SWIGLUOAI_UNINTERLEAVE, "swigluoai_uninterleave"),
     ],
 )
 def test_b12x_layers_share_owned_workspace_and_preserve_call_contract(
@@ -85,7 +101,15 @@ def test_b12x_layers_share_owned_workspace_and_preserve_call_contract(
     fake_fused_moe.__dict__["B12xMoEWrapper"] = FakeB12xMoEWrapper
     monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", fake_fused_moe)
 
-    expert_instances = (_make_experts(activation), _make_experts(activation))
+    kwargs = (
+        {"quant_limit": 7.0}
+        if activation is MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        else {}
+    )
+    expert_instances = (
+        _make_experts(activation, **kwargs),
+        _make_experts(activation, **kwargs),
+    )
     assert len(wrappers) == 1
     assert wrappers[0].config == {
         "num_experts": 2,
@@ -98,6 +122,11 @@ def test_b12x_layers_share_owned_workspace_and_preserve_call_contract(
         "output_dtype": torch.bfloat16,
         "device": "cpu",
         "activation": expected_activation,
+        "swiglu_alpha": 1.0,
+        "swiglu_beta": 0.0,
+        "swiglu_limit": 7.0
+        if activation is MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        else None,
     }
 
     output = torch.empty(3, 4, dtype=torch.bfloat16)
@@ -180,3 +209,98 @@ def test_b12x_workspace_is_not_shared_between_model_owners(
     second = _make_experts(MoEActivation.SILU, max_num_tokens=18)
 
     assert first._wrapper is not second._wrapper
+
+
+def test_b12x_silu_construction_uses_alias_and_clamp(monkeypatch: pytest.MonkeyPatch):
+    class FakeB12xMoEWrapper:
+        def __init__(self, **kwargs):
+            self.config = kwargs
+
+    fake_fused_moe = ModuleType("flashinfer.fused_moe")
+    fake_fused_moe.__dict__["B12xMoEWrapper"] = FakeB12xMoEWrapper
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", fake_fused_moe)
+
+    plain = _make_experts(MoEActivation.SILU)
+    clamped = _make_experts(MoEActivation.SILU, quant_limit=7.0)
+
+    assert plain._wrapper.config["activation"] == "silu"
+    assert plain._wrapper.config["swiglu_limit"] is None
+    assert clamped._wrapper.config["activation"] == "swigluoai_uninterleave"
+    assert clamped._wrapper.config["swiglu_limit"] == 7.0
+
+
+def test_b12x_explicit_swiglu_oai_and_precedence(monkeypatch: pytest.MonkeyPatch):
+    class FakeB12xMoEWrapper:
+        def __init__(self, **kwargs):
+            self.config = kwargs
+
+    fake_fused_moe = ModuleType("flashinfer.fused_moe")
+    fake_fused_moe.__dict__["B12xMoEWrapper"] = FakeB12xMoEWrapper
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", fake_fused_moe)
+
+    experts = _make_experts(
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        quant_alpha=2.0,
+        quant_beta=3.0,
+        quant_limit=4.0,
+        model_alpha=5.0,
+        model_beta=6.0,
+        model_limit=7.0,
+    )
+
+    assert experts._wrapper.config["activation"] == "swigluoai_uninterleave"
+    assert experts._wrapper.config["swiglu_alpha"] == 2.0
+    assert experts._wrapper.config["swiglu_beta"] == 3.0
+    assert experts._wrapper.config["swiglu_limit"] == 4.0
+
+
+def test_b12x_wrapper_cache_key_separates_activation_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeB12xMoEWrapper:
+        def __init__(self, **kwargs):
+            pass
+
+    fake_fused_moe = ModuleType("flashinfer.fused_moe")
+    fake_fused_moe.__dict__["B12xMoEWrapper"] = FakeB12xMoEWrapper
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", fake_fused_moe)
+
+    first = _make_experts(
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        quant_alpha=1.0,
+        quant_beta=0.0,
+        quant_limit=4.0,
+    )
+    second = _make_experts(
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        quant_alpha=1.5,
+        quant_beta=0.0,
+        quant_limit=4.0,
+    )
+
+    assert first._wrapper is not second._wrapper
+
+
+def test_b12x_rejects_clamp_for_non_silu_activation():
+    with pytest.raises(ValueError, match="cannot apply a SwiGLU clamp limit"):
+        _make_experts(MoEActivation.RELU2_NO_MUL, quant_limit=7.0)
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [
+        MoEActivation.SILU,
+        MoEActivation.RELU2_NO_MUL,
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    ],
+)
+def test_b12x_supports_expected_activations(activation: MoEActivation):
+    assert b12x.FlashInferB12xExperts._supports_activation(activation)
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [MoEActivation.GELU, MoEActivation.SWIGLUOAI],
+)
+def test_b12x_rejects_unsupported_activations(activation: MoEActivation):
+    assert not b12x.FlashInferB12xExperts._supports_activation(activation)

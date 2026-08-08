@@ -44,10 +44,8 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ### Fast local dev loop (MANDATORY before image builds)
 
-The full Tekton image build is a 4+ hour cross-compile from x86 to aarch64.
-**Never trigger it to iterate on a change.** It exists for producing deployable
-images after work is validated, not for getting feedback on edits. The first
-reflex when a change needs verifying is a local loop on a GPU box, not a build.
+Full image builds are for validated deployable work, not edit feedback.
+Use a local GPU dev loop first.
 
 Two loops exist and are the default — pick by what the change touches:
 
@@ -59,61 +57,30 @@ Two loops exist and are the default — pick by what the change touches:
    minutes not hours. See `Makefile.toml` and
    `docs/contributing/kernel_targets/rdna35.md`.
 
-For GB10/CUDA work that genuinely needs a native build, SSH to a free GB10
-node (e.g. `server18`/`server20`, IP under `kubectl get nodes -o wide`),
-clone the checkout, `uv venv` + `VLLM_USE_PRECOMPILED=1 uv pip install -e .`,
-and iterate with `.venv/bin/python -m pytest` or `vllm serve` against a small
-model (e.g. `Qwen/Qwen3.5-4B`, cached on the `qwen35-test-cache` PVC).
-`.venv/bin/python -c "import vllm"` succeeding is the gate before any image
-build is even contemplated.
+For CUDA work requiring a native build, use the sanctioned explicit
+`.venv/bin/python` interpreter and verify `import vllm._C` before image builds.
+Only trigger an image build once the local checks above are green **and** a
+deployable image is actually needed.
 
-Trigger `spark-build-on-push` / `strix-build-on-push` only when local loops
-are green **and** a deployable image is actually needed. The 4h build is the
-publish step, not the feedback step.
+Environment setup and dependencies use `uv`; Python commands use
+`.venv/bin/python`.
 
-### Environment setup
+Tests
 
 ```bash
-# Install `uv` if you don't have it already:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Always use `uv` for Python environment management:
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Always make sure `pre-commit` and its hooks are installed:
-uv pip install -r requirements/lint.txt
-pre-commit install
-```
-
-### Installing dependencies
-
-```bash
-# If you are only making Python changes:
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-
-# If you are also making C/C++ changes:
-uv pip install -e . --torch-backend=auto
-```
-
-### Tests
-
-> Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
-
-```bash
-# Install test dependencies (use cuda.in on non-x86_64):
 uv pip install -r requirements/test/cuda.in
 
-# Run a specific test file:
 .venv/bin/python -m pytest tests/path/to/test_file.py -v
 ```
 
 For AMD Strix Halo (`gfx1151`) ROCm work, use `cargo make test -- <pytest
 args>`. It supports paths, node IDs, and `-k`, rejects a bare command, and
-uses a container rather than the host `.venv`; keep the generic command above
-for non-ROCm environments.
+uses a container rather than the host `.venv`; keep the generic command for
+non-ROCm environments. The devloop container must bind-mount the checkout so
+the compiled `vllm._C` extension is loaded from the build under test (see the
+homelab guide).
 
-When adding tests:
+When adding tests
 
 - **Design before you write.** Answer four questions first: what is the module
   for, what is its I/O contract, what failure am I guarding against, and what is

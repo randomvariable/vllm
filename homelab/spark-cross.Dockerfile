@@ -230,6 +230,14 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
+# b12x is pinned as a submodule so SM120/SM121 MoE fixes can be carried
+# ahead of a PyPI release. It declares no ext_modules, so the wheel is
+# arch-independent and needs no cross-compile toolchain.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    mkdir -p /wheels-b12x && \
+    uv build --wheel --out-dir /wheels-b12x \
+      /src/vllm/third_party/b12x
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     mkdir -p /wheels-gguf && \
     if git init -q /src/gguf-plugin && \
@@ -285,6 +293,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages uv
 COPY --from=builder /wheels /wheels
 COPY --from=builder /wheels-flashinfer /wheels-flashinfer
 COPY --from=builder /wheels-gguf /wheels-gguf
+COPY --from=builder /wheels-b12x /wheels-b12x
 COPY --from=builder /runtime-requirements /runtime-requirements
 COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 # Verbose cross-compile logs exceed the CI log limit mid-build, so persist
@@ -301,7 +310,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl && \
     uv pip install --system --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
-    uv pip install --system b12x==0.30.2 && \
+    uv pip install --system /wheels-b12x/*.whl && \
     uv pip install --system xxhash && \
     uv pip install --system --no-deps /wheels/*.whl && \
     if ls /wheels-gguf/*.whl >/dev/null 2>&1; then \
@@ -312,7 +321,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       echo "GGUF plugin wheel absent; skipping"; \
     fi
 
-RUN rm -rf /wheels /wheels-flashinfer /wheels-gguf && \
+RUN rm -rf /wheels /wheels-flashinfer /wheels-gguf /wheels-b12x && \
     python3 -m compileall -q \
       "$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
       || true
