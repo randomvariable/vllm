@@ -76,6 +76,24 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     file /tmp/t.o | grep -qi aarch64 && \
     rm -f /tmp/t.cu /tmp/t.o
 
+# Ubuntu 24.04 ships ccache 4.9.1, which cannot preprocess nvcc's
+# --generate-dependencies-with-compile and reports every such call as
+# "Preprocessing failed" (uncacheable). FlashInfer's AOT build uses that flag
+# for all ~3400 of its compile units, so apt's ccache caches none of them.
+# 4.13.x handles it, so pin a static build ahead of /usr/bin on PATH.
+ARG CCACHE_VERSION=4.13.6
+ARG CCACHE_SHA256=156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5
+RUN cd /tmp && \
+    wget -q -O ccache.tar.xz \
+      "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-x86_64-musl-static.tar.xz" && \
+    echo "${CCACHE_SHA256}  ccache.tar.xz" | sha256sum -c - && \
+    tar -xf ccache.tar.xz && \
+    install -m755 "ccache-${CCACHE_VERSION}-linux-x86_64-musl-static/ccache" \
+      /usr/local/bin/ccache && \
+    rm -rf ccache.tar.xz "ccache-${CCACHE_VERSION}-linux-x86_64-musl-static" && \
+    [ "$(command -v ccache)" = /usr/local/bin/ccache ] && \
+    ccache --version | head -1
+
 # The aarch64 cross compiler defines __aarch64__, so the multiarch wrapper at
 # /usr/include/python3.12/pyconfig.h does
 #   #include <aarch64-linux-gnu/python3.12/pyconfig.h>
@@ -167,7 +185,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     ccache -z && \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
-    ccache -s | tee /src/ccache-stats-vllm.txt
+    ccache -sv | tee /src/ccache-stats-vllm.txt
 
 # Build both FlashInfer packages from the pinned recursive submodule. The local
 # JIT-cache wheel carries the patched AArch64 SM121 native modules.
@@ -201,7 +219,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh && \
-    ccache -s | tee /src/ccache-stats-flashinfer.txt
+    ccache -sv | tee /src/ccache-stats-flashinfer.txt
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
