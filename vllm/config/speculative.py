@@ -528,10 +528,20 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
             )
-        if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+        elif hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
             is_moe = hf_config.model_type == "qwen3_5_moe"
             hf_config.model_type = "qwen3_5_mtp"
-            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+            # Multimodal wrappers keep the text hyperparameters on ``text_config``.
+            text_config = getattr(hf_config, "text_config", None) or hf_config
+            n_predict = getattr(text_config, "mtp_num_hidden_layers", None)
+            # The draft is text-only even when the target is multimodal, so it
+            # uses 1-D positions. Drop the inherited M-RoPE fields; otherwise
+            # the proposer builds 3-D positions for non-M-RoPE draft layers.
+            for cfg in {id(hf_config): hf_config, id(text_config): text_config}.values():
+                rope_parameters = getattr(cfg, "rope_parameters", None)
+                if rope_parameters is not None:
+                    rope_parameters.pop("mrope_section", None)
+                    rope_parameters.pop("mrope_interleaved", None)
             hf_config.update(
                 {
                     "n_predict": n_predict,
@@ -891,6 +901,16 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
+                    # Self-drafting methods (MTP, EAGLE heads shipped inside the
+                    # target checkpoint) read the target's weights, so carry over
+                    # the resolved weights location. Loaders prefer
+                    # ``model_weights`` over ``model``, which differ when the
+                    # config source is not the weights source.
+                    model_weights=(
+                        self.target_model_config.model_weights
+                        if self.model == self.target_model_config.model
+                        else ""
+                    ),
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
