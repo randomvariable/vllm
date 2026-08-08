@@ -198,7 +198,14 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
       'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests numpy \
       nvidia-ml-py 'apache-tvm-ffi>=0.1,<0.2' && \
     FI_NVCC_PREPEND="-target-dir sbsa-linux" && \
-    printf '%s\n' "$FI_NVCC_PREPEND" 12.1a > "$CCACHE_EXTRAFILES" && \
+    # 12.1a alone is not sufficient. FlashInfer names each AOT module after the
+    # arch it was built for (fp4_quantization_121), but its runtime resolver
+    # rewrites SM12x to the family variant "120f" whenever CUDA >= 12.9 and
+    # then looks up fp4_quantization_120f. With FLASHINFER_DISABLE_JIT=1 that
+    # lookup raises MissingJITCacheError instead of compiling a fallback, so
+    # both variants must be present in the wheel.
+    FI_ARCH_LIST="12.0f 12.1a" && \
+    printf '%s\n' "$FI_NVCC_PREPEND" "$FI_ARCH_LIST" > "$CCACHE_EXTRAFILES" && \
     ccache -z && \
     CUDA_VERSION=13.0 \
     CC=/usr/bin/aarch64-linux-gnu-gcc \
@@ -213,7 +220,7 @@ RUN --mount=type=cache,target=/root/.ccache-cross,sharing=locked \
     FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.0/targets/sbsa-linux/lib -L/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.0/targets/sbsa-linux/lib" \
     FLASHINFER_SOURCE_DIR=/src/vllm/third_party/flashinfer \
     FLASHINFER_DIST_DIR=/wheels-flashinfer \
-    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH_LIST" \
     FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
     MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
