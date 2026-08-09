@@ -54,6 +54,14 @@ class Sampler:
         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
+        # The temperature schedule derives its step count and reasoning phase
+        # from these persistent buffers, device side.
+        self.sampling_states.bind_reasoning_state(
+            req_states,
+            getattr(self.thinking_budget_state, "cached_last_start", None),
+            getattr(self.thinking_budget_state, "cached_last_end", None),
+            device,
+        )
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -201,9 +209,11 @@ class Sampler:
             expanded_local_pos,
         )
 
-        # Apply temperature in place.
+        # Apply temperature in place. The kernel resolves the per-row step,
+        # anneal progress and reasoning phase itself, reading the marker cache
+        # `thinking_budget_state.apply` refreshed just above.
         self.sampling_states.apply_temperature(
-            logits, expanded_idx_mapping, idx_mapping_np
+            logits, expanded_idx_mapping, idx_mapping_np, expanded_local_pos
         )
 
         # Apply min_p in place.
@@ -233,6 +243,10 @@ class Sampler:
         states = self.sampling_states
         temperatures = states.temperature.np[idx_mapping_np]
         if np.any((temperatures != 0.0) & (temperatures != 1.0)):
+            return True
+        # A base of 0.0/1.0 says nothing about a request that anneals to some
+        # other value, or overrides its temperature in the answer phase.
+        if states.any_dynamic_temperature(idx_mapping_np):
             return True
         if np.any(states.min_p.np[idx_mapping_np] != 0.0):
             return True
@@ -270,6 +284,8 @@ class Sampler:
             # logprobs need to be returned for any requests.
             (top_k is None and top_p is None)
             or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            # `any_greedy` covers schedules that can resolve to zero on a later
+            # step; FlashInfer decides greedy statically and cannot see them.
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
@@ -287,5 +303,10 @@ class Sampler:
                 pos,
                 apply_temperature=False,
                 use_fp64=self.use_fp64_gumbel,
+                # Temperature is already applied above; the schedule is passed
+                # so the greedy branch tests the resolved value, not the base.
+                schedule=self.sampling_states.temperature_schedule(
+                    idx_mapping_np, expanded_local_pos
+                ),
             )
         return sampled, processed_logits

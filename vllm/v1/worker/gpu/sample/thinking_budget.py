@@ -64,6 +64,11 @@ class ThinkingBudgetState:
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
         self.use_marker_penalty = np.zeros(self.max_num_reqs, dtype=bool)
         self.use_answer_reserve = np.zeros(self.max_num_reqs, dtype=bool)
+        # A request that only sets `reasoning_answer_temperature` still needs
+        # the committed-marker cache maintained, since the temperature kernel
+        # reads it to decide the phase -- but it must not trigger the penalty
+        # or force-end subkernels.
+        self.use_phase_temperature = np.zeros(self.max_num_reqs, dtype=bool)
         self.reasoning_marker_penalty: UvaBackedTensor | None = None
         self._num_markers = 0
         if not self.enabled:
@@ -87,6 +92,15 @@ class ThinkingBudgetState:
         self.max_tokens.np.fill(-1)
         self.max_tokens.copy_to_uva()
         self._reserve_dirty = False
+
+        # Device mirror of `use_phase_temperature`, read by the marker-cache
+        # kernel so it keeps the cache warm for override-only requests.
+        self.phase_temperature_enabled = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.phase_temperature_enabled.np.fill(0)
+        self.phase_temperature_enabled.copy_to_uva()
+        self._phase_temp_dirty = False
 
         self.cached_last_start = torch.full(
             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
@@ -173,6 +187,14 @@ class ThinkingBudgetState:
         if active and req_idx not in self._reset_reqs:
             self._reset_reqs.append(req_idx)
 
+        uses_phase_temp = sampling_params.reasoning_answer_temperature is not None
+        self.use_phase_temperature[req_idx] = uses_phase_temp
+        if self.phase_temperature_enabled.np[req_idx] != uses_phase_temp:
+            self.phase_temperature_enabled.np[req_idx] = uses_phase_temp
+            self._phase_temp_dirty = True
+        if uses_phase_temp and req_idx not in self._reset_reqs:
+            self._reset_reqs.append(req_idx)
+
         if self.reasoning_marker_penalty is not None:
             penalty = sampling_params.reasoning_marker_penalty or 0.0
             self.use_marker_penalty[req_idx] = penalty != 0.0
@@ -205,6 +227,9 @@ class ThinkingBudgetState:
             self.reasoning_answer_reserve.copy_to_uva()
             self.max_tokens.copy_to_uva()
             self._reserve_dirty = False
+        if self._phase_temp_dirty:
+            self.phase_temperature_enabled.copy_to_uva()
+            self._phase_temp_dirty = False
 
     @property
     def tracked_np(self) -> np.ndarray:
@@ -216,7 +241,10 @@ class ThinkingBudgetState:
         early and leaving the budget silently inert.
         """
         return (
-            self.use_thinking_budget | self.use_marker_penalty | self.use_answer_reserve
+            self.use_thinking_budget
+            | self.use_marker_penalty
+            | self.use_answer_reserve
+            | self.use_phase_temperature
         )
 
     def apply(
@@ -236,7 +264,8 @@ class ThinkingBudgetState:
             self.use_marker_penalty[idx_mapping_np]
         )
         use_reserve = np.any(self.use_answer_reserve[idx_mapping_np])
-        if not use_budget and not use_penalty and not use_reserve:
+        use_phase_temp = np.any(self.use_phase_temperature[idx_mapping_np])
+        if not (use_budget or use_penalty or use_reserve or use_phase_temp):
             return
 
         apply_thinking_budget(
@@ -263,6 +292,12 @@ class ThinkingBudgetState:
             answer_reserve=self.reasoning_answer_reserve.gpu if use_reserve else None,
             max_tokens=self.max_tokens.gpu if use_reserve else None,
             prompt_len=self.req_states.prompt_len.gpu if use_reserve else None,
+            phase_temperature=(
+                self.phase_temperature_enabled.gpu if use_phase_temp else None
+            ),
+            # A phase-temperature-only batch needs the cache refresh and
+            # nothing else; forcing an end marker would be wrong.
+            update_cache_only=not use_budget and not use_penalty and not use_reserve,
         )
 
 
@@ -291,6 +326,7 @@ def _update_committed_marker_cache_kernel(
     thinking_token_budget_ptr,
     marker_penalty_ptr,
     answer_reserve_ptr,
+    phase_temperature_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
@@ -305,6 +341,7 @@ def _update_committed_marker_cache_kernel(
     BLOCK: tl.constexpr,
     HAS_PENALTY: tl.constexpr,
     HAS_RESERVE: tl.constexpr,
+    HAS_PHASE_TEMPERATURE: tl.constexpr,
 ):
     req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
     budget = tl.load(thinking_token_budget_ptr + req_state_idx)
@@ -315,6 +352,9 @@ def _update_committed_marker_cache_kernel(
         needs_cache = needs_cache or tl.load(marker_penalty_ptr + req_state_idx) != 0.0
     if HAS_RESERVE:
         needs_cache = needs_cache or tl.load(answer_reserve_ptr + req_state_idx) > 0
+    if HAS_PHASE_TEMPERATURE:
+        # A phase temperature reads the cache without penalising or forcing.
+        needs_cache = needs_cache or tl.load(phase_temperature_ptr + req_state_idx) != 0
     if not needs_cache:
         return
 
@@ -628,6 +668,8 @@ def apply_thinking_budget(
     answer_reserve: torch.Tensor | None = None,
     max_tokens: torch.Tensor | None = None,
     prompt_len: torch.Tensor | None = None,
+    phase_temperature: torch.Tensor | None = None,
+    update_cache_only: bool = False,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -640,6 +682,7 @@ def apply_thinking_budget(
         # Unused when no penalty is configured; pass a valid pointer anyway.
         marker_penalty if marker_penalty is not None else thinking_token_budget,
         answer_reserve if answer_reserve is not None else thinking_token_budget,
+        phase_temperature if phase_temperature is not None else thinking_token_budget,
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
@@ -654,7 +697,13 @@ def apply_thinking_budget(
         BLOCK=_COLD_SCAN_BLOCK,
         HAS_PENALTY=marker_penalty is not None,
         HAS_RESERVE=answer_reserve is not None,
+        HAS_PHASE_TEMPERATURE=phase_temperature is not None,
     )
+
+    if update_cache_only:
+        # Only the marker cache was requested: no request in this batch has a
+        # budget, penalty or reserve, so there is nothing to penalise or force.
+        return
 
     # The penalty reads the marker cache the kernel above just refreshed, and
     # must run before forcing so a forced end token is never penalised.

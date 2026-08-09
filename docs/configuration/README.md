@@ -54,3 +54,9 @@ are independent and can be set together. The penalty discourages selected
 tokens; the budget counts reasoning tokens separately and forces
 `reasoning_end_str` when the limit is reached; the reserve forces
 `reasoning_end_str` once the remaining output budget drops to it.
+
+[Step-aware temperature](../features/reasoning_outputs.md#step-aware-temperature)
+(`temperature_final`, `temperature_anneal_steps` and
+`reasoning_answer_temperature`) is orthogonal to all three: those parameters
+decide where the reasoning block ends, while step-aware temperature decides how
+tokens are sampled on either side of it.

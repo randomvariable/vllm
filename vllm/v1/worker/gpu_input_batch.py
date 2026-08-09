@@ -24,11 +24,81 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.temperature import TemperatureSchedule
 from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
+
+_ScheduleBuffer = tuple[torch.Tensor, torch.Tensor]
+
+
+@dataclass(eq=False)
+class _TemperatureScheduleBuffers:
+    """Persistent GPU buffers plus their pinned staging tensors.
+
+    Each field is a `(gpu, cpu)` pair. The CPU side is written per request and
+    flushed with `copy_slice`, mirroring how `InputBatch` stages `temperature`.
+    `base` is not held here: it aliases the existing `temperature` buffer.
+    """
+
+    final: _ScheduleBuffer
+    anneal_steps: _ScheduleBuffer
+    schedule_enabled: _ScheduleBuffer
+    answer_temperature: _ScheduleBuffer
+    answer_enabled: _ScheduleBuffer
+    generated_steps: _ScheduleBuffer
+    reasoning_phase: _ScheduleBuffer
+    entered_reasoning: _ScheduleBuffer
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _TemperatureScheduleBuffers):
+            return NotImplemented
+        return all(
+            torch.equal(a_gpu, b_gpu) and torch.equal(a_cpu, b_cpu)
+            for (a_gpu, a_cpu), (b_gpu, b_cpu) in zip(self.fields(), other.fields())
+        )
+
+    def fields(self) -> tuple[_ScheduleBuffer, ...]:
+        return (
+            self.final,
+            self.anneal_steps,
+            self.schedule_enabled,
+            self.answer_temperature,
+            self.answer_enabled,
+            self.generated_steps,
+            self.reasoning_phase,
+            self.entered_reasoning,
+        )
+
+    def clear_row(self, index: int) -> None:
+        for _, cpu in self.fields():
+            cpu[index] = 0
+
+    def swap_rows(self, i1: int, i2: int) -> None:
+        for _, cpu in self.fields():
+            tmp = cpu[i1].item()
+            cpu[i1] = cpu[i2]
+            cpu[i2] = tmp
+
+    def move_row(self, dst: int, src: int) -> None:
+        for _, cpu in self.fields():
+            cpu[dst] = cpu[src]
+
+    def as_schedule(self, base: torch.Tensor, num_reqs: int) -> TemperatureSchedule:
+        """Device-side view over the first `num_reqs` rows."""
+        return TemperatureSchedule(
+            base=base[:num_reqs],
+            final=self.final[0][:num_reqs],
+            anneal_steps=self.anneal_steps[0][:num_reqs],
+            schedule_enabled=self.schedule_enabled[0][:num_reqs],
+            answer_temperature=self.answer_temperature[0][:num_reqs],
+            answer_enabled=self.answer_enabled[0][:num_reqs],
+            generated_steps=self.generated_steps[0][:num_reqs],
+            reasoning_phase=self.reasoning_phase[0][:num_reqs],
+            entered_reasoning=self.entered_reasoning[0][:num_reqs],
+        )
 
 
 @dataclass
@@ -206,6 +276,15 @@ class InputBatch:
         self.greedy_reqs: set[str] = set()
         self.random_reqs: set[str] = set()
 
+        # Step-aware temperature: immutable per-request config plus the
+        # per-step signals the device-side primitive consumes. Allocated once
+        # at max_num_reqs and only ever written in place, so pointer identity
+        # survives CUDA graph capture.
+        self.temperature_schedule = self._make_temperature_schedule(
+            max_num_reqs, device
+        )
+        self.dynamic_temperature_reqs: set[str] = set()
+
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
@@ -315,6 +394,94 @@ class InputBatch:
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
+    def _set_temperature_schedule(
+        self, req_id: str, req_index: int, sampling_params: SamplingParams
+    ) -> None:
+        """Stage a request's immutable step-aware temperature config.
+
+        Only the configuration is staged. Step count, reasoning phase and the
+        resulting temperature are all resolved device-side.
+        """
+        sched = self.temperature_schedule
+        sched.clear_row(req_index)
+        self.dynamic_temperature_reqs.discard(req_id)
+        if not sampling_params.has_dynamic_temperature:
+            return
+
+        if sampling_params.has_temperature_schedule:
+            assert sampling_params.temperature_final is not None
+            assert sampling_params.temperature_anneal_steps is not None
+            sched.final[1][req_index] = sampling_params.temperature_final
+            sched.anneal_steps[1][req_index] = sampling_params.temperature_anneal_steps
+            sched.schedule_enabled[1][req_index] = 1
+        answer_temp = sampling_params.reasoning_answer_temperature
+        if answer_temp is not None:
+            sched.answer_temperature[1][req_index] = answer_temp
+            sched.answer_enabled[1][req_index] = 1
+        self.dynamic_temperature_reqs.add(req_id)
+
+    def refresh_temperature_steps(self) -> None:
+        """Refresh the per-step schedule inputs, in place, before sampling.
+
+        `refresh_metadata` only runs after a structural batch change, but the
+        step counter and reasoning phase move every decode step, so they are
+        re-staged here. Writes land in the buffers the cached
+        `SamplingMetadata` already points at, so no tensor is reallocated.
+        """
+        if not self.dynamic_temperature_reqs:
+            return
+        num_reqs = self.num_reqs
+        if num_reqs == 0:
+            return
+
+        sched = self.temperature_schedule
+        steps_cpu = sched.generated_steps[1]
+        for req_index in range(num_reqs):
+            steps_cpu[req_index] = len(self.req_output_token_ids[req_index] or ())
+
+        phase_cpu = sched.reasoning_phase[1]
+        entered_cpu = sched.entered_reasoning[1]
+        holder = self.thinking_budget_state_holder
+        if holder is not None:
+            holder.export_phase(phase_cpu, num_reqs)
+            # Latch: once a request has left thinking it stays in the answer
+            # phase, and a request that never entered reasoning never latches.
+            entered_cpu[:num_reqs] |= phase_cpu[:num_reqs]
+        else:
+            phase_cpu[:num_reqs] = 0
+
+        for buffers in (
+            sched.generated_steps,
+            sched.reasoning_phase,
+            sched.entered_reasoning,
+        ):
+            copy_slice(buffers[1], buffers[0], num_reqs)
+
+    @staticmethod
+    def _make_temperature_schedule(
+        max_num_reqs: int, device: torch.device
+    ) -> _TemperatureScheduleBuffers:
+        """Allocate the persistent step-aware temperature buffers."""
+
+        def alloc(dtype: torch.dtype) -> _ScheduleBuffer:
+            gpu = torch.zeros((max_num_reqs,), dtype=dtype, device=device)
+            cpu = torch.zeros(
+                (max_num_reqs,), dtype=dtype, device="cpu", pin_memory=PIN_MEMORY
+            )
+            return gpu, cpu
+
+        f32, i32 = torch.float32, torch.int32
+        return _TemperatureScheduleBuffers(
+            final=alloc(f32),
+            anneal_steps=alloc(i32),
+            schedule_enabled=alloc(i32),
+            answer_temperature=alloc(f32),
+            answer_enabled=alloc(i32),
+            generated_steps=alloc(i32),
+            reasoning_phase=alloc(i32),
+            entered_reasoning=alloc(i32),
+        )
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -405,6 +572,8 @@ class InputBatch:
             else:
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.random_reqs.add(req_id)
+
+            self._set_temperature_schedule(req_id, req_index, sampling_params)
 
             self.top_p_cpu[req_index] = sampling_params.top_p
             if sampling_params.top_p < 1:
@@ -581,6 +750,9 @@ class InputBatch:
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
         self.thinking_token_budget_reqs.discard(req_id)
+        self.dynamic_temperature_reqs.discard(req_id)
+        self.temperature_schedule.clear_row(req_index)
+
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -665,6 +837,7 @@ class InputBatch:
         # to support logitsprocs.
         self.batch_update_builder.moved.append((i1, i2, MoveDirectionality.SWAP))
 
+        self.temperature_schedule.swap_rows(i1, i2)
         self.temperature_cpu[i1], self.temperature_cpu[i2] = (
             self.temperature_cpu[i2],
             self.temperature_cpu[i1],
@@ -801,6 +974,7 @@ class InputBatch:
             )
 
             self.temperature_cpu[empty_index] = self.temperature_cpu[last_req_index]
+            self.temperature_schedule.move_row(empty_index, last_req_index)
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
             self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
             self.frequency_penalties_cpu[empty_index] = self.frequency_penalties_cpu[
@@ -859,12 +1033,22 @@ class InputBatch:
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
-        if not self.all_greedy:
+        # A schedule can move a statically-greedy request off 0.0 later, so the
+        # base temperature must be uploaded even when `all_greedy` holds now.
+        has_schedule = bool(self.dynamic_temperature_reqs)
+        if not self.all_greedy or has_schedule:
             temperature = copy_slice(
                 self.temperature_cpu_tensor, self.temperature, num_reqs
             )
         else:
             temperature = None
+
+        temperature_schedule = None
+        if has_schedule:
+            sched = self.temperature_schedule
+            for gpu, cpu in sched.fields():
+                copy_slice(cpu, gpu, num_reqs)
+            temperature_schedule = sched.as_schedule(self.temperature, num_reqs)
         if not self.no_top_p:
             copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
         if not self.no_top_k:
@@ -942,8 +1126,9 @@ class InputBatch:
 
         return SamplingMetadata(
             temperature=temperature,
-            all_greedy=self.all_greedy,
-            all_random=self.all_random,
+            temperature_schedule=temperature_schedule,
+            all_greedy=self.all_greedy and not has_schedule,
+            all_random=self.all_random and not has_schedule,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -960,6 +1145,9 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            refresh_temperature_schedule=(
+                self.refresh_temperature_steps if has_schedule else None
+            ),
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

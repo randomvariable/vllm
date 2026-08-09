@@ -26,6 +26,7 @@ logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
+_MAX_TEMPERATURE = 2.0
 
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
@@ -81,6 +82,75 @@ def validate_reasoning_answer_reserve(value: int | float | bool | None) -> int |
     return value
 
 
+def validate_temperature_final(value: float | int | bool | None) -> float | None:
+    """Validate ``temperature_final``; return ``None`` if unset.
+
+    Accepts the same range as ``temperature`` so a schedule can never anneal
+    to a value the static parameter would have rejected.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`temperature_final` must be a finite float in [0, 2].",
+            parameter="temperature_final",
+            value=value,
+        )
+    if not math.isfinite(value) or not 0.0 <= value <= _MAX_TEMPERATURE:
+        raise VLLMValidationError(
+            "`temperature_final` must be a finite float in [0, 2].",
+            parameter="temperature_final",
+            value=value,
+        )
+    return float(value)
+
+
+def validate_temperature_anneal_steps(value: int | float | bool | None) -> int | None:
+    """Validate ``temperature_anneal_steps``; return ``None`` if unset.
+
+    ``0`` is rejected rather than treated as a no-op: a zero-length anneal has
+    no interpolation to perform, so it can only mean a misconfigured request.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)) or not isinstance(value, int):
+        raise VLLMValidationError(
+            "`temperature_anneal_steps` must be a positive integer or -1 for unset.",
+            parameter="temperature_anneal_steps",
+            value=value,
+        )
+    if value == -1:
+        return None
+    if value < 1:
+        raise VLLMValidationError(
+            "`temperature_anneal_steps` must be a positive integer or -1 for unset.",
+            parameter="temperature_anneal_steps",
+            value=value,
+        )
+    return value
+
+
+def validate_reasoning_answer_temperature(
+    value: float | int | bool | None,
+) -> float | None:
+    """Validate ``reasoning_answer_temperature``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`reasoning_answer_temperature` must be a finite float in [0, 2].",
+            parameter="reasoning_answer_temperature",
+            value=value,
+        )
+    if not math.isfinite(value) or not 0.0 <= value <= _MAX_TEMPERATURE:
+        raise VLLMValidationError(
+            "`reasoning_answer_temperature` must be a finite float in [0, 2].",
+            parameter="reasoning_answer_temperature",
+            value=value,
+        )
+    return float(value)
+
+
 def validate_reasoning_marker_penalty(value: float | int | None) -> float | None:
     """Validate the per-request reasoning marker penalty."""
     if value is None:
@@ -111,6 +181,18 @@ ReasoningMarkerPenalty = Annotated[
 ReasoningAnswerReserve = Annotated[
     int | None,
     BeforeValidator(validate_reasoning_answer_reserve),
+]
+TemperatureFinal = Annotated[
+    float | None,
+    BeforeValidator(validate_temperature_final),
+]
+TemperatureAnnealSteps = Annotated[
+    int | None,
+    BeforeValidator(validate_temperature_anneal_steps),
+]
+ReasoningAnswerTemperature = Annotated[
+    float | None,
+    BeforeValidator(validate_reasoning_answer_temperature),
 ]
 
 
@@ -433,6 +515,44 @@ class SamplingParams(
     is clamped to that prompt-aware cap so the reserve boundary is reachable.
     """
 
+    temperature_final: TemperatureFinal = None
+    """Temperature reached at the end of the annealing schedule.
+
+    Enables step-aware temperature: instead of a constant ``temperature``, the
+    sampling temperature is linearly interpolated from ``temperature`` at
+    generation step 0 to ``temperature_final`` at step
+    ``temperature_anneal_steps``, then held there. The interpolation is
+    evaluated device-side per logits row, so speculative-decode draft rows at
+    different offsets within the same step each get their own value.
+
+    Must be supplied together with ``temperature_anneal_steps``; supplying
+    either alone is a configuration error. Leaving both unset keeps the exact
+    static ``temperature`` behaviour with no added sampling work.
+    """
+    temperature_anneal_steps: TemperatureAnnealSteps = None
+    """Number of generated tokens over which ``temperature_final`` is reached.
+
+    Progress is ``min(generated_steps / temperature_anneal_steps, 1.0)``, so
+    the schedule clamps at ``temperature_final`` once the request has produced
+    this many output tokens. Must be a positive integer and must be supplied
+    together with ``temperature_final``; ``None`` (or ``-1``) disables the
+    schedule.
+    """
+    reasoning_answer_temperature: ReasoningAnswerTemperature = None
+    """Temperature used once the reasoning block has closed.
+
+    Overrides both ``temperature`` and any annealing schedule for rows sampled
+    after a natural end-of-thinking marker has fully completed, letting a
+    request explore while thinking and then commit to a low temperature for the
+    answer. A request that never enters a reasoning block never takes the
+    override.
+
+    Requires reasoning to be configured on the request via one of
+    ``thinking_token_budget``, ``reasoning_answer_reserve`` or
+    ``reasoning_marker_penalty``, because the phase is only tracked for
+    requests the reasoning path already follows.
+    """
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -458,6 +578,9 @@ class SamplingParams(
         thinking_token_budget: int | None = None,
         reasoning_marker_penalty: float | None = None,
         reasoning_answer_reserve: int | None = None,
+        temperature_final: float | None = None,
+        temperature_anneal_steps: int | None = None,
+        reasoning_answer_temperature: float | None = None,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
@@ -522,6 +645,9 @@ class SamplingParams(
             thinking_token_budget=thinking_token_budget,
             reasoning_marker_penalty=reasoning_marker_penalty,
             reasoning_answer_reserve=reasoning_answer_reserve,
+            temperature_final=temperature_final,
+            temperature_anneal_steps=temperature_anneal_steps,
+            reasoning_answer_temperature=reasoning_answer_temperature,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -565,6 +691,25 @@ class SamplingParams(
         self.reasoning_answer_reserve = validate_reasoning_answer_reserve(
             self.reasoning_answer_reserve
         )
+        self.temperature_final = validate_temperature_final(self.temperature_final)
+        self.temperature_anneal_steps = validate_temperature_anneal_steps(
+            self.temperature_anneal_steps
+        )
+        self.reasoning_answer_temperature = validate_reasoning_answer_temperature(
+            self.reasoning_answer_temperature
+        )
+        # Same numerical floor as `temperature`: a dynamic target in (0, eps)
+        # would divide logits by ~0 device-side.
+        if (
+            self.temperature_final is not None
+            and 0 < self.temperature_final < _MAX_TEMP
+        ):
+            self.temperature_final = _MAX_TEMP
+        if (
+            self.reasoning_answer_temperature is not None
+            and 0 < self.reasoning_answer_temperature < _MAX_TEMP
+        ):
+            self.reasoning_answer_temperature = _MAX_TEMP
 
         if self.stop is None:
             self.stop = []
@@ -590,8 +735,9 @@ class SamplingParams(
 
         self._verify_args()
 
-        if self.temperature < _SAMPLING_EPS:
-            # Zero temperature means greedy sampling.
+        if self.temperature < _SAMPLING_EPS and not self.has_dynamic_temperature:
+            # Zero temperature means greedy sampling. A schedule starting at 0
+            # is not greedy for its whole life, so top_p/top_k stay meaningful.
             self.top_p = 1.0
             self.top_k = 0
             self.min_p = 0.0
@@ -707,6 +853,28 @@ class SamplingParams(
                     parameter="reasoning_answer_reserve",
                     value=self.reasoning_answer_reserve,
                 )
+        if (self.temperature_final is None) != (self.temperature_anneal_steps is None):
+            raise VLLMValidationError(
+                "`temperature_final` and `temperature_anneal_steps` must be "
+                "supplied together; a target with no length, or a length with "
+                "no target, does not define a schedule.",
+                parameter="temperature_final",
+                value=self.temperature_final,
+            )
+        if self.reasoning_answer_temperature is not None and not (
+            self.thinking_token_budget is not None
+            or self.reasoning_answer_reserve is not None
+            or self.reasoning_marker_penalty not in (None, 0.0)
+        ):
+            raise VLLMValidationError(
+                "`reasoning_answer_temperature` requires reasoning to be "
+                "configured on the request via `thinking_token_budget`, "
+                "`reasoning_answer_reserve` or `reasoning_marker_penalty`; "
+                "without one the answer phase is never tracked and the "
+                "override could never fire.",
+                parameter="reasoning_answer_temperature",
+                value=self.reasoning_answer_temperature,
+            )
         if self.stream_interval is not None and self.stream_interval < 1:
             raise VLLMValidationError(
                 f"stream_interval must be at least 1, got {self.stream_interval}.",
@@ -827,9 +995,50 @@ class SamplingParams(
                 value=self.bad_words,
             )
 
+    @property
+    def has_temperature_schedule(self) -> bool:
+        """Whether a linear temperature anneal is configured."""
+        return (
+            self.temperature_final is not None
+            and self.temperature_anneal_steps is not None
+        )
+
+    @property
+    def has_dynamic_temperature(self) -> bool:
+        """Whether the sampling temperature can change during generation."""
+        return (
+            self.has_temperature_schedule
+            or self.reasoning_answer_temperature is not None
+        )
+
+    @property
+    def max_effective_temperature(self) -> float:
+        """Largest temperature this request can ever sample at."""
+        temp = self.temperature
+        if self.has_temperature_schedule:
+            assert self.temperature_final is not None
+            temp = max(temp, self.temperature_final)
+        if self.reasoning_answer_temperature is not None:
+            temp = max(temp, self.reasoning_answer_temperature)
+        return temp
+
+    @property
+    def min_effective_temperature(self) -> float:
+        """Smallest temperature this request can ever sample at."""
+        temp = self.temperature
+        if self.has_temperature_schedule:
+            assert self.temperature_final is not None
+            temp = min(temp, self.temperature_final)
+        if self.reasoning_answer_temperature is not None:
+            temp = min(temp, self.reasoning_answer_temperature)
+        return temp
+
     @cached_property
     def sampling_type(self) -> SamplingType:
-        if self.temperature < _SAMPLING_EPS:
+        # A request whose temperature can rise above zero later is not greedy,
+        # even if it starts at zero; the device-side primitive still samples
+        # greedily on the steps where the resolved temperature is zero.
+        if self.max_effective_temperature < _SAMPLING_EPS:
             return SamplingType.GREEDY
         if self.seed is not None:
             return SamplingType.RANDOM_SEED

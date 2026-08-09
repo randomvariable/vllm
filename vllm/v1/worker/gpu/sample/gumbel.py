@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import NamedTuple
+
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
@@ -14,18 +16,151 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
 
 
+class TemperatureSchedule(NamedTuple):
+    """Persistent device buffers for step-aware temperature resolution.
+
+    Every member is a buffer owned by `SamplingStates`, `RequestState` or
+    `ThinkingBudgetState` and allocated once at `max_num_reqs`. The kernels
+    derive the per-row step count, the anneal progress and the reasoning phase
+    from them, so a resolved temperature is never computed on the host.
+    """
+
+    temperature_final: torch.Tensor
+    """[max_num_reqs] f32 — temperature the anneal converges to."""
+    anneal_steps: torch.Tensor
+    """[max_num_reqs] i32 — output tokens the anneal spans."""
+    schedule_enabled: torch.Tensor
+    """[max_num_reqs] i32 — non-zero if the request anneals."""
+    answer_temperature: torch.Tensor
+    """[max_num_reqs] f32 — temperature to use in the answer phase."""
+    answer_enabled: torch.Tensor
+    """[max_num_reqs] i32 — non-zero if the phase override applies."""
+    expanded_local_pos: torch.Tensor
+    """[num_tokens] i32 — row offset within its request's logits."""
+    total_len: torch.Tensor
+    """[max_num_reqs] i32 — prompt_len + committed output length."""
+    prompt_len: torch.Tensor
+    """[max_num_reqs] i32 — prompt length, subtracted to get the step."""
+    cached_last_start: torch.Tensor
+    """[max_num_reqs] i32 — last committed reasoning start marker."""
+    cached_last_end: torch.Tensor
+    """[max_num_reqs] i32 — last committed natural end marker."""
+
+
+_NUM_SCHEDULE_ARGS = len(TemperatureSchedule._fields)
+
+
+def schedule_args(
+    schedule: "TemperatureSchedule | None", fallback: torch.Tensor
+) -> tuple:
+    """Positional kernel arguments for `schedule`, or valid filler pointers.
+
+    Triton needs a real pointer for every argument, including ones on branches
+    its `HAS_SCHEDULE` constexpr eliminates, so the static path repeats
+    `fallback` instead of passing `None`.
+
+    Args:
+        schedule: Schedule buffers, or `None` for static temperature.
+        fallback: Any live tensor to use as an unread placeholder pointer.
+
+    Returns:
+        A tuple of `len(TemperatureSchedule._fields)` tensors.
+    """
+    if schedule is None:
+        return (fallback,) * _NUM_SCHEDULE_ARGS
+    return tuple(schedule)
+
+
+@triton.jit
+def resolve_temperature(
+    token_idx,
+    req_state_idx,
+    temperature_ptr,
+    temperature_final_ptr,
+    anneal_steps_ptr,
+    schedule_enabled_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    expanded_local_pos_ptr,
+    total_len_ptr,
+    prompt_len_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
+    HAS_SCHEDULE: tl.constexpr,
+):
+    """Resolve the temperature for one logits row, entirely on device.
+
+    With `HAS_SCHEDULE` false this is exactly `temperature_ptr[req]`, which
+    keeps the unscheduled path byte-for-byte identical to the static kernel.
+    """
+    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    if HAS_SCHEDULE:
+        if tl.load(schedule_enabled_ptr + req_state_idx) != 0:
+            # generated_steps is derived on device; the host stages no counter.
+            total_len = tl.load(total_len_ptr + req_state_idx).to(tl.int32)
+            prompt_len = tl.load(prompt_len_ptr + req_state_idx).to(tl.int32)
+            local_pos = tl.load(expanded_local_pos_ptr + token_idx).to(tl.int32)
+            step = total_len - prompt_len + local_pos
+            if step < 0:
+                step = 0
+            anneal_steps = tl.load(anneal_steps_ptr + req_state_idx).to(tl.int32)
+            if anneal_steps > 0:
+                progress = step.to(tl.float32) / anneal_steps.to(tl.float32)
+                progress = tl.minimum(progress, 1.0)
+                final = tl.load(temperature_final_ptr + req_state_idx).to(tl.float32)
+                temperature = temperature + progress * (final - temperature)
+
+        if tl.load(answer_enabled_ptr + req_state_idx) != 0:
+            # The answer phase starts only once a natural end marker has fully
+            # committed with no later start marker. A request that never
+            # entered reasoning has last_end < 0 and keeps its scheduled value.
+            last_start = tl.load(cached_last_start_ptr + req_state_idx).to(tl.int32)
+            last_end = tl.load(cached_last_end_ptr + req_state_idx).to(tl.int32)
+            if last_end >= 0 and last_start <= last_end:
+                temperature = tl.load(answer_temperature_ptr + req_state_idx).to(
+                    tl.float32
+                )
+    return temperature
+
+
 @triton.jit
 def _temperature_kernel(
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
     temperature_ptr,
+    temperature_final_ptr,
+    anneal_steps_ptr,
+    schedule_enabled_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    expanded_local_pos_ptr,
+    total_len_ptr,
+    prompt_len_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SCHEDULE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    temperature = resolve_temperature(
+        token_idx,
+        req_state_idx,
+        temperature_ptr,
+        temperature_final_ptr,
+        anneal_steps_ptr,
+        schedule_enabled_ptr,
+        answer_temperature_ptr,
+        answer_enabled_ptr,
+        expanded_local_pos_ptr,
+        total_len_ptr,
+        prompt_len_ptr,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
+        HAS_SCHEDULE=HAS_SCHEDULE,
+    )
     if temperature == 0.0 or temperature == 1.0:
         # Early return to avoid loading logits.
         return
@@ -44,6 +179,7 @@ def apply_temperature(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
+    schedule: TemperatureSchedule | None = None,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
@@ -53,8 +189,10 @@ def apply_temperature(
         logits.stride(0),
         expanded_idx_mapping,
         temperature,
+        *schedule_args(schedule, temperature),
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_SCHEDULE=schedule is not None,
     )
 
 
@@ -95,15 +233,48 @@ def gumbel_block_argmax(
     logits_cache_stride,
     logits_cache_col_ptr,
     vocab_size,
-    APPLY_TEMPERATURE: tl.constexpr,
-    USE_FP64: tl.constexpr,
+    temperature_final_ptr=None,
+    anneal_steps_ptr=None,
+    schedule_enabled_ptr=None,
+    answer_temperature_ptr=None,
+    answer_enabled_ptr=None,
+    expanded_local_pos_ptr=None,
+    total_len_ptr=None,
+    prompt_len_ptr=None,
+    cached_last_start_ptr=None,
+    cached_last_end_ptr=None,
+    APPLY_TEMPERATURE: tl.constexpr = False,
+    USE_FP64: tl.constexpr = False,
     PER_TOKEN_COL: tl.constexpr = False,
+    HAS_SCHEDULE: tl.constexpr = False,
 ):
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
+    # Clamp so the schedule loads below stay in bounds for padded rows; the
+    # resolved value is discarded for them anyway.
+    safe_req_idx = tl.where(is_valid_req, req_state_idx, 0)
     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
         tl.float32
     )
+    if HAS_SCHEDULE:
+        resolved = resolve_temperature(
+            token_idx,
+            safe_req_idx,
+            temp_ptr,
+            temperature_final_ptr,
+            anneal_steps_ptr,
+            schedule_enabled_ptr,
+            answer_temperature_ptr,
+            answer_enabled_ptr,
+            expanded_local_pos_ptr,
+            total_len_ptr,
+            prompt_len_ptr,
+            cached_last_start_ptr,
+            cached_last_end_ptr,
+            HAS_SCHEDULE=True,
+        )
+        temp = tl.where(is_valid_req, resolved, 0.0)
+
     if logits_cache_ptr is not None:
         # Store the logits *before* temperature. Dividing first would produce a
         # value that is generally not representable in the cache's dtype, forcing
@@ -173,11 +344,22 @@ def _gumbel_sample_kernel(
     seeds_ptr,
     pos_ptr,
     temp_ptr,
+    temperature_final_ptr,
+    anneal_steps_ptr,
+    schedule_enabled_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    expanded_local_pos_ptr,
+    total_len_ptr,
+    prompt_len_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
+    HAS_SCHEDULE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
@@ -203,9 +385,20 @@ def _gumbel_sample_kernel(
         logits_cache_stride,
         logits_cache_col_ptr,
         vocab_size,
+        temperature_final_ptr,
+        anneal_steps_ptr,
+        schedule_enabled_ptr,
+        answer_temperature_ptr,
+        answer_enabled_ptr,
+        expanded_local_pos_ptr,
+        total_len_ptr,
+        prompt_len_ptr,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
+        HAS_SCHEDULE=HAS_SCHEDULE,
     )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
@@ -222,6 +415,7 @@ def gumbel_sample(
     logits_cache: torch.Tensor | None = None,  # [max_num_reqs, num_cols, vocab_size]
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
+    schedule: TemperatureSchedule | None = None,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -249,11 +443,13 @@ def gumbel_sample(
         seed,
         pos,
         temperature,
+        *schedule_args(schedule, temperature),
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
+        HAS_SCHEDULE=schedule is not None,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)

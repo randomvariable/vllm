@@ -27,10 +27,13 @@ from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
     ReasoningAnswerReserve,
+    ReasoningAnswerTemperature,
     RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    TemperatureAnnealSteps,
+    TemperatureFinal,
     ThinkingTokenBudget,
     validate_reasoning_marker_penalty,
 )
@@ -246,6 +249,35 @@ class CompletionRequest(OpenAIBaseModel):
     reasoning_marker_penalty: Annotated[
         float | None, BeforeValidator(validate_reasoning_marker_penalty)
     ] = None
+    temperature_final: TemperatureFinal = Field(
+        default=None,
+        description=(
+            "Target temperature to anneal towards over the course of "
+            "generation. Must be supplied together with "
+            "`temperature_anneal_steps`. The effective temperature moves "
+            "linearly from `temperature` at the first generated token to "
+            "this value once `temperature_anneal_steps` tokens have been "
+            "generated, and stays there afterwards."
+        ),
+    )
+    temperature_anneal_steps: TemperatureAnnealSteps = Field(
+        default=None,
+        description=(
+            "Number of generated tokens over which to anneal from "
+            "`temperature` to `temperature_final`. Positive integer; -1 "
+            "means unset."
+        ),
+    )
+    reasoning_answer_temperature: ReasoningAnswerTemperature = Field(
+        default=None,
+        description=(
+            "Temperature to switch to once the model has left the reasoning "
+            "block, overriding `temperature` and any annealing schedule. "
+            "Only applies after a natural end-of-thinking marker completes; "
+            "a request that never enters reasoning never takes the "
+            "override. Requires a reasoning control to be configured."
+        ),
+    )
     reasoning_answer_reserve: ReasoningAnswerReserve = Field(
         default=None,
         description=(
@@ -412,6 +444,9 @@ class CompletionRequest(OpenAIBaseModel):
             thinking_token_budget=self.thinking_token_budget,
             reasoning_marker_penalty=self.reasoning_marker_penalty,
             reasoning_answer_reserve=self.reasoning_answer_reserve,
+            temperature_final=self.temperature_final,
+            temperature_anneal_steps=self.temperature_anneal_steps,
+            reasoning_answer_temperature=self.reasoning_answer_temperature,
         )
 
     @model_validator(mode="before")

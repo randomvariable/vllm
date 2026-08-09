@@ -12,6 +12,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.temperature import (
+    divide_by_temperature,
+    resolve_temperature,
+)
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
@@ -230,11 +234,7 @@ class Sampler(nn.Module):
         temp: torch.Tensor,
         all_random: bool,
     ) -> torch.Tensor:
-        # Use in-place division to avoid creating a new tensor.
-        # Avoid division by zero if there are greedy requests.
-        if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
-        return logits.div_(temp.unsqueeze(dim=1))
+        return divide_by_temperature(logits, temp, all_random)
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -272,9 +272,16 @@ class Sampler(nn.Module):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        # Apply temperature. With a step-aware schedule the effective value is
+        # resolved device-side per row and is what the greedy-vs-random choice
+        # below must key off, not the static base.
+        effective_temperature = sampling_metadata.temperature
+        if sampling_metadata.temperature_schedule is not None:
+            effective_temperature = resolve_temperature(
+                sampling_metadata.temperature_schedule
+            )
+        logits = divide_by_temperature(
+            logits, effective_temperature, sampling_metadata.all_random
         )
 
         # Apply logits processors that only apply to random sampling
@@ -294,7 +301,7 @@ class Sampler(nn.Module):
             return random_sampled, processed_logprobs
 
         sampled = torch.where(
-            sampling_metadata.temperature < _SAMPLING_EPS,
+            effective_temperature < _SAMPLING_EPS,
             greedy_sampled,
             random_sampled,
             out=greedy_sampled,  # Reuse tensor
@@ -414,6 +421,10 @@ class Sampler(nn.Module):
                 predict_bonus_token,
                 sampling_metadata.spec_token_ids,
             )
+        # Re-stage step count and reasoning phase only once the thinking-budget
+        # state for this step has been advanced above.
+        if sampling_metadata.refresh_temperature_schedule is not None:
+            sampling_metadata.refresh_temperature_schedule()
         return logits
 
     @staticmethod

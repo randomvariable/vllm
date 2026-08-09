@@ -100,10 +100,14 @@ class ThinkingBudgetStateHolder:
             thinking_token_budget = params.thinking_token_budget
             marker_penalty = params.reasoning_marker_penalty
             answer_reserve = params.reasoning_answer_reserve
+            # A phase-temperature-only request configures none of the budget
+            # features but still needs its think state tracked, otherwise the
+            # device-side temperature primitive never sees a phase transition.
             if (
                 thinking_token_budget is not None
                 or answer_reserve is not None
                 or marker_penalty not in (None, 0.0)
+                or params.reasoning_answer_temperature is not None
             ):
                 self._state[index] = self._init_state_entry(
                     prompt_tok_ids,
@@ -165,6 +169,24 @@ class ThinkingBudgetStateHolder:
             state["in_spec_mode"] = self.in_spec_mode
             state["force_index"] = []
             self._update_think_state(state)
+
+    def export_phase(self, out: torch.Tensor, num_reqs: int) -> None:
+        """Write the tracked in-thinking flag into a row-aligned CPU buffer.
+
+        Rows without tracked state are left in the answer phase (0), which is
+        also what a request that never entered reasoning reports, so it never
+        takes the answer-phase override.
+
+        Args:
+            out: `[max_num_reqs]` int32 CPU tensor, written in place.
+            num_reqs: Number of active rows to refresh.
+        """
+        out[:num_reqs] = 0
+        if not self.is_enabled or not self._state:
+            return
+        for seq_idx, state in self._state.items():
+            if seq_idx < num_reqs and state.get("in_think"):
+                out[seq_idx] = 1
 
     def apply_to_logits(
         self,

@@ -341,10 +341,10 @@ remaining output budget rather than an absolute count.
 
 Both parameters drive the same force-close path, but from different triggers:
 
-| Parameter | Trigger | Expresses |
-|-----------|---------|-----------|
-| `thinking_token_budget` | absolute count of reasoning tokens | "think for at most N tokens" |
-| `reasoning_answer_reserve` | remaining output budget | "always leave N tokens for the answer" |
+| Parameter                  | Trigger                            | Expresses                              |
+|----------------------------|------------------------------------|----------------------------------------|
+| `thinking_token_budget`    | absolute count of reasoning tokens | "think for at most N tokens"           |
+| `reasoning_answer_reserve` | remaining output budget            | "always leave N tokens for the answer" |
 
 They are independent and are **not** mutually exclusive. When both are set,
 whichever condition is reached first closes the reasoning block; the other has
@@ -416,6 +416,120 @@ sampling_params = SamplingParams(max_tokens=2048, reasoning_answer_reserve=512)
     workload emits tool calls from inside the reasoning block, size the reserve
     so the boundary is unlikely to land mid-call, or leave it unset until the
     upstream fix lands.
+
+## Step-Aware Temperature
+
+Temperature is normally a single constant applied to every token of a
+generation. Three per-request sampling parameters let it vary with how far the
+request has progressed, and with whether the model is still reasoning:
+
+- `temperature_final` (float) — temperature to anneal towards.
+- `temperature_anneal_steps` (int) — number of generated tokens the anneal
+  spans.
+- `reasoning_answer_temperature` (float) — temperature used once reasoning has
+  finished.
+
+All three default to unset. A request that sets none of them is scaled by
+exactly the value it would have been scaled by before the feature existed, and
+takes no extra work in the sampling path.
+
+### Annealing
+
+`temperature_final` and `temperature_anneal_steps` must be supplied together: a
+target with no length, or a length with no target, does not describe a
+schedule and is rejected. Given both, the effective temperature for a row is
+
+```text
+progress = min(generated_tokens / temperature_anneal_steps, 1.0)
+temperature_effective = temperature + progress * (temperature_final - temperature)
+```
+
+so it starts at `temperature`, moves linearly, and holds at `temperature_final`
+for every token after the anneal length. The direction is free — annealing
+upwards is as valid as annealing downwards.
+
+Use it when the useful sampling entropy is not constant across a generation.
+A long reasoning trace that benefits from exploration early but should commit
+to a conclusion late is the motivating case: a high base temperature avoids
+early lock-in, and a low `temperature_final` stops the tail of the trace from
+wandering.
+
+`temperature_final: 0.0` is permitted and means the request becomes greedy once
+the anneal completes. This is a genuine mid-generation transition, so a request
+carrying a schedule takes the sampling path that can honour a temperature that
+is not known at scheduling time.
+
+### Answer temperature
+
+`reasoning_answer_temperature` addresses a different axis: reasoning tokens and
+answer tokens often want different entropy regardless of position. It overrides
+both `temperature` and any annealing schedule, but **only** after the model has
+left the reasoning block.
+
+The switch is driven by the same committed end-of-thinking marker the rest of
+the reasoning machinery uses, and fires only once that marker has fully
+completed. Two consequences follow, both deliberate:
+
+- A request that never enters reasoning never takes the override. It stays on
+  `temperature`, or on its schedule if it has one.
+- While the model is still inside the reasoning block, the override is inert
+  and any configured anneal continues to apply normally.
+
+Because the override depends on reasoning boundaries being detectable, it
+requires a reasoning control to be configured on the request; supplying it
+alone is a configuration error rather than a silent no-op.
+
+### Interaction
+
+The three parameters compose rather than compete. When a request sets all of
+them, the anneal governs the reasoning phase and the answer temperature takes
+over afterwards — the override wins wherever both would apply. When only the
+anneal is set, it applies across the whole generation including the answer.
+When only the answer temperature is set, reasoning tokens use `temperature`
+unchanged.
+
+None of this interacts with `thinking_token_budget` or
+`reasoning_answer_reserve`, which control *where* the reasoning block ends.
+Step-aware temperature controls *how* tokens are sampled on either side of that
+boundary, and the two can be set independently.
+
+### Validation
+
+Temperatures must be finite and within the range already accepted for
+`temperature`. `temperature_anneal_steps` must be a positive integer; `0`,
+negative values, booleans and floats are rejected rather than coerced, and `-1`
+is the sentinel that leaves the field unset. Every one of these failures is
+raised at request validation rather than adjusted at sample time.
+
+### Online Serving
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      { "role": "user", "content": "9.11 and 9.8, which is greater?" }
+    ],
+    "temperature": 1.0,
+    "temperature_final": 0.3,
+    "temperature_anneal_steps": 512,
+    "reasoning_answer_temperature": 0.2,
+    "thinking_token_budget": 1024
+  }'
+```
+
+### Offline Inference
+
+```python
+sampling_params = SamplingParams(
+    temperature=1.0,
+    temperature_final=0.3,
+    temperature_anneal_steps=512,
+    reasoning_answer_temperature=0.2,
+    thinking_token_budget=1024,
+)
+```
 
 ## Automatic `enable_thinking` Activation
 

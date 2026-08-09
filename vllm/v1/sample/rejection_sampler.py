@@ -18,6 +18,7 @@ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.temperature import TemperatureSchedule
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -347,6 +348,8 @@ class RejectionSampler(nn.Module):
                 predict_bonus_token=False,
                 spec_token_ids=sampling_metadata.spec_token_ids,
             )
+        if sampling_metadata.refresh_temperature_schedule is not None:
+            sampling_metadata.refresh_temperature_schedule()
         return logits
 
     @staticmethod
@@ -538,13 +541,19 @@ def apply_sampling_constraints(
         return logits
 
     num_tokens = logits.shape[0]
-    temperature = expand_batch_to_tokens(
-        sampling_metadata.temperature,
-        cu_num_draft_tokens,
-        num_tokens,
-        replace_from=GREEDY_TEMPERATURE,
-        replace_to=1,
-    )
+    schedule = sampling_metadata.temperature_schedule
+    if schedule is not None:
+        temperature = expand_scheduled_temperature(
+            schedule, cu_num_draft_tokens, num_tokens
+        )
+    else:
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            cu_num_draft_tokens,
+            num_tokens,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
+        )
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
 
@@ -567,6 +576,42 @@ def apply_sampling_constraints(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
+
+
+def expand_scheduled_temperature(
+    schedule: TemperatureSchedule,
+    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
+    num_tokens: int,
+) -> torch.Tensor:
+    """Resolve a step-aware temperature for every speculative row.
+
+    Args:
+        schedule: Persistent per-request configuration and step signals.
+        cu_num_draft_tokens: Cumulative draft-token counts per request.
+        num_tokens: Total number of expanded rows.
+
+    Returns:
+        A `[num_tokens]` tensor of temperatures, with greedy rows already
+        replaced by 1.0 so the caller can divide directly.
+    """
+    batch_size = schedule.base.shape[0]
+    assert cu_num_draft_tokens.shape[0] == batch_size
+    expanded = schedule.base.new_empty(num_tokens)
+    expand_scheduled_temperature_kernel[(batch_size,)](
+        expanded,
+        cu_num_draft_tokens,
+        schedule.base,
+        schedule.final,
+        schedule.anneal_steps,
+        schedule.schedule_enabled,
+        schedule.answer_temperature,
+        schedule.answer_enabled,
+        schedule.generated_steps,
+        schedule.reasoning_phase,
+        schedule.entered_reasoning,
+        MAX_NUM_TOKENS=MAX_SPEC_LEN,
+    )
+    return expanded
 
 
 def expand_batch_to_tokens(
@@ -847,6 +892,64 @@ def rejection_random_sample_kernel(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,
         )
+
+
+@triton.jit
+def expand_scheduled_temperature_kernel(
+    output_ptr,  # [num_tokens]
+    cu_num_tokens_ptr,  # [batch_size]
+    base_ptr,  # [batch_size]
+    final_ptr,  # [batch_size]
+    anneal_steps_ptr,  # [batch_size]
+    schedule_enabled_ptr,  # [batch_size]
+    answer_temperature_ptr,  # [batch_size]
+    answer_enabled_ptr,  # [batch_size]
+    generated_steps_ptr,  # [batch_size]
+    reasoning_phase_ptr,  # [batch_size]
+    entered_reasoning_ptr,  # [batch_size]
+    MAX_NUM_TOKENS: tl.constexpr,
+):
+    """Resolve a per-draft-row temperature from persistent config buffers.
+
+    Each speculative row advances the step counter by its own offset within
+    the request, so a draft block spans the anneal ramp instead of pinning
+    every row to the request's current step.
+    """
+    req_idx = tl.program_id(0)
+    if req_idx == 0:
+        start_idx = tl.zeros([], dtype=cu_num_tokens_ptr.dtype.element_ty)
+    else:
+        start_idx = tl.load(cu_num_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_tokens_ptr + req_idx)
+    num_tokens = end_idx - start_idx
+
+    offset = tl.arange(0, MAX_NUM_TOKENS)
+    temperature = tl.load(base_ptr + req_idx).to(tl.float32)
+    temperature = tl.broadcast_to(temperature[None], [MAX_NUM_TOKENS])
+
+    if tl.load(schedule_enabled_ptr + req_idx) != 0:
+        anneal_steps = tl.load(anneal_steps_ptr + req_idx).to(tl.float32)
+        if anneal_steps > 0:
+            step = tl.load(generated_steps_ptr + req_idx).to(tl.float32) + offset.to(
+                tl.float32
+            )
+            progress = tl.minimum(step / anneal_steps, 1.0)
+            final = tl.load(final_ptr + req_idx).to(tl.float32)
+            temperature = temperature + progress * (final - temperature)
+
+    if tl.load(answer_enabled_ptr + req_idx) != 0:
+        in_answer = (tl.load(entered_reasoning_ptr + req_idx) != 0) and (
+            tl.load(reasoning_phase_ptr + req_idx) == 0
+        )
+        if in_answer:
+            answer_temperature = tl.load(answer_temperature_ptr + req_idx).to(
+                tl.float32
+            )
+            temperature = tl.broadcast_to(answer_temperature[None], [MAX_NUM_TOKENS])
+
+    # A resolved zero still means greedy; substitute only the divisor.
+    temperature = tl.where(temperature < 1e-5, 1.0, temperature)
+    tl.store(output_ptr + start_idx + offset, temperature, mask=offset < num_tokens)
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
