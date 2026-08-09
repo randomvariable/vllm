@@ -298,6 +298,13 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         ],
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
         "b12x": [Mxfp4MoeBackend.B12X_MXFP4],
+        # A mixed-quant deployment (NVFP4 target + MXFP4 drafter, e.g. DSv4 with
+        # DSpark) shares one global --moe-backend: the drafter's layers are
+        # built during the target model load, so speculative_config.moe_backend
+        # never reaches them. Both names select the b12x family on SM12x -- the
+        # NvFP4 oracle only spells it "flashinfer_b12x" -- so accept that
+        # spelling here and resolve it to the native B12X_MXFP4 kernels.
+        "flashinfer_b12x": [Mxfp4MoeBackend.B12X_MXFP4],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
