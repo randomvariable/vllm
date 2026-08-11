@@ -26,6 +26,7 @@ from vllm.models.kimi_k3.nvidia.kda import (
     _store_cache_checkpoints_kernel,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    use_split_mixed_precision_input_projection,
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
 from vllm.models.kimi_k3.nvidia.ops import recoverssm as recoverssm_ops
@@ -103,6 +104,26 @@ def test_kda_recoverssm_config_state_layout():
         (4, 3, 32),
         (4, 3, 64),
     )
+@pytest.mark.parametrize(
+    ("dense_format", "ignored_layers", "expected"),
+    [
+        ("mxfp8", ["g_proj", "f_a_proj", "b_proj"], True),
+        ("mxfp8", ["q_proj", "g_proj", "f_a_proj", "b_proj"], False),
+        ("mxfp8", ["g_proj", "f_a_proj"], False),
+        (None, ["g_proj", "f_a_proj", "b_proj"], False),
+    ],
+)
+def test_kda_mixed_precision_input_projection_selection(
+    dense_format: str | None,
+    ignored_layers: list[str],
+    expected: bool,
+):
+    quant_config = SimpleNamespace(
+        dense_format=dense_format,
+        dense_ignored_layers=ignored_layers,
+    )
+
+    assert use_split_mixed_precision_input_projection(quant_config) is expected
 
 
 @torch.inference_mode()
