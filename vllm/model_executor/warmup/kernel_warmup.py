@@ -510,6 +510,17 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
 
 
 def _run_flashinfer_autotune_dummy_runs(runner: "GPUModelRunner") -> None:
+    extra_kwargs: dict[str, object] = {}
+
+    # V2 initializes attention backends and block tables only after the initial
+    # memory profile.  Kernel autotuning runs during that profile, so execute
+    # the model kernels without attention until those tables exist.  Attention
+    # backends have their own warmup after KV-cache initialization.
+    if getattr(runner.vllm_config, "use_v2_model_runner", False) and not hasattr(
+        runner, "block_tables"
+    ):
+        extra_kwargs["skip_attn"] = True
+
     for num_tokens in _flashinfer_autotune_token_counts(runner):
         logger.info("Running FlashInfer autotune with %d tokens.", num_tokens)
         runner._dummy_run(
@@ -517,6 +528,7 @@ def _run_flashinfer_autotune_dummy_runs(runner: "GPUModelRunner") -> None:
             skip_eplb=True,
             is_profile=True,
             randomize_inputs=True,
+            **extra_kwargs,
         )
 
 
