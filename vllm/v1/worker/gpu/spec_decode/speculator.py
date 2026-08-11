@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 
 logger = init_logger(__name__)
+
+CUDAGraphCapturePhase = Literal["profile", "production"]
 
 
 def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
@@ -64,7 +66,7 @@ class BaseSpeculator(ABC):
         pass
 
     @abstractmethod
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         pass
 
     def get_cudagraph_managers(self) -> tuple["CudaGraphManager", ...]:

@@ -193,28 +193,6 @@ def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
 
 
-def _create_cudagraph_pool_anchor(
-    pool: Any, device: torch.device
-) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
-    """Keep a graph-private pool live between profiling and real capture.
-
-    PyTorch cannot reopen a pool whose last graph was reset while allocations
-    remain. This tiny graph holds the pool reference until production capture.
-
-    Args:
-        pool: CUDA graph pool to retain.
-        device: CUDA device on which to create the anchor.
-
-    Returns:
-        The anchor graph and its retained token tensor.
-    """
-    token = torch.zeros(1, device=device)
-    token.add_(0)
-    torch.accelerator.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, pool=pool):
-        token.add_(0)
-    return graph, token
 
 
 def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> str:
@@ -401,9 +379,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
-        self._cudagraph_pool_anchor: (
-            tuple[torch.cuda.CUDAGraph, torch.Tensor] | None
-        ) = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -1021,7 +996,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return _profile_cudagraph_memory(self)
 
     @torch.inference_mode()
-    def capture_model(self) -> int:
+    def capture_model(self, capture_phase: str = "production") -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs
@@ -1029,7 +1004,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
         if not capture_encoder and not capture_decoder:
-            self._release_cudagraph_pool_anchor()
             logger.warning(
                 "Skipping encoder and decoder CUDA graph capture. To enable "
                 "encoder capture, ensure `cudagraph_mm_encoder` is enabled; "
@@ -1044,10 +1018,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
-        try:
-            with self.maybe_setup_dummy_loras(self.lora_config):
-                if capture_encoder:
-                    self.model_state.encoder_runner.capture()
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            if capture_encoder:
+                self.model_state.encoder_runner.capture()
 
             if capture_decoder:
                 input_buffers = self.input_buffers
@@ -1065,20 +1038,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    channel_id=f"vllm:target:{capture_phase}",
                 )
-                if self.speculator is not None:
-                    with use_workspace_lane(self._draft_workspace_lane):
-                        self.speculator.capture()
-                if self.adaptive_verification is not None:
-                    with self.step_timing.collect() as timings:
-                        for batch in self.adaptive_verification.batches_to_profile(
-                            self.cudagraph_manager.captured_token_counts()
-                        ):
-                            self._dummy_run(**batch)
-                    self.adaptive_verification.set_initial_cost_curves(timings)
-                self._zero_cudagraph_capture_kv_blocks()
-        finally:
-            self._release_cudagraph_pool_anchor()
+            if self.speculator is not None:
+                workspace_lane = (
+                    1 if capture_phase == "profile" else self._draft_workspace_lane
+                )
+                with use_workspace_lane(workspace_lane):
+                    self.speculator.capture(capture_phase=capture_phase)
+            if self.adaptive_verification is not None:
+                with self.step_timing.collect() as timings:
+                    for batch in self.adaptive_verification.batches_to_profile(
+                        self.cudagraph_manager.captured_token_counts()
+                    ):
+                        self._dummy_run(**batch)
+                self.adaptive_verification.set_initial_cost_curves(timings)
+            self._zero_cudagraph_capture_kv_blocks()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -2406,7 +2381,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
-        self._release_cudagraph_pool_anchor()
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,6 +14,7 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -1898,3 +1899,445 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+class TestInitFp8KvScalesHybridModels:
+    """Verify init_fp8_kv_scales handles heterogeneous kv_caches entries.
+
+    Hybrid models (Mamba, DeltaNet) store per-layer state as a list of tensors
+    rather than a single tensor. init_fp8_kv_scales must iterate both forms.
+    """
+
+    @staticmethod
+    def _make_runner_stub(kv_caches):
+        runner = Mock(spec=GPUModelRunner)
+        runner.cache_config = SimpleNamespace(cache_dtype="fp8_e4m3")
+        runner.kv_caches = kv_caches
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        runner.init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales.__get__(
+            runner, GPUModelRunner
+        )
+        return runner
+
+    def test_zeroes_both_tensor_and_list_entries(self):
+        single_tensor = torch.ones(4, 8)
+        list_tensors = [torch.ones(2, 4), torch.ones(3, 6)]
+
+        runner = self._make_runner_stub([single_tensor, list_tensors])
+        runner.init_fp8_kv_scales()
+
+        assert (single_tensor == 0).all()
+        assert all((t == 0).all() for t in list_tensors)
+
+    def test_skips_none_entries(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([None, tensor, None])
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 0).all()
+
+    def test_noop_when_kv_cache_not_quantized(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([tensor])
+        runner.cache_config.cache_dtype = "auto"
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 1).all()
+
+    def test_mixed_none_tensor_and_list(self):
+        t1 = torch.ones(2, 2)
+        t2 = torch.ones(3, 3)
+        list_entry = [torch.ones(1, 1), torch.ones(1, 1)]
+
+        runner = self._make_runner_stub([None, t1, list_entry, None, t2])
+        runner.init_fp8_kv_scales()
+
+        assert (t1 == 0).all()
+        assert (t2 == 0).all()
+        assert all((t == 0).all() for t in list_entry)
+
+
+def _configure_disabled_capture_profiler(runner, monkeypatch) -> None:
+    runner.vllm_config = SimpleNamespace(
+        profiler_config=SimpleNamespace(capture_torch_profiler=False)
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group",
+        lambda: SimpleNamespace(local_rank=0),
+    )
+
+
+def test_v1_capture_separates_target_and_draft_semantic_channels(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    runner.speculative_config = SimpleNamespace(
+        enforce_eager=False,
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: True,
+        uses_extract_hidden_states=lambda: False,
+    )
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [
+            (CUDAGraphMode.FULL, []),
+            (CUDAGraphMode.PIECEWISE, [object()]),
+        ]
+    )
+    runner.encoder_cudagraph_manager = None
+    runner.device = torch.device("cpu")
+    runner._maybe_init_encoder_cudagraph_manager = lambda: None
+    runner._freeze_gc = nullcontext
+    _configure_disabled_capture_profiler(runner, monkeypatch)
+
+    active_channel: list[str] = []
+    channel_entries: list[str] = []
+    captures: list[tuple[str, bool]] = []
+
+    @contextmanager
+    def fake_graph_capture(*, device, channel_id, **kwargs):
+        assert device == runner.device
+        active_channel.append(channel_id)
+        channel_entries.append(channel_id)
+        try:
+            yield SimpleNamespace(channel_id=channel_id)
+        finally:
+            assert active_channel.pop() == channel_id
+
+    def fake_capture_cudagraphs(*, run_drafter, **kwargs):
+        assert len(active_channel) == 1
+        captures.append((active_channel[0], run_drafter))
+
+    runner._capture_cudagraphs = fake_capture_cudagraphs
+    runner.encoder_cudagraph_manager = SimpleNamespace(
+        capture=lambda **_: captures.append((active_channel[0], True))
+    )
+    memory_info = iter(((1000, 0), (900, 0)))
+    monkeypatch.setattr(gpu_model_runner_module, "graph_capture", fake_graph_capture)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_cudagraph_capturing_enabled",
+        lambda _: None,
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "lock_workspace", lambda: None)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "current_platform",
+        SimpleNamespace(graph_pool_handle=object),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda: next(memory_info),
+    )
+
+    assert runner.capture_model() == 100
+    assert captures == [
+        ("vllm:target:production", False),
+        ("vllm:draft:production", True),
+        ("vllm:encoder:production", True),
+    ]
+    assert channel_entries == [
+        "vllm:target:production",
+        "vllm:draft:production",
+        "vllm:encoder:production",
+    ]
+
+
+@pytest.mark.parametrize("with_speculation", [False, True])
+def test_v1_full_capture_is_monolithic(monkeypatch, with_speculation):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    runner.speculative_config = (
+        SimpleNamespace(
+            enforce_eager=False,
+            use_eagle=lambda: False,
+            uses_draft_model=lambda: True,
+            uses_extract_hidden_states=lambda: False,
+        )
+        if with_speculation
+        else None
+    )
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [(CUDAGraphMode.FULL, [object()])]
+    )
+    runner.encoder_cudagraph_manager = None
+    runner.device = torch.device("cpu")
+    runner._maybe_init_encoder_cudagraph_manager = lambda: None
+    runner._freeze_gc = nullcontext
+    _configure_disabled_capture_profiler(runner, monkeypatch)
+
+    channels: list[str] = []
+    captures: list[bool] = []
+
+    @contextmanager
+    def fake_graph_capture(*, channel_id, **kwargs):
+        channels.append(channel_id)
+        yield SimpleNamespace(channel_id=channel_id)
+
+    runner._capture_cudagraphs = lambda *, run_drafter, **_: captures.append(
+        run_drafter
+    )
+    memory_info = iter(((1000, 0), (900, 0)))
+    monkeypatch.setattr(gpu_model_runner_module, "graph_capture", fake_graph_capture)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_cudagraph_capturing_enabled",
+        lambda _: None,
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "lock_workspace", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda: next(memory_info),
+    )
+
+    assert runner.capture_model() == 100
+    assert channels == ["vllm:target:production"]
+    assert captures == [True]
+
+
+def test_v1_profile_rolls_back_distinct_target_and_draft_channels(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.speculative_config = SimpleNamespace(
+        enforce_eager=False,
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: True,
+        uses_extract_hidden_states=lambda: False,
+    )
+    desc = SimpleNamespace(num_tokens=32)
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [
+            (CUDAGraphMode.FULL, []),
+            (CUDAGraphMode.PIECEWISE, [desc]),
+        ],
+        cudagraph_keys={},
+        keys_initialized=True,
+    )
+    runner.max_model_len = 4096
+    runner.max_num_tokens = 256
+    runner.lora_config = None
+    runner._freeze_gc = nullcontext
+    runner._init_minimal_kv_cache_for_profiling = lambda: None
+    runner._create_encoder_cudagraph_manager = lambda: None
+    runner.maybe_remove_all_loras = lambda _: None
+
+    events: list[object] = []
+    active_channel: list[str] = []
+
+    @contextmanager
+    def fake_graph_capture(*, device, channel_id, **kwargs):
+        assert device == runner.device
+        active_channel.append(channel_id)
+        events.append(("enter", channel_id))
+        try:
+            yield SimpleNamespace(channel_id=channel_id)
+        finally:
+            assert active_channel.pop() == channel_id
+            events.append(("exit", channel_id))
+
+    def fake_warmup_and_capture(*args, run_drafter, **kwargs):
+        assert len(active_channel) == 1
+        events.append(("capture", active_channel[0], run_drafter))
+
+    runner._warmup_and_capture = fake_warmup_and_capture
+    runner._cleanup_profiling_kv_cache = lambda: events.extend(
+        ("cleanup-sync", "cleanup")
+    )
+
+    checkpoint = ((lambda _: None, "checkpoint"),)
+
+    def checkpoint_graph_channels():
+        events.append("checkpoint")
+        return checkpoint
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "checkpoint_b12x_graph_channels",
+        checkpoint_graph_channels,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "rollback_b12x_graph_channels",
+        lambda value: events.append(("rollback", value)),
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "graph_capture", fake_graph_capture)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "current_platform",
+        SimpleNamespace(
+            graph_pool_handle=object,
+            is_rocm=lambda: False,
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_cudagraph_capturing_enabled",
+        lambda enabled: events.append(("capture-enabled", enabled)),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "_all_instances",
+        [],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "_all_instances",
+        [],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        lambda: events.append("clear-target"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        lambda: events.append("clear-breakable"),
+    )
+    memory_info = iter(((1000, 0), (900, 0), (900, 0), (800, 0)))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda: events.append("sync"),
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda: next(memory_info),
+    )
+
+    assert runner.profile_cudagraph_memory() == 200
+    assert ("capture", "vllm:target:profile", False) in events
+    assert ("capture", "vllm:draft:profile", True) in events
+    assert events.index("clear-target") < events.index("cleanup")
+    assert events.index("cleanup-sync") < events.index("cleanup")
+    assert events.index("cleanup") < events.index(("rollback", checkpoint))
+    assert events[-1] == ("rollback", checkpoint)
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_v1_profile_restores_state_when_capture_or_cleanup_fails(
+    monkeypatch,
+    cleanup_fails,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.speculative_config = None
+    desc = SimpleNamespace(num_tokens=32)
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [(CUDAGraphMode.FULL, [desc])],
+        cudagraph_keys={},
+        keys_initialized=True,
+    )
+    runner.max_model_len = 4096
+    runner.max_num_tokens = 256
+    runner.lora_config = None
+    runner._freeze_gc = nullcontext
+    runner._init_minimal_kv_cache_for_profiling = lambda: None
+    runner._create_encoder_cudagraph_manager = lambda: None
+    runner.maybe_remove_all_loras = lambda _: None
+
+    events: list[object] = []
+
+    @contextmanager
+    def fake_graph_capture(**kwargs):
+        yield SimpleNamespace(channel_id=kwargs["channel_id"])
+
+    def fail_capture(*args, **kwargs):
+        events.append("capture-failed")
+        raise RuntimeError("expected capture failure")
+
+    runner._warmup_and_capture = fail_capture
+    runner._cleanup_profiling_kv_cache = lambda: events.extend(
+        ("cleanup-sync", "cleanup")
+    )
+    checkpoint = ((lambda _: None, "checkpoint"),)
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "checkpoint_b12x_graph_channels",
+        lambda: checkpoint,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "rollback_b12x_graph_channels",
+        lambda value: events.append(("rollback", value)),
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "graph_capture", fake_graph_capture)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "current_platform",
+        SimpleNamespace(graph_pool_handle=object, is_rocm=lambda: False),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_cudagraph_capturing_enabled",
+        lambda enabled: events.append(("capture-enabled", enabled)),
+    )
+    original_pool = object()
+    wrapper = SimpleNamespace(graph_pool=original_pool)
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "_all_instances",
+        [wrapper],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "_all_instances",
+        [],
+    )
+
+    def clear_target_graphs():
+        events.append("clear-target")
+        if cleanup_fails:
+            raise RuntimeError("expected cleanup failure")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        clear_target_graphs,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        lambda: events.append("clear-breakable"),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: (1000, 0))
+
+    expected_error = "expected cleanup failure" if cleanup_fails else "capture failure"
+    with pytest.raises(RuntimeError, match=expected_error):
+        runner.profile_cudagraph_memory()
+
+    assert wrapper.graph_pool is original_pool
+    if not cleanup_fails:
+        assert events.index("clear-target") < events.index("cleanup")
+        assert events.index("cleanup-sync") < events.index("cleanup")
+        assert events.index("cleanup") < events.index(("rollback", checkpoint))
+    assert events[-1] == ("rollback", checkpoint)
