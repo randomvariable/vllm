@@ -43,7 +43,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
-    get_kv_cache_cp_shard_count,
+    get_kv_cache_dcp_shard_count,
 )
 
 logger = init_logger(__name__)
@@ -658,10 +658,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         configured_dcp_world_size = parallel_config.decode_context_parallel_size
         # PCP slot mappings are gathered independently below. This group tracks
         # only the unique sparse-indexer shards within DCP.
-        self.dcp_world_size = get_kv_cache_cp_shard_count(
-            self.kv_cache_spec,
-            configured_dcp_world_size,
-            1,
+        self.dcp_world_size = get_kv_cache_dcp_shard_count(
+            self.kv_cache_spec, configured_dcp_world_size
         )
         if self.dcp_world_size > 1:
             indexer_group = get_indexer_dcp_group(self.dcp_world_size)
