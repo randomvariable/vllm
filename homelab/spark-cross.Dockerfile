@@ -10,7 +10,7 @@ ARG NVCC_THREADS=2
 ARG GGUF_PLUGIN_REPOSITORY=https://github.com/vllm-project/vllm-gguf-plugin.git
 ARG GGUF_PLUGIN_REF=1df60c43f1f1274681bb957e5bb9b8f5c44d2f4d
 
-FROM --platform=linux/amd64 nvidia/cuda:13.0.2-devel-ubuntu24.04 AS builder
+FROM --platform=linux/amd64 nvidia/cuda:13.3.1-devel-ubuntu24.04 AS builder
 ARG MAX_JOBS
 ARG CMAKE_BUILD_PARALLEL_LEVEL
 ARG NVCC_THREADS
@@ -18,19 +18,19 @@ ARG GGUF_PLUGIN_REPOSITORY
 ARG GGUF_PLUGIN_REF
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
-    CUDA_HOME=/usr/local/cuda-13.0 \
-    CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.0 \
+    CUDA_HOME=/usr/local/cuda-13.3 \
+    CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.3 \
     DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++ \
     DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12 \
     DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so \
     DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch \
-    DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/lib \
+    DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda-13.3/targets/sbsa-linux/lib \
     DEEPGEMM_TORCH_CXX11_ABI=1 \
     DEEPGEMM_SRC_DIR=/src/vllm/third_party/deep_gemm \
     VLLM_TARGET_DEVICE=cuda \
     TORCH_CUDA_ARCH_LIST="12.1a" \
     NVCC_PREPEND_FLAGS="-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++" \
-    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.0 -DCUDA_CUDART=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so -DVLLM_CUBLAS_LIBRARY=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublas.so -DVLLM_CUTLASS_SRC_DIR=/src/vllm/third_party/flashinfer/3rdparty/cutlass" \
+    CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda-13.3 -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.3 -DCUDA_CUDART=/usr/local/cuda-13.3/targets/sbsa-linux/lib/libcudart.so -DVLLM_CUBLAS_LIBRARY=/usr/local/cuda-13.3/targets/sbsa-linux/lib/libcublas.so -DVLLM_CUTLASS_SRC_DIR=/src/vllm/third_party/flashinfer/3rdparty/cutlass" \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     NVCC_THREADS=${NVCC_THREADS} \
@@ -73,13 +73,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/cross-linux-sbsa/cuda-keyring_1.1-1_all.deb && \
     dpkg -i /tmp/cuda-keyring.deb && \
     apt-get update && apt-get install -y --no-install-recommends \
-      cuda-cross-sbsa-13-0 && \
+      cuda-cross-sbsa-13-3 && \
     rm -f /tmp/cuda-keyring.deb && \
-    ln -sfn /usr/local/cuda-13.0/targets/sbsa-linux \
-      /usr/local/cuda-13.0/targets/aarch64-linux && \
-    for stub in /usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs/*.so; do \
+    ln -sfn /usr/local/cuda-13.3/targets/sbsa-linux \
+      /usr/local/cuda-13.3/targets/aarch64-linux && \
+    for stub in /usr/local/cuda-13.3/targets/sbsa-linux/lib/stubs/*.so; do \
       ln -sfn "stubs/$(basename "$stub")" \
-        "/usr/local/cuda-13.0/targets/sbsa-linux/lib/$(basename "$stub")"; \
+        "/usr/local/cuda-13.3/targets/sbsa-linux/lib/$(basename "$stub")"; \
     done && \
     printf '__global__ void k(){}' > /tmp/t.cu && \
     nvcc -target-dir sbsa-linux \
@@ -206,6 +206,8 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
     ccache -sv | tee /src/ccache-stats-vllm.txt
 
+# FlashInfer publishes no cu133 wheel or JIT-cache index. Its cu130 runtime
+# wheel remains compatible; CUDA_VERSION controls the 13.3 AOT compiler.
 # Build both FlashInfer packages from the pinned recursive submodule. The local
 # JIT-cache wheel carries the patched AArch64 SM121 native modules.
 RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sharing=locked \
@@ -229,17 +231,17 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     export CCACHE_LOGFILE=/tmp/ccache-flashinfer.log && \
     rm -f "$CCACHE_LOGFILE" && \
     { ccache --show-config || true; } && \
-    CUDA_VERSION=13.0 \
+    CUDA_VERSION=13.3 \
     CC=/usr/bin/aarch64-linux-gnu-gcc \
     CXX=/usr/bin/aarch64-linux-gnu-g++ \
-    FLASHINFER_NVCC=/usr/local/cuda-13.0/bin/nvcc \
+    FLASHINFER_NVCC=/usr/local/cuda-13.3/bin/nvcc \
     FLASHINFER_FMHA_V2_HOST_BUILD=1 \
     FLASHINFER_FMHA_V2_HOST_CXX=/usr/bin/g++ \
     NVCC_PREPEND_FLAGS="$FI_NVCC_PREPEND" \
     FLASHINFER_NVCC_LAUNCHER=ccache \
     FLASHINFER_CXX_LAUNCHER=ccache \
-    LIBRARY_PATH="/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs" \
-    FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.0/targets/sbsa-linux/lib -L/usr/local/cuda-13.0/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.0/targets/sbsa-linux/lib" \
+    LIBRARY_PATH="/usr/local/cuda-13.3/targets/sbsa-linux/lib:/usr/local/cuda-13.3/targets/sbsa-linux/lib/stubs" \
+    FLASHINFER_EXTRA_LDFLAGS="-L/usr/local/cuda-13.3/targets/sbsa-linux/lib -L/usr/local/cuda-13.3/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda-13.3/targets/sbsa-linux/lib" \
     FLASHINFER_SOURCE_DIR=/src/vllm/third_party/flashinfer \
     FLASHINFER_DIST_DIR=/wheels-flashinfer \
     FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH_LIST" \
@@ -306,7 +308,7 @@ RUN mkdir -p /runtime-requirements && \
     cp /src/vllm/requirements/common.txt /runtime-requirements/common.txt && \
     python3 -c 'from pathlib import Path; p=Path("/runtime-requirements/cuda.txt"); p.write_text("".join(line for line in p.read_text().splitlines(keepends=True) if not line.startswith(("--extra-index-url ", "flashinfer-python==", "flashinfer-cubin==", "flashinfer-jit-cache=="))))'
 
-FROM --platform=$TARGETPLATFORM nvidia/cuda:13.0.2-runtime-ubuntu24.04 AS runtime
+FROM --platform=$TARGETPLATFORM nvidia/cuda:13.3.1-runtime-ubuntu24.04 AS runtime
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -332,7 +334,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gcc g++ python3-dev \
-      cuda-nvcc-13-0 cuda-cudart-dev-13-0 \
+      cuda-nvcc-13-3 cuda-cudart-dev-13-3 \
       libibverbs1 librdmacm1 libnuma1 libgomp1 \
       libucx0 python3 python3-pip && \
     useradd --create-home --uid 10001 --shell /usr/sbin/nologin vllm
@@ -388,7 +390,7 @@ RUN mkdir -p /opt/vllm/tiktoken_encodings "$HF_HOME" "$VLLM_CACHE_ROOT" && \
 LABEL org.opencontainers.image.title="vllm-spark-cross-runtime" \
       org.opencontainers.image.description="Cross-compiled vLLM runtime for DGX Spark sm_121a" \
       org.opencontainers.image.source="https://github.com/randomvariable/vllm/tree/homelabs-main/homelab" \
-      org.randomvariable.vllm.cuda="13.0.2" \
+      org.randomvariable.vllm.cuda="13.3.1" \
       org.randomvariable.vllm.distributed-executor-backend="ray" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
