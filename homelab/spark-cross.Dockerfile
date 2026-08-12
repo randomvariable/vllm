@@ -4,9 +4,9 @@ ARG VLLM_BUILD_COMMIT=unknown
 ARG VLLM_BUILD_PIPELINE=local
 ARG VLLM_BUILD_URL=
 ARG VLLM_IMAGE_TAG=local/vllm-spark-cross:dev
-ARG MAX_JOBS=16
-ARG CMAKE_BUILD_PARALLEL_LEVEL=16
-ARG NVCC_THREADS=4
+ARG MAX_JOBS=8
+ARG CMAKE_BUILD_PARALLEL_LEVEL=8
+ARG NVCC_THREADS=2
 ARG GGUF_PLUGIN_REPOSITORY=https://github.com/vllm-project/vllm-gguf-plugin.git
 ARG GGUF_PLUGIN_REF=1df60c43f1f1274681bb957e5bb9b8f5c44d2f4d
 
@@ -245,11 +245,10 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH_LIST" \
     FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
-    # MAX_JOBS is Ninja -j, FLASHINFER_NVCC_THREADS is nvcc --threads. 8 rather
-    # than the global 16 because nvcc peak RSS per job is what risks OOM against
-    # the builder pod's 56 GiB limit, and an OOM-killed two-hour step costs far
-    # more than a slightly slower one. Do not raise without measuring RSS.
-    MAX_JOBS=8 FLASHINFER_NVCC_THREADS=1 \
+    # Four parallel nvcc jobs stay below server6's eviction threshold. Eight
+    # reached 44 GiB RSS and caused the kubelet to evict the build before its
+    # 56 GiB cgroup limit. Do not raise without a successful measured build.
+    MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh && \
     { ccache -sv | tee /src/ccache-stats-flashinfer.txt; \
