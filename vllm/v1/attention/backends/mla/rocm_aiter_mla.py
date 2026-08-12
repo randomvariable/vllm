@@ -19,6 +19,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
+from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -155,6 +156,21 @@ class AiterMLABackend(MLACommonBackend):
     @staticmethod
     def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        from vllm.platforms.rocm import on_mi3xx
+
+        # AITER's MLA kernels only have gfx942/gfx950 paths. AITER as a whole
+        # is also admitted on gfx1151 (see is_aiter_found_and_supported) for
+        # its Triton FA/unified-attention/norm/BF16-MoE kernels, but MLA is
+        # not among them, so gate MLA separately here rather than relying on
+        # the library-wide admission.
+        #
+        # DeviceCapability is currently created using
+        # torch.cuda.get_device_capability() which is known to be buggy on
+        # rocm systems. on_mi3xx uses amd-smi which is more reliable.
+        return on_mi3xx()
 
 
 @dataclass

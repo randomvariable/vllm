@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_name_prefixes,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -67,6 +68,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        weight_name_prefixes: tuple[str, ...] | None = None
+        """If defined, load only checkpoint tensor names with these prefixes."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -113,6 +117,29 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_weights_track", None
         )
 
+        # --- ATOM-ported APU/NUMA knobs (default off = current behavior) ---
+        # VLLM_DISABLE_MMAP: force non-mmap weight loading ("eager" strategy
+        # reads full file into RAM). Adapted from ROCm/ATOM ATOM_DISABLE_MMAP.
+        from vllm.envs import VLLM_DISABLE_MMAP, VLLM_LOADER_NUM_THREADS
+
+        if VLLM_DISABLE_MMAP:
+            load_config.safetensors_load_strategy = "eager"
+            logger.info(
+                "VLLM_DISABLE_MMAP=1: forcing safetensors_load_strategy=\"eager\""
+                " (no mmap).")
+
+        # VLLM_LOADER_NUM_THREADS: >1 enables parallel per-fused-param CPU
+        # staging + single H2D copy. Adapted from ROCm/ATOM
+        # ATOM_LOADER_NUM_THREADS.
+        if VLLM_LOADER_NUM_THREADS > 1:
+            extra_config["enable_multithread_load"] = True
+            extra_config["num_threads"] = VLLM_LOADER_NUM_THREADS
+            logger.info(
+                "VLLM_LOADER_NUM_THREADS=%d: enabling multithread weight load.",
+                VLLM_LOADER_NUM_THREADS,
+            )
+        # --- end ATOM-ported knobs ---
+
         # The multi-thread loader ignores safetensors_load_strategy, so reject
         # the combination instead of silently dropping the requested strategy.
         if extra_config.get("enable_multithread_load") and (
@@ -132,6 +159,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        weight_name_prefixes: tuple[str, ...] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -199,6 +227,7 @@ class DefaultModelLoader(BaseModelLoader):
                 revision,
                 subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
+                weight_name_prefixes=weight_name_prefixes,
             )
         else:
             hf_folder = model_name_or_path
@@ -231,6 +260,12 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
+            hf_weights_files = filter_safetensors_files_by_weight_name_prefixes(
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                weight_name_prefixes,
+            )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -252,6 +287,7 @@ class DefaultModelLoader(BaseModelLoader):
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            source.weight_name_prefixes,
         )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
@@ -268,11 +304,13 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    weight_name_prefixes=source.weight_name_prefixes,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    weight_name_prefixes=source.weight_name_prefixes,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
@@ -282,6 +320,7 @@ class DefaultModelLoader(BaseModelLoader):
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
                         ),
+                        weight_name_prefixes=source.weight_name_prefixes,
                     )
                 else:
                     weights_iterator = safetensors_weights_iterator(
@@ -289,6 +328,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        weight_name_prefixes=source.weight_name_prefixes,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -329,6 +369,9 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            weight_name_prefixes=getattr(
+                model, "checkpoint_weight_name_prefixes", None
+            ),
         )
         yield from self._get_weights_iterator(primary_weights)
 
@@ -346,6 +389,7 @@ class DefaultModelLoader(BaseModelLoader):
             revision=model_config.revision,
             fall_back_to_pt=True,
             allow_patterns_overrides=None,
+            weight_name_prefixes=None,
         )
 
     def _init_ep_weight_filter(self, model_config: ModelConfig) -> None:

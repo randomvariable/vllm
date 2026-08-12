@@ -1,0 +1,80 @@
+# Homelab Hard Requirements
+
+Mandatory rules for the `homelabs-main` fork, each one learned the hard way.
+They override convenience. Violating them has caused broken images and wasted
+multi-hour build cycles.
+
+## FlashInfer is MANDATORY in DGX Spark (CUDA sm_121a) images
+
+The production DGX deployments — `deepseek-v4-flash-dspark` (sparse MLA), `hy3-299b-nvfp4` (NVFP4 MoE), `laguna` (AWQ MoE) — run on FlashInfer sm_12x kernels, so a FlashInfer-less DGX image is pointless for them. **Never strip `flashinfer-python` / `flashinfer-cubin` / `flashinfer-jit-cache` from `requirements/cuda.txt` at image-build time.**
+
+## Verify dependency claims by actual resolution, with the repo's indexes
+
+Before declaring two packages incompatible — especially before baking an exclusion into a Dockerfile — run a real resolution using the EXACT `--extra-index-url` lines from the repo's `requirements/*.txt`:
+
+```bash
+uv pip compile requirements/cuda.txt --index-strategy unsafe-best-match
+```
+
+Package-metadata reading alone is insufficient: constraints move across versions and indexes. An incompatibility claim not reproduced by a resolver with the correct indexes is not a fact — do not act on it. `flashinfer-cubin` and `flashinfer-jit-cache` are **NOT on PyPI**; they exist only on the flashinfer.ai index declared in `requirements/cuda.txt`, so a resolution run without it fails misleadingly and makes the pinned FlashInfer look incompatible with torch/CUDA when it is not.
+
+## Verify every `VLLM_*` env var against `vllm/envs.py` before use
+
+Docker `ENV` entries that do not exist in `vllm/envs.py` are silent no-ops. Example that bit us: `VLLM_USE_FLASHINFER` does NOT exist; the sampler gate is `VLLM_USE_FLASHINFER_SAMPLER` (default `True`, `envs.py`). Grep `vllm/envs.py` for the exact variable name before adding it to any Dockerfile, script, or deployment manifest.
+
+## `README.md` must not overclaim
+
+The fork `README.md` is a public, user-facing document: no node names, registry hosts, or cluster/CI specifics. Keep it current when fork capabilities, supported hardware, or build commands change, and never claim work that has not been done — carried-upstream configs are not "ours", ported-and-building is not "performance-qualified", and a number nobody measured is not a benchmark. Correct or remove a claim as soon as it stops being true.
+
+## Dockerfiles are build-only
+
+`homelab/*.Dockerfile` must BUILD only — no verification assertions, probes, or gate checks in the build path, which fail correct builds on technicalities (e.g. `grep -q` on CMakeCache.txt key formats, readelf arch checks, zipfile membership checks). Verification is a runtime concern: run it against the deployed image on real hardware.
+
+## No performance regression in production migrations
+
+When migrating a production serving deployment to a new image/build, the target must **match or beat** the current deployment's performance. A migration that boots on a slower fallback path (e.g. Triton instead of the tuned kernel backend) is not done — it is a correctness baseline only. Establish the performance-parity requirement BEFORE planning the migration, identify exactly which kernel/backend delivers the current performance, and gate the swap on matching it. (2026-07-26: "i won't accept any regression in performance.")
+
+## Both targets must run every attention type on the most optimized path
+
+CUDA `sm_121a` (DGX Spark / GB10) and ROCm `gfx1151` (Strix Halo) must each run EVERY attention type on the most optimized available path, not merely "run at all". In scope: dense causal GQA/MQA, sliding-window/global hybrids, attention sinks, MLA and sparse/compressed MLA, and linear/recurrent state (Gated DeltaNet, Mamba2, Kimi Delta Attention).
+
+- A model that serves only by falling back to a slower generic backend is a GAP to close, not "support".
+- When triaging optimization work, prefer items that close a target × attention-type gap.
+- Do NOT dismiss an optimization because it benefits only one of the two targets.
+
+## Ports must be upstream-compatible
+
+Any code ported into this fork from another fork/overlay (e.g. aidendle94 DSV4, bjk110, ATOM) must be written in **upstream-compatible style**: follow the target area's existing upstream patterns (oracle enums/mappings, capability gating, `is_supported_config`/`_supports_current_device` probes, optional-dependency probes, envs.py declarations), so the work could be proposed as an upstream PR. No hacky fork-only patches, no divergent one-off wiring. (2026-07-26: "make any ports upstream compatible.")
+
+## When a deployment is idle, swap and iterate live
+
+If the user says a production deployment is not in use, treat the migration as a live test loop: swap to the new image immediately and iterate on the real deployment until it works, rather than staging a separate canary. Rollback is the manifest revert. (2026-07-26: "completely swap out and test until we get working.")
+
+## Rebase on upstream at least daily, and before implementation work
+
+Keep `homelabs-main` close to `upstream/main` so fork changes stay small, mergeable, and always land on current upstream code.
+
+- Rebase onto `upstream/main` **at least once per working day**, and **before starting any new implementation/fixer work** on a feature.
+- Procedure: confirm the `upstream` remote points at `vllm-project/vllm`, then `git fetch upstream && git rebase upstream/main`, then force-push with lease (`git push --force-with-lease`).
+- Resolve conflicts by **preserving fork-unique work** — the SM120/SM121 CUTLASS grouped-MoE port, the vendored FlashInfer submodule and its build wiring, B12X MXFP4 integration, DeepGEMM/Spark cross-build changes, and the `homelab/` Dockerfiles. Never drop these to make a rebase "clean".
+- If a rebase hits non-trivial conflicts, stop and resolve them with fork context rather than blindly taking upstream or fork sides.
+
+## Compiled extensions live in the checkout, not the image
+
+The gfx1151 devtools image has an **empty** `/src/vllm`; build extensions land
+in the host checkout. First check that the devloop container bind-mounts the
+checkout. A missing `vllm._C` can have other causes, so then verify with the
+sanctioned explicit `.venv/bin/python` or devtools interpreter. Prefer the
+Strix devloop's mandatory `cargo make doctor`, `cargo make setup`,
+`cargo make build`, and `cargo make test` sequence. For other incremental
+C++/HIP/CUDA work, follow the [Incremental Build Setup](./incremental_build.md)
+guidance rather than duplicating its CMake commands.
+
+## Optimise the development lifecycle daily, and build incrementally
+
+A slow edit-test loop is treated as a defect, not a cost of doing business. Rebuilding a whole image to test a source change is never acceptable as the routine path. (2026-07-30: "the development practice should force fast incremental build whenever we need to... aggressively optimise the development lifecycle daily.")
+
+- Use the [Incremental Build Setup](./incremental_build.md) guidance for C++/HIP/CUDA changes. Strix work uses the mandatory cargo-make devloop above.
+- **Review the loop daily**, alongside the upstream rebase above. If any routine step has become slow, fix the tooling before continuing feature work.
+- **Environment staleness must fail closed.** A harness that cannot find the source it is meant to test, or that silently falls back to an installed package or a fallback kernel, must error rather than report success. Prove *which* files a run actually loaded — resolved package path and compiled extension imports — before trusting a pass. Test harnesses that overlay source into a container must run pytest with `--import-mode=importlib`, otherwise the mount shadows the installed package and its compiled extensions vanish silently. Devloop probes and pytest Python invocations must use safe-path mode (`python -P`) in addition to pytest `--import-mode=importlib`, so mounted checkout metadata cannot shadow image metadata.
+- **Do not add another language** to solve build orchestration. This tree is already Python, C++/HIP/CUDA and Rust; dev tooling belongs in Rust (`cargo-make`, already a dependency via `setuptools-rust`). A hermetic build system such as Bazel or Pants is not justified by polyglot pain alone: the recurring costs here have been SDK packaging, cross-compilation toolchain files and artefact staleness, none of which it addresses, and it would fight the ROCm SDK's layout harder than CMake does.

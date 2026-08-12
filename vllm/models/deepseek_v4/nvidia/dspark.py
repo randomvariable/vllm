@@ -21,11 +21,16 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
+)
+from vllm.model_executor.layers.fp8_draft_head import (
+    Fp8DraftHead,
+    fp8_draft_head_logits,
+    fp8_draft_head_supported,
+    quantize_draft_head,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -43,16 +48,9 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
 
 from .model import (
     DeepseekV4DecoderLayer,
-    DeepseekV4Model,
-    _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -75,7 +73,6 @@ class DSparkDeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
 
@@ -96,19 +93,12 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
-            dtype=torch.int32,
-        )
-
         current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
-                    topk_indices_buffer=self.topk_indices_buffer,
                 )
                 for i in range(self.num_dspark_layers)
             ]
@@ -154,6 +144,18 @@ class DSparkDeepseekV4Model(nn.Module):
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
 
+    def finalize_mhc_weights(self) -> None:
+        for layer in self.layers:
+            layer.refresh_b12x_mhc_bf16_weights()
+
+        first_layer = self.layers[0]
+        if first_layer._use_b12x_mhc:
+            first_layer.hc_attn_fn_broadcast = (
+                first_layer.hc_attn_fn.detach()
+                .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+                .sum(dim=1)
+            )
+
     @torch.inference_mode()
     def precompute_and_store_context_kv(
         self,
@@ -195,17 +197,10 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        full_num_tokens = positions.shape[0]
-        if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, inputs_embeds
-                )
-            inputs_embeds = sp_shard(inputs_embeds)
-            input_ids = sp_shard(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if getattr(self.layers[0], "_use_b12x_mhc", False):
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -218,8 +213,6 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         # hc_head reduces the hc copies; return the PRE-norm head hidden
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,
@@ -312,10 +305,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        self.quant_config = vllm_config.quant_config
-        self.pad_shared_expert = getattr(
-            self.quant_config, "weight_block_size", None
-        ) is not None and not _use_sequence_parallel(vllm_config)
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -326,6 +315,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # Optional rowwise-fp8 copy of the (shared) lm_head, used ONLY for
+        # draft-proposal logits. Materialized eagerly at load time via
+        # maybe_init_fp8_draft_head(); None means the bf16 path is used.
+        self._fp8_draft_head: Fp8DraftHead | None = None
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -363,8 +356,48 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Base logits U_k = lm_head(norm(head_hidden))."""
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize the rowwise-fp8 draft lm_head copy (opt-in).
+
+        Called by ``load_dspark_model`` right after the target's lm_head is
+        aliased onto this model. This must happen eagerly at load time, NOT
+        lazily on the first draft call: the whole DSpark draft step
+        (including ``compute_draft_logits``) runs inside a FULL captured
+        CUDA graph, so the quantization kernels must not fire during
+        capture/replay.
+
+        TP: the lm_head is vocab-sharded, so each rank quantizes its local
+        shard with per-local-row scales; the draft path's gather and argmax
+        semantics are unchanged.
+        """
+        if not envs.VLLM_DSPARK_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
+                "fp8 support (SM89+ required); using the unquantized "
+                "draft lm_head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "DSpark draft-proposal logits use a rowwise-fp8 copy of the "
+            "target lm_head (draft-time only; verify pass untouched)."
+        )
+
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
+        if self._fp8_draft_head is not None:
+            # Draft-proposal-only fp8 path. Mirrors compute_logits ->
+            # LogitsProcessor._get_logits: local (shard) logits, then the
+            # same TP gather and vocab-padding slice.
+            local_logits = fp8_draft_head_logits(
+                self.model.norm(hidden_states), self._fp8_draft_head
+            )
+            logits = self.logits_processor._gather_logits(local_logits)
+            if logits is not None:
+                logits = logits[..., : self.logits_processor.org_vocab_size]
+            return logits
         return self.compute_logits(hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -445,12 +478,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
-            if ".shared_experts.w2" in name:
-                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-            if self.pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
@@ -495,6 +522,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     params_dict[name][: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
                     continue
+                if ".shared_experts.w2" in name:
+                    name = name.replace(
+                        ".shared_experts.w2", ".shared_experts.down_proj"
+                    )
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
@@ -505,6 +536,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         self._finalize_moe()
+
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))

@@ -72,6 +72,8 @@ For more details about installing from source and installing for other hardware,
 
 For an optimized workflow when iterating on C++/CUDA kernels, see the [Incremental Compilation Workflow](./incremental_build.md) for recommendations.
 
+If you are writing or porting a kernel for this fork's hardware targets (AMD Strix Halo / `gfx1151`, or NVIDIA GB10 / `sm_121a`), see [Writing Kernels for Homelab Targets](./kernel_targets/README.md) for the architecture constraints and the correctness/performance verification bar.
+
 !!! tip
     vLLM is compatible with Python versions 3.10 to 3.13. However, vLLM's default [Dockerfile](../../docker/Dockerfile) ships with Python 3.12 and tests in CI (except `mypy`) are run with Python 3.12.
 
@@ -137,6 +139,12 @@ For additional features and advanced configurations, refer to the:
 ### Testing
 
 vLLM uses `pytest` to test the codebase.
+
+For AMD Strix Halo (`gfx1151`) ROCm kernel work, use the [Strix Halo
+cargo-make devloop](incremental_build.md#strix-halo-cargo-make-devloop), the
+sanctioned local containerized test entrypoint. Do not use the host `.venv` for
+this ROCm surface. There is currently no equivalent containerized harness for
+CUDA or DGX Spark `sm_121a` targets.
 
 ```bash
 # Install the test dependencies used in CI (CUDA only)

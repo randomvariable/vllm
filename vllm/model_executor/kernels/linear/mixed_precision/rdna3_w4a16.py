@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""W4A16 GPTQ kernel for AMD RDNA3 (gfx1100) — fp16 + bf16.
+"""W4A16 GPTQ kernel for AMD RDNA3 (gfx1100) and RDNA3.5 (gfx1151) — fp16 + bf16.
 
-Drop-in replacement for ExllamaLinearKernel on RDNA3 that adds native bf16
+Drop-in replacement for ExllamaLinearKernel on RDNA3/3.5 that adds native bf16
 support. The HIP kernel lives in ``csrc/rocm/q_gemm_rdna3.cu``
 and is exposed via ``torch.ops._rocm_C.gptq_gemm_rdna3``.
 
@@ -28,7 +28,7 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # ROCm gates via on_gfx1100() in can_implement.
+        # ROCm gates via on_gfx1100()/on_gfx1151() in can_implement.
         return 60
 
     @classmethod
@@ -36,10 +36,10 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         if not current_platform.is_rocm():
             return False, "RDNA3 W4A16 kernel is ROCm-only"
 
-        from vllm.platforms.rocm import on_gfx1100
+        from vllm.platforms.rocm import on_gfx1100, on_gfx1151
 
-        if not on_gfx1100():
-            return False, "RDNA3 W4A16 kernel requires gfx1100"
+        if not (on_gfx1100() or on_gfx1151()):
+            return False, "RDNA3 W4A16 kernel requires gfx1100 or gfx1151"
 
         # The HIP op is registered by the C++ extension; if a user is running
         # against a vLLM build that doesn't include it (e.g. partial rebuild),

@@ -718,6 +718,9 @@ def report_usage_stats(
             "dtype": str(model_config.dtype),
             "block_size": vllm_config.cache_config.block_size,
             "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
+            "gpu_memory_utilization_gb": (
+                vllm_config.cache_config.gpu_memory_utilization_gb
+            ),
             "kv_cache_memory_bytes": vllm_config.cache_config.kv_cache_memory_bytes,
             # Quantization
             "quantization": model_config.quantization,
@@ -756,6 +759,13 @@ def report_usage_stats(
 
 
 _PROFILER_FUNC = None
+_TORCH_PROFILER_SCOPES_ENABLED = False
+
+
+def set_torch_profiler_scopes_enabled(enabled: bool) -> None:
+    global _PROFILER_FUNC, _TORCH_PROFILER_SCOPES_ENABLED
+    _TORCH_PROFILER_SCOPES_ENABLED = enabled
+    _PROFILER_FUNC = None
 
 
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
@@ -766,7 +776,7 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
         return _PROFILER_FUNC(name)
 
     func = contextlib.nullcontext
-    if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+    if _TORCH_PROFILER_SCOPES_ENABLED or envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
         func = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
         import nvtx

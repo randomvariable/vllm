@@ -125,11 +125,13 @@ MoEBackend = Literal[
     "batched_triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "b12x",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
     "flashinfer_b12x",
+    "b12x",
     "marlin",
     "humming",
     "triton_unfused",
@@ -141,6 +143,7 @@ MoEBackend = Literal[
 
 LinearBackend = Literal[
     "auto",
+    "b12x",
     "cutlass",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
@@ -197,12 +200,19 @@ class KernelConfig:
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "b12x": Use B12X kernels for Blackwell FP4 MoE
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
+    - "b12x": Use the native b12x fused MoE package for SM12x (MXFP4 and
+      ModelOpt NVFP4). This is the preferred NVFP4 path on SM121 and leads
+      auto-selection; distinct from "flashinfer_b12x", which uses FlashInfer's
+      vendored kernel copy. Requires the pinned b12x release and fails closed
+      otherwise. Does not support a SWIGLU clamp, so clamp-requiring models
+      fall through to the next backend rather than silently dropping it.
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
@@ -217,6 +227,7 @@ class KernelConfig:
     """Backend for quantized linear layer GEMM kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
+    - "b12x": Use B12X kernels for Blackwell FP8, MXFP8, NVFP4, and MXFP4 linears
     - "cutlass": Use CUTLASS-based kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuTe-DSL kernels (NVFP4, MXFP8)

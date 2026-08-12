@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.timing import SpecForwardTimings
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -270,6 +271,11 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # Draft token ids generated for the next scheduler step. Async block
+    # speculators attach these to the normal model output so their D2H transfer
+    # shares the sampled-output event instead of requiring a second worker RPC.
+    draft_token_ids: "DraftTokenIds | None" = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
@@ -295,6 +301,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # target/draft forward durations, when spec decode telemetry is enabled
+    spec_forward_timings: SpecForwardTimings | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

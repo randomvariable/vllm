@@ -390,7 +390,7 @@ void mxfp4_experts_quant(
     torch::stable::Tensor const& output_scale_offset_by_experts,
     int64_t n_experts) {
 #if VLLM_MXFP4_EXPERTS_QUANT_SUPPORTED
-  int32_t sm = get_sm_version_num();
+  int32_t sm = get_sm_version_num(input.get_device_index());
   STD_TORCH_CHECK(mxfp4_experts_quant_sm_supported(sm),
                   "No compiled MXFP4 experts quant kernel for SM ", sm,
                   ". Recompile with SM10x/11x FP4 support and CUDA >= 12.9.");
@@ -428,7 +428,7 @@ void silu_and_mul_mxfp4_experts_quant(
     torch::stable::Tensor const& output_scale_offset_by_experts,
     int64_t n_experts) {
 #if VLLM_MXFP4_EXPERTS_QUANT_SUPPORTED
-  int32_t sm = get_sm_version_num();
+  int32_t sm = get_sm_version_num(input.get_device_index());
   STD_TORCH_CHECK(mxfp4_experts_quant_sm_supported(sm),
                   "No compiled SiLU+Mul MXFP4 experts quant kernel for SM ", sm,
                   ". Recompile with SM10x/11x FP4 support and CUDA >= 12.9.");

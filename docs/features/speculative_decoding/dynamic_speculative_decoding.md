@@ -11,6 +11,18 @@ SD methods need to verify K tokens for each sequence during decoding. As BS incr
 
 ## `--speculative-config` schema
 
+Dynamic speculative decoding supports two controls:
+
+* `num_speculative_tokens_per_batch_size` caps K based on the current batch
+  size.
+* `adaptive_speculative_tokens_window` adjusts K from recent accepted draft
+  lengths.
+
+The controls can be enabled separately or together. When both are configured,
+the batch-size schedule is a hard cap on the acceptance-based value.
+
+### Batch-size schedule
+
 To use Dynamic SD, add `num_speculative_tokens_per_batch_size` to the config of an SD method which is a list of list. Here, an entry is `[start_bs, end_bs, optimal_K]` which means when the concurrency is within range `[start_bs, end_bs]` then `optimal_K` number of draft tokens are used. For e.g.,
 
 ```bash
@@ -31,6 +43,40 @@ implies that:
 * K=3 will be used when the concurrency is in range [1, 64]
 * K=1 will be used when the concurrency is in range [65, 128]
 * K=0 will be used when the concurrency is in range [129, 512], i.e., no draft tokens will be produced.
+
+### Acceptance-length adaptation
+
+Set `adaptive_speculative_tokens_window` to the number of non-empty
+verification steps to observe between K updates. The controller starts at
+`num_speculative_tokens`, which remains its upper bound, and never reduces K
+below 1.
+
+For each window, the controller computes the request-weighted averages of
+attempted and accepted draft tokens. Its target is:
+
+```text
+target verification length = mean accepted draft tokens + 1
+```
+
+The target is rounded to the nearest integer, with half values rounded up. K
+drops directly to a lower target to avoid wasted verification work, but rises
+by at most one token per window. This asymmetric policy responds promptly when
+acceptance degrades while allowing sustained high acceptance to explore deeper
+drafts gradually.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-config '{
+    "method": "eagle3",
+    "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+    "num_speculative_tokens": 8,
+    "adaptive_speculative_tokens_window": 32
+  }'
+```
+
+The logged vLLM mean acceptance length includes the target-model bonus token,
+so it is numerically equal to the controller target before rounding. The
+speculative-decoding metrics also log the current speculative depth.
 
 ## Online Examples
 
@@ -69,8 +115,37 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 ```
 
+## Telemetry
+
+Dynamic SD currently reads its K values from a static, hand-written schedule. Choosing those numbers well requires knowing what acceptance the drafter actually achieves and what the target and draft forwards actually cost at each concurrency level. `--spec-decode-telemetry` measures both.
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --spec-decode-telemetry ...
+```
+
+When enabled, the scheduler keeps, bucketed by batch size:
+
+* an exponentially weighted acceptance rate, including per draft position, so a position that is never drafted reads as "no evidence" rather than as zero acceptance;
+* exponentially weighted target and draft forward durations, measured with CUDA events in the worker rather than wall clock, because kernel launches and CUDA graph replays return before the GPU work completes.
+
+Bucketing by batch size is what makes `K = 0` recoverable: nothing is drafted at `K = 0`, so acceptance there is unobservable, and a single global estimate would never learn its way back out. What was learned at `B = 8` survives `K = 0` at `B = 200`.
+
+The drafter timer also runs at `K = 0`. The proposer still performs a cache-sync forward before returning an empty draft, so `K = 0` is cheaper than drafting but is not free.
+
+### Cost
+
+Default off. With the flag off, no CUDA events are allocated, nothing is recorded, and the worker reports no timings. With it on, the per-step cost is a fixed number of CUDA event records, a deferred read of events from two steps earlier (never a blocking wait), and O(K) arithmetic per drafting request, which is the same order as the acceptance counting that `SpecDecodingStats` already performs.
+
+### Relationship to other flags
+
+`--spec-decode-telemetry` is deliberately independent of `--disable-log-stats`. It is instrumentation for a future depth governor that will select K, not a reporting surface, so disabling statistics logging must not silently degrade control. It requires a speculative configuration; without one it allocates nothing.
+
+Phase 1 records these signals and nothing more. K is still chosen entirely by `num_speculative_tokens_per_batch_size`, and enabling telemetry does not change which K is selected.
+
 ## Limitations
 
 * Tested with Eagle, Eagle-3, and DFlash. Other SD methods may or may not work out of the box
 * Full Cudagraph only works with Model Runner V2. MRv1 only supports piece-wise cuda graph with this feature
 * Not compatible with data parallelism (`--data-parallel-size > 1`). Each DP rank schedules independently, so ranks can pick different K values, causing DP collective divergence and deadlocks. When DP is enabled, vLLM automatically disables `num_speculative_tokens_per_batch_size` and falls back to the static `num_speculative_tokens` value.
+* Acceptance-length adaptation supports model-backed speculative decoding;
+  n-gram, suffix, custom proposers, and diffusion decoding are not supported.

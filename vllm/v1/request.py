@@ -171,6 +171,12 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Cumulative speculative decoding counters, reset with the request.
+        # A finished request's acceptance history is not evidence about a new
+        # request, so dying with the request is correct rather than lossy.
+        self.spec_num_drafts = 0
+        self.spec_num_draft_tokens = 0
+        self.spec_num_accepted_tokens = 0
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

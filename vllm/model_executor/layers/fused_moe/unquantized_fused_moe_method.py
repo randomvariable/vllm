@@ -175,14 +175,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().process_weights_after_loading(layer)
 
         # Padding the weight for better performance on ROCm.
-        # _maybe_pad_weight is idempotent: on the first call it allocates a
-        # padded storage and returns a strided view; on subsequent calls
-        # (weight updates) the stride condition no longer matches so it
-        # returns the input unchanged. The reassignment to .data is therefore
-        # a no-op on updates and preserves the storage address (data_ptr)
-        # used by captured CUDA graphs.
-        layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
-        layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
+        # Padding may allocate a same-shaped strided view. Copy it back instead
+        # of rebinding `.data`, since CUDA graphs capture the parameter storage
+        # address (data_ptr); rebinding would leave captured graphs pointing at
+        # stale storage after a weight update (RL/GRPO replay).
+        layer.w13_weight.data.copy_(self._maybe_pad_weight(layer.w13_weight.data))
+        layer.w2_weight.data.copy_(self._maybe_pad_weight(layer.w2_weight.data))
 
         if self.unquantized_backend in [
             UnquantizedMoeBackend.TPU,

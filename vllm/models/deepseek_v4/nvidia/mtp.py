@@ -18,13 +18,11 @@ import regex as re
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -39,18 +37,10 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.mtp_validation import (
-    is_mtp_completeness_check_enabled,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
 from vllm.models.deepseek_v4.common.ops import (
     fused_mtp_input_rmsnorm,
     mtp_shared_head_rmsnorm,
@@ -59,15 +49,13 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
-    DeepseekV4Model,
-    _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
 
 logger = init_logger(__name__)
 
 # MoE expert scales are fused into per-layer w13/w2 tensors. The exact
-# parameter suffix depends on which FusedMoEFactory method handles the experts:
+# parameter suffix depends on which FusedMoE method handles the experts:
 # - fp4 experts (Mxfp4MoEMethod) register ``w{1,2,3}_weight_scale``;
 # - fp8 experts (Fp8MoEMethod with block_quant=True) register
 #   ``w{1,2,3}_weight_scale_inv``.
@@ -166,23 +154,25 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
             self.hc_mult,
         )
-        if self.mtp_block.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, inputs_embeds
-                )
-            inputs_embeds = sp_shard(inputs_embeds)
-            previous_hidden_states = sp_shard(previous_hidden_states)
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
-        if self.mtp_block.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+        if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
+            from sparkinfer.norm.mhc import run_post as b12x_mhc_post
+
+            hidden_states = b12x_mhc_post(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+            )
+        else:
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
@@ -284,11 +274,20 @@ class DeepSeekV4MTP(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.pad_shared_expert = getattr(
-            self.quant_config, "weight_block_size", None
-        ) is not None and not _use_sequence_parallel(vllm_config)
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        mtp_layers = range(self.config.num_nextn_predict_layers)
+        nextn_layers = range(
+            self.config.num_hidden_layers,
+            self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+        )
+        return tuple(
+            [f"mtp.{layer_idx}." for layer_idx in mtp_layers]
+            + [f"model.layers.{layer_idx}." for layer_idx in nextn_layers]
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -409,12 +408,6 @@ class DeepSeekV4MTP(nn.Module):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
-            if ".shared_experts.w2" in name:
-                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-            if self.pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -470,6 +463,10 @@ class DeepSeekV4MTP(nn.Module):
                     loaded_params.add(name)
                     continue
                 else:
+                    if ".shared_experts.w2" in name:
+                        name = name.replace(
+                            ".shared_experts.w2", ".shared_experts.down_proj"
+                        )
                     if name.endswith(".ffn.gate.bias"):
                         # ``e_score_correction_bias`` lives on the gate
                         # under a different attribute name.
@@ -494,7 +491,7 @@ class DeepSeekV4MTP(nn.Module):
             self.model.mtp_start_layer_idx,
             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
         ):
-            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+            if layer_idx not in loaded_layers:
                 raise ValueError(
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint. The checkpoint may have "

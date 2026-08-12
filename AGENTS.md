@@ -42,55 +42,57 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 - **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
 
-### Environment setup
+### Fast local dev loop (MANDATORY before image builds)
+
+Full image builds are for validated deployable work, not edit feedback.
+Use a local GPU dev loop first.
+
+Two loops exist and are the default — pick by what the change touches:
+
+1. **Pure Python / Triton (no CUDA sources, no `setup.py` rebuild).** Most
+   sampler, scheduler, config, and reasoning-control work. Edit on the host
+   checkout, sync to the box, restart `vllm`. No compile. This is seconds.
+2. **HIP/C++ on Strix Halo (gfx1151).** Uses the `cargo make` devloop harness
+   (`cargo make doctor` → `setup` → `build` → `test`). Incremental, ccache-warm,
+   minutes not hours. See `Makefile.toml` and
+   `docs/contributing/kernel_targets/rdna35.md`.
+
+For CUDA work requiring a native build, use the sanctioned explicit
+`.venv/bin/python` interpreter and verify `import vllm._C` before image builds.
+Only trigger an image build once the local checks above are green **and** a
+deployable image is actually needed.
+
+Environment setup and dependencies use `uv`; Python commands use
+`.venv/bin/python`.
+
+Tests
 
 ```bash
-# Install `uv` if you don't have it already:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Always use `uv` for Python environment management:
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Always make sure `pre-commit` and its hooks are installed:
-uv pip install -r requirements/lint.txt
-pre-commit install
-```
-
-### Installing dependencies
-
-```bash
-# If you are only making Python changes:
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-
-# If you are also making C/C++ changes:
-uv pip install -e . --torch-backend=auto
-```
-
-### Tests
-
-> Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
-
-```bash
-# Install test dependencies (use cuda.in on non-x86_64):
 uv pip install -r requirements/test/cuda.in
 
-# Run a specific test file:
 .venv/bin/python -m pytest tests/path/to/test_file.py -v
 ```
 
-When adding tests:
+For AMD Strix Halo (`gfx1151`) ROCm work, use `cargo make test -- <pytest
+args>`. It supports paths, node IDs, and `-k`, rejects a bare command, and
+uses a container rather than the host `.venv`; keep the generic command for
+non-ROCm environments. The devloop container must bind-mount the checkout so
+the compiled `vllm._C` extension is loaded from the build under test (see the
+homelab guide).
+
+When adding tests
 
 - **Design before you write.** Answer four questions first: what is the module
   for, what is its I/O contract, what failure am I guarding against, and what is
   the cheapest level that catches it (unit over integration over e2e)?
 - **Reuse before create.** Extend existing test files, `conftest.py` fixtures, and
   helpers; add a new file only when no nearby suite fits.
-- **Test behavior with intent.** Assert observable outcomes through public APIs;
-  state why in the name or docstring. Skip trivial wiring; flaky tests are worse
-  than no tests.
-- **Keep it minimal.** One behavior per test and the smallest setup that
-  triggers it; if the test diff dwarfs the code change, cut scope.
+- **Test behavior with intent and minimal scope.** Assert observable outcomes
+  through public APIs; one behavior per test with the smallest setup that
+  triggers it. Skip trivial wiring; flaky tests are worse than no tests.
+- **Use property-based testing wherever relevant.** Python tests must use
+  Hypothesis and Rust tests must use proptest for meaningful generative or
+  state-space coverage. Otherwise choose the cheapest appropriate test level.
 - **No one-off kernel benchmarks in `tests/`.** Put kernel perf work in
   `benchmarks/kernels/`; prove correctness in existing pytest suites.
 - **Run model evals for model-affecting changes.** Search `tests/evals/` or use
@@ -98,6 +100,17 @@ When adding tests:
 
 For model-specific requirements, see
 [`docs/contributing/model/tests.md`](docs/contributing/model/tests.md).
+
+### Documentation
+
+Documentation updates are mandatory for relevant code or config changes: update
+the owning docs page in the same change, never as a follow-up.
+
+- **Any new user-facing feature, or new/changed config option** → update the prose page that owns the area. Search `docs/configuration/` for the guide covering it (memory, optimization, env vars) rather than assuming a path.
+- **Document**: what it does, when to use it, interaction and mutual exclusion with related options, defaults, and intentional failure modes — state what fails closed and why, so the behaviour does not read as a bug.
+- **Reference pages are generated** from config field docstrings (search for `gen:engine-args`), so a Google-style docstring on the field *is* the reference doc. Generated reference does not replace prose guidance — a new option needs both.
+- **Environment variables** must be declared in `vllm/envs.py` and documented wherever env vars are listed.
+- **Cross-reference** from the established option a new one competes with, so readers find the alternative instead of only the one they searched for.
 
 ### Running linters
 
@@ -121,11 +134,26 @@ The line length limit for Python code is 88 characters. If you are not sure, use
 
 Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) (`Args:`/`Returns:`/`Raises:` sections), not reStructuredText/Sphinx fields (`:param:`, `:return:`, `:rtype:`).
 
+### Choosing a kernel implementation
+
+Prefer, in order, and justify skipping a tier: an existing
+[AITER](https://github.com/ROCm/aiter) operator on ROCm; then Triton, which vLLM
+V1 uses as the portable layer so one implementation serves CUDA and ROCm; then
+hand-written CUDA/HIP or CUTLASS, only where the hardware exposes something with
+no portable expression. Compiling is not justification — measure against Triton
+before making anything the selected default.
+
+AITER changes belong in the fork at `github.com/randomvariable/aiter`, branch
+`homelabs-main`, consumed as a submodule — not patched in-tree here. See
+[the kernel targets guide](docs/contributing/kernel_targets/README.md) for what
+AITER does and does not give you on RDNA.
+
 ### Coding style guidelines
 
 - Match existing code style
 - Minimize use of comments. Eliminate comments which are redundant, preferring legible and self-documenting code. When used, keep docstrings and comments brief and direct.
 - Assume the reader is familiar with vLLM.
+- Keep no broken windows: after every edit, inspect diagnostics and fix all reported errors, including pre-existing errors in files touched by the work. Do not declare work complete while known diagnostics remain; if an environment or dependency blocker prevents a fix, document it explicitly.
 
 ### Commit messages
 
@@ -155,3 +183,12 @@ vulnerability process.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **Working on the `homelabs-main` fork**:
+  [`docs/contributing/homelab-hard-requirements.md`](docs/contributing/homelab-hard-requirements.md)
+  — Mandatory rules for this fork, each learned the hard way. Read before
+  touching `homelab/` Dockerfiles, `requirements/`, `VLLM_*` env vars,
+  `README.md`, production migrations, or ported code.
+- **Writing GPU kernels**:
+  [`docs/contributing/kernel_targets/README.md`](docs/contributing/kernel_targets/README.md)
+  — What ROCm `gfx1151` and CUDA `sm_121a` each constrain, and the
+  correctness and measurement bar for both.

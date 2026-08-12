@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import inspect
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
-from typing import ClassVar
+from functools import cache, partial
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -1251,6 +1252,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
+        uses_spec_reorder = self.reorder_batch_threshold > 1
         route_decode = causal or self.use_dedicated_xqa
         if route_decode:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -1278,7 +1280,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         use_cascade = common_prefix_len > 0
-        uses_spec_reorder = self.reorder_batch_threshold > 1
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
@@ -1487,9 +1488,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # use_trtllm_attention never selects it when DCP is enabled.
                 assert not self.use_dcp
                 # Create GPU versions
-                qo_indptr_prefill_gpu = (
-                    qo_indptr[prefill_start:] - qo_indptr[prefill_start]
-                )
+                if prefill_start == 0:
+                    qo_indptr_prefill_gpu = qo_indptr[: num_prefills + 1]
+                else:
+                    qo_indptr_prefill_gpu = (
+                        qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                    )
                 # Compute cum_seq_lens_kv on GPU to avoid CPU sync.
                 # This is the cumulative sum of the number of KV cache
                 # blocks per prefill request.
@@ -1631,11 +1635,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
-                num_input_tokens = num_decode_tokens
+                # Spec-as-decode verify batches carry a uniform
+                # num_decode_tokens // num_decodes tokens per request; the
+                # wrapper's batch size and kv metadata are per request.
+                assert num_decode_tokens % num_decodes == 0
+                decode_q_len = num_decode_tokens // num_decodes
 
-                decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
-                )
+                decode_wrapper = self._get_decode_wrapper(num_decodes, use_cudagraph)
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
@@ -1647,11 +1653,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 fast_plan_decode(
                     decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                    indptr_cpu=self.paged_kv_indptr.cpu[: num_decodes + 1],
                     indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
+                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[:num_decodes],
                     num_qo_heads=self.num_qo_heads * self.dcp_world_size,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
@@ -1666,6 +1670,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    q_len_per_req=decode_q_len,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -2112,6 +2117,15 @@ class FlashInferImpl(AttentionImpl):
                 workspace_buffer = _get_trtllm_workspace_buffer()
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
+                cum_seq_lens_kv = attn_metadata.prefill.cum_seq_lens_kv
+                cum_seq_lens_kv[:1] = 0
+                page_size = kv_cache_permute.shape[-2]
+                num_blocks_per_req = (seq_lens_prefill + page_size - 1) // page_size
+                torch.cumsum(
+                    num_blocks_per_req,
+                    dim=0,
+                    out=cum_seq_lens_kv[1:],
+                )
 
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
                 assert get_kv_cache_layout() == "HND"
@@ -2480,6 +2494,14 @@ class FlashInferImpl(AttentionImpl):
             )
 
 
+@cache
+def flashinfer_supports_uniform_multi_token_decode() -> bool:
+    """Whether the installed FlashInfer can plan the tensor-core decode path
+    for a uniform q_len_per_req > 1 (spec-decode verify) and keep the plan
+    cudagraph-safe."""
+    return "q_len_per_req" in inspect.signature(fast_decode_plan).parameters
+
+
 def fast_plan_decode(
     self,  # decode wrapper
     indptr_cpu: torch.Tensor,
@@ -2502,6 +2524,7 @@ def fast_plan_decode(
     non_blocking: bool = True,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    q_len_per_req: int = 1,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
@@ -2543,34 +2566,42 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            q_len_per_req=q_len_per_req,
         )
         self.vllm_first_call = False
         return
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
 
-    fast_decode_plan(
-        self,
-        indptr=indptr_cpu,
-        indices=indices,
-        last_page_len=last_page_len_cpu,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        window_left=window_left,
-        logits_soft_cap=logits_soft_cap,
-        q_data_type=q_data_type,
-        kv_data_type=kv_data_type,
-        data_type=data_type,
-        sm_scale=sm_scale,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-        non_blocking=non_blocking,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=disable_split_kv,
-    )
+    plan_kwargs: dict[str, Any] = {
+        "indptr": indptr_cpu,
+        "indices": indices,
+        "last_page_len": last_page_len_cpu,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "page_size": page_size,
+        "pos_encoding_mode": pos_encoding_mode,
+        "window_left": window_left,
+        "logits_soft_cap": logits_soft_cap,
+        "q_data_type": q_data_type,
+        "kv_data_type": kv_data_type,
+        "data_type": data_type,
+        "sm_scale": sm_scale,
+        "rope_scale": rope_scale,
+        "rope_theta": rope_theta,
+        "non_blocking": non_blocking,
+        "fixed_split_size": fixed_split_size,
+        "disable_split_kv": disable_split_kv,
+    }
+    if flashinfer_supports_uniform_multi_token_decode():
+        plan_kwargs["q_len_per_req"] = q_len_per_req
+    elif q_len_per_req != 1:
+        raise RuntimeError(
+            "The installed FlashInfer fast_decode_plan does not support "
+            f"q_len_per_req={q_len_per_req}"
+        )
+    fast_decode_plan(self, **plan_kwargs)
 
 
 @triton.jit

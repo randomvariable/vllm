@@ -123,7 +123,7 @@ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
    # to support the whole generation without specifying all sub-architectures
    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
@@ -269,6 +269,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND
    DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
   list(APPEND VLLM_GPU_FLAGS "--compress-mode=size")
+endif()
+
+# Enable -ffast-math for HIP (ROCm) kernels. Allows the compiler to perform
+# floating-point contractions, use fast intrinsics, and relax IEEE compliance.
+# Proven +4-7% on AMD attention/activation kernels (see llama.cpp #23862).
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  list(APPEND VLLM_GPU_FLAGS "-ffast-math")
 endif()
 
 #
@@ -477,12 +484,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_STABLE_EXT_SRC
       "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
       "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_kv_gather.cu"
-      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_q_gather.cu")
+      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_q_gather.cu"
+      "csrc/libtorch_stable/attention/mla/safe_query_bmm.cu")
 
     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
     # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
-    set(CUTLASS_REVISION "v4.4.2")
+    # v4.6.1 contains the SM120 ptr-array collective used by grouped FP8 MoE.
+    set(CUTLASS_REVISION "v4.6.1")
 
     # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
     if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
@@ -1012,7 +1021,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/quantization/fp4/nvfp4_experts_quant.cu"
       "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
       "csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
-      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu")
+      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu"
+      "csrc/libtorch_stable/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm120.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FP4_SM120_SRCS}"
       CUDA_ARCHS "${FP4_SM120_ARCHS}")
@@ -1205,6 +1215,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    find_library(VLLM_CUBLAS_LIBRARY cublas
+      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib" NO_DEFAULT_PATH)
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      find_library(VLLM_CUBLAS_LIBRARY cublas)
+    endif()
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      message(FATAL_ERROR "safe_mla_query_bmm requires libcublas")
+    endif()
+    target_link_libraries(_C_stable_libtorch PRIVATE ${VLLM_CUBLAS_LIBRARY})
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)
@@ -1510,13 +1529,21 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
-  set(VLLM_ROCM_HAS_GFX1100 OFF)
-  if(VLLM_GPU_ARCHES MATCHES "gfx1100")
-    set(VLLM_ROCM_HAS_GFX1100 ON)
+  # RDNA3-family scalar W4A16 GEMM kernels: gfx1100 (RDNA3) and gfx1151
+  # (RDNA3.5 / Strix Halo). The separate WMMA prefill TU is gfx1100-only.
+  set(VLLM_ROCM_HAS_RDNA3_GEMM OFF)
+  set(VLLM_ROCM_HAS_RDNA3_WMMA OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1100|gfx1151")
+    set(VLLM_ROCM_HAS_RDNA3_GEMM ON)
     list(APPEND VLLM_ROCM_EXT_SRC
       "csrc/rocm/q_gemm_rdna3.cu"
-      "csrc/rocm/q_gemm_rdna3_wmma.cu"
       "csrc/rocm/moe_q_gemm_rdna3.cu")
+  endif()
+
+  if(VLLM_GPU_ARCHES MATCHES "gfx1100")
+    set(VLLM_ROCM_HAS_RDNA3_WMMA ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/q_gemm_rdna3_wmma.cu")
   endif()
 
   define_extension_target(
@@ -1535,8 +1562,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
   endif()
 
-  if(VLLM_ROCM_HAS_GFX1100)
-    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1100)
+  if(VLLM_ROCM_HAS_RDNA3_GEMM)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_RDNA3_GEMM)
+  endif()
+  if(VLLM_ROCM_HAS_RDNA3_WMMA)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_RDNA3_WMMA)
   endif()
 endif()
 

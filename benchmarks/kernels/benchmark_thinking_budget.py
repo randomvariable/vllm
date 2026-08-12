@@ -19,12 +19,50 @@ END_TOKEN_ID = 91
 TOKEN_ID = 10
 VOCAB_SIZE = 128
 QUANTILES = [0.5, 0.2, 0.8]
+# Marker last-tokens are drawn from here so they never alias the history
+# filler, the reasoning boundaries, or each other.
+MARKER_TOKEN_BASE = 20
+MARKER_PENALTY = 4.0
+# Modes whose per-step cost is expected to be independent of history length,
+# and so are eligible for --max-slowdown enforcement.
+SLOWDOWN_CHECKED_MODES = frozenset(
+    {
+        "cached",
+        "incremental-decode",
+        "marker-penalty",
+        "marker-penalty-nomatch",
+        "batched-marker-penalty",
+    }
+)
 
 
 class ReasoningConfig:
     reasoning_start_token_ids = [START_TOKEN_ID]
     reasoning_end_token_ids = [END_TOKEN_ID]
     natural_reasoning_end_token_ids = [END_TOKEN_ID]
+
+    def __init__(self, marker_token_ids: list[list[int]] | None = None):
+        self.reasoning_marker_token_ids = marker_token_ids or []
+
+
+def build_markers(num_markers: int, marker_len: int, matching: bool) -> list[list[int]]:
+    """Build distinct markers of a fixed length.
+
+    The kernel matches every marker token but the last against recent history
+    and acts on the final token, so ``matching`` selects whether that prefix
+    reproduces the history filler. A matching prefix is the worst case: the
+    comparison loop runs to completion *and* the penalty store is issued.
+    A marker shorter than two tokens has no such prefix, so matching is
+    undefined and callers must reject it first.
+    """
+    assert marker_len >= 2
+    prefix_token = TOKEN_ID if matching else TOKEN_ID + 1
+    markers = []
+    for marker_num in range(num_markers):
+        last_token = MARKER_TOKEN_BASE + marker_num
+        assert last_token < START_TOKEN_ID, "marker token collides with boundaries"
+        markers.append([prefix_token] * (marker_len - 1) + [last_token])
+    return markers
 
 
 @dataclasses.dataclass
@@ -41,6 +79,8 @@ def create_case(
     history_type: Literal["reasoning", "prefill"] = "reasoning",
     batch_size: int = 1,
     budget_type: Literal["active", "forced", "mixed"] = "active",
+    markers: list[list[int]] | None = None,
+    marker_penalty: float = 0.0,
 ) -> BenchmarkCase:
     assert history_len >= 2
     if history_type == "prefill":
@@ -68,7 +108,7 @@ def create_case(
         req_indices.append(req_states.req_id_to_index[req_id])
     req_states.apply_staged_writes()
 
-    state = ThinkingBudgetState(req_states, ReasoningConfig())
+    state = ThinkingBudgetState(req_states, ReasoningConfig(markers))
     active_budget = history_len + extra_tokens + 1
     forced_budget = max(1, history_len - 2)
     for req_num, req_idx in enumerate(req_indices):
@@ -80,7 +120,10 @@ def create_case(
             budget = active_budget
         state.add_request(
             req_idx,
-            SamplingParams(thinking_token_budget=budget),
+            SamplingParams(
+                thinking_token_budget=budget,
+                reasoning_marker_penalty=marker_penalty or None,
+            ),
         )
     state.apply_staged_writes()
 
@@ -110,6 +153,21 @@ def create_case(
     assert torch.all(state.cached_scan_pos[active_req_indices] == history_len).item()
     if budget_type == "forced":
         assert torch.all(logits[:, END_TOKEN_ID] == 1.0e9).item()
+    if markers and marker_penalty:
+        # Prove the measured path is the one intended: a matching marker must
+        # have been penalised, and a non-matching one must not have been. A
+        # silently skipped kernel would otherwise benchmark as "free".
+        last_tokens = [marker[-1] for marker in markers]
+        penalised = logits[:, last_tokens]
+        if markers[0][0] == TOKEN_ID:
+            assert torch.all(penalised == -marker_penalty).item(), (
+                "marker penalty did not fire; benchmark would measure a no-op"
+            )
+        else:
+            assert torch.all(penalised == 0.0).item(), (
+                "non-matching marker was penalised; history/marker setup is wrong"
+            )
+        logits.zero_()
     return BenchmarkCase(req_states, state, run)
 
 
@@ -211,6 +269,9 @@ def main() -> None:
             "forced-end",
             "batched-budgeted",
             "batched-mixed",
+            "marker-penalty",
+            "marker-penalty-nomatch",
+            "batched-marker-penalty",
         ],
         default=[
             "cached",
@@ -220,7 +281,25 @@ def main() -> None:
             "forced-end",
             "batched-budgeted",
             "batched-mixed",
+            "marker-penalty",
+            "marker-penalty-nomatch",
+            "batched-marker-penalty",
         ],
+    )
+    parser.add_argument(
+        "--num-markers",
+        type=int,
+        default=4,
+        help="Configured hesitation markers for marker-penalty modes.",
+    )
+    parser.add_argument(
+        "--marker-len",
+        type=int,
+        default=4,
+        help=(
+            "Tokens per marker, at least 2. The kernel matches marker_len-1 "
+            "tokens in a serial loop, so this is the per-program cost driver."
+        ),
     )
     parser.add_argument(
         "--batch-sizes",
@@ -259,9 +338,10 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Fail if cached or incremental-decode median latency exceeds this "
-            "multiple of its shortest-history latency. Cold modes are excluded "
-            "because worst-case cold-resume cost scales with scanned history."
+            "Fail if cached, incremental-decode, or any marker-penalty mode "
+            "has a median latency exceeding this multiple of its own "
+            "shortest-history latency. Cold modes are excluded because "
+            "worst-case cold-resume cost scales with scanned history."
         ),
     )
     args = parser.parse_args()
@@ -275,8 +355,24 @@ def main() -> None:
     if not batch_sizes or batch_sizes[0] <= 0:
         parser.error("batch sizes must be positive")
 
+    if args.num_markers <= 0:
+        parser.error("marker count must be positive")
+    if args.marker_len < 2:
+        parser.error(
+            "--marker-len must be at least 2; a single-token marker has no "
+            "prefix to match against history, so marker matching is invalid"
+        )
+    if MARKER_TOKEN_BASE + args.num_markers > START_TOKEN_ID:
+        parser.error(
+            f"--num-markers must be below {START_TOKEN_ID - MARKER_TOKEN_BASE} "
+            "so marker tokens do not collide with reasoning boundaries"
+        )
+
     device = torch.device(args.device)
     results: dict[str, dict[int, tuple[float, float, float]]] = {}
+    # Labels whose cost must stay flat in history length. Cold modes are
+    # excluded: their worst case legitimately scales with scanned history.
+    slowdown_checked_labels: list[str] = []
     for mode in args.modes:
         mode_batch_sizes = batch_sizes if mode.startswith("batched-") else [1]
         if mode == "batched-mixed":
@@ -285,6 +381,8 @@ def main() -> None:
                 parser.error("batched-mixed requires a batch size of at least 2")
         for batch_size in mode_batch_sizes:
             label = f"{mode}-b{batch_size}" if mode.startswith("batched-") else mode
+            if mode in SLOWDOWN_CHECKED_MODES:
+                slowdown_checked_labels.append(label)
             mode_results: dict[int, tuple[float, float, float]] = {}
             for history_len in history_lengths:
                 if mode == "cached":
@@ -313,6 +411,23 @@ def main() -> None:
                         args.iterations,
                         "reasoning",
                     )
+                elif mode in (
+                    "marker-penalty",
+                    "marker-penalty-nomatch",
+                    "batched-marker-penalty",
+                ):
+                    case = create_case(
+                        history_len,
+                        device,
+                        batch_size=batch_size,
+                        markers=build_markers(
+                            args.num_markers,
+                            args.marker_len,
+                            matching=mode != "marker-penalty-nomatch",
+                        ),
+                        marker_penalty=MARKER_PENALTY,
+                    )
+                    result = benchmark_cached(case, args.warmup_ms, args.rep_ms)
                 else:
                     budget_type = (
                         "forced"
@@ -344,10 +459,8 @@ def main() -> None:
             )
 
     if args.max_slowdown is not None:
-        for mode in ("cached", "incremental-decode"):
-            if mode not in results:
-                continue
-            mode_results = results[mode]
+        for label in slowdown_checked_labels:
+            mode_results = results[label]
             baseline_ms = mode_results[history_lengths[0]][0]
             worst_history_len = max(
                 mode_results, key=lambda length: mode_results[length][0]
@@ -355,7 +468,7 @@ def main() -> None:
             worst_slowdown = mode_results[worst_history_len][0] / baseline_ms
             if worst_slowdown > args.max_slowdown:
                 raise SystemExit(
-                    f"thinking-budget {mode} slowdown {worst_slowdown:.3f}x "
+                    f"thinking-budget {label} slowdown {worst_slowdown:.3f}x "
                     f"at history length {worst_history_len} exceeds "
                     f"{args.max_slowdown:.3f}x"
                 )

@@ -6,19 +6,30 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
+    warmup_b12x_mla_mxfp8_bmm,
+    warmup_fused_mla_query,
+)
+from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    warmup_b12x_tensor_fp8_linear,
+)
+from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
+from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
+    warmup_b12x_sparse_indexer,
+)
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
-)
-from vllm.model_executor.warmup.fa4_cutedsl_warmup import (
-    fa4_cutedsl_warmup,
 )
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
@@ -28,12 +39,12 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
-    kimi_k3_triton_warmup,
+from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+    minimax_m3_msa_warmup,
 )
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
-    sparse_mla_triton_warmup,
+    sparse_mla_triton_warmup_if_needed,
 )
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
@@ -48,30 +59,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_LL_BF16_WARMUP_MODEL_SHAPES: tuple[tuple[int, int], ...] = (
+    (6144, 264),  # Inkling
+    (7168, 256),  # DSV3
+    (7168, 384),  # DSV4-Pro
+    (14400, 256),  # DSV4-Flash
+)
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
 
 
-def _ll_bf16_router_shapes_from_model(
-    model: torch.nn.Module,
-) -> tuple[tuple[int, int], ...]:
-    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
-
-    shapes: set[tuple[int, int]] = set()
-    for module in model.modules():
-        if not isinstance(module, GateLinear):
-            continue
-        weight = getattr(module, "weight", None)
-        if not isinstance(weight, torch.Tensor):
-            continue
-        if weight.dim() != 2 or weight.dtype != torch.bfloat16:
-            continue
-        n, k = weight.shape
-        if k % 8 == 0:
-            shapes.add((int(k), int(n)))
-    return tuple(sorted(shapes))
-
-
-def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
+def _warmup_ll_bf16_router_gemm() -> None:
     from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
         is_available as is_ll_bf16_gemm_available,
     )
@@ -82,66 +79,207 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     if not is_ll_bf16_gemm_available():
         return
 
-    shapes = _ll_bf16_router_shapes_from_model(model)
-    if not shapes:
-        logger.debug_once(
-            "Skipping ll_bf16 router GEMM warmup: no bf16 GateLinear shapes found."
-        )
-        return
-
-    logger.info_once("Warming up ll_bf16 router GEMM kernels for shapes: %s.", shapes)
+    logger.info("Warming up ll_bf16 router GEMM kernels.")
     ll_bf16_gemm_kernel.warmup(
-        shapes=shapes,
+        shapes=_LL_BF16_WARMUP_MODEL_SHAPES,
         m_values=_LL_BF16_WARMUP_M_RANGE,
     )
 
 
-def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
+def _is_flashinfer_backend(backend) -> bool:
+    try:
+        return backend.get_name() == "FLASHINFER"
+    except NotImplementedError:
+        return False
+
+
+def _is_flashinfer_object(obj: object) -> bool:
+    cls = obj.__class__
+    name = cls.__name__.lower()
+    module = cls.__module__.lower()
+    return "flashinfer" in name or "flashinfer" in module
+
+
+def _contains_flashinfer_object(
+    obj: object,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    if obj is None or isinstance(obj, (str, bytes, int, float, bool, torch.Tensor)):
+        return False
+    if _is_flashinfer_object(obj):
+        return True
+    if depth >= 3:
+        return False
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return False
+    seen.add(obj_id)
+
+    if isinstance(obj, nn.Module):
+        return False
+    values: Iterable[object]
+    if isinstance(obj, dict):
+        values = obj.values()
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        values = obj
+    elif hasattr(obj, "__dict__"):
+        values = vars(obj).values()
+    else:
+        return False
+
+    return any(
+        _contains_flashinfer_object(value, depth=depth + 1, seen=seen)
+        for value in values
     )
 
-    if not worker.use_v2_model_runner:
-        # Pooling models do not use the generation slot-mapping path.
-        if not worker.model_runner.is_pooling_model:
-            warm_v1_block_table_kernels(worker.model_runner)
-        # The KV-block zeroing kernel is driven by the scheduler's
-        # `new_block_ids_to_zero`, so no dummy run ever reaches it.
-        zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
-        if zeroer is not None:
-            zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
 
+def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    attn_groups = getattr(runner, "attn_groups", None)
+    return bool(
+        attn_groups
+        and any(
+            _is_flashinfer_backend(group.backend)
+            for groups in attn_groups
+            for group in groups
+        )
+    )
+
+
+def _uses_flashinfer_model_kernels(model: nn.Module) -> bool:
+    for module in model.modules():
+        if _is_flashinfer_object(module):
+            return True
+        if any(
+            _contains_flashinfer_object(value)
+            for value in vars(module).values()
+            if not isinstance(value, nn.Module)
+        ):
+            return True
+    return False
+
+
+def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
+    return _uses_flashinfer_attention(
+        worker.model_runner
+    ) or _uses_flashinfer_model_kernels(worker.get_model())
+
+
+def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
+    if not envs.VLLM_USE_B12X_DCP_A2A:
+        return 0
+    parallel_config = getattr(worker.vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return 0
+    dcp_world_size = parallel_config.decode_context_parallel_size
+    if dcp_world_size <= 1 or parallel_config.dcp_comm_backend != "a2a":
+        return 0
+
+    # Pooling models do not use the generation slot-mapping path.
+    if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
+        warm_v1_block_table_kernels(
+            getattr(worker.model_runner, "device", torch.device("cuda")),
+            worker.scheduler_config.max_num_batched_tokens,
+        )
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.models.deepseek_v4.nvidia.b12x import (
+        DeepseekV4B12xMLAAttention,
+    )
+    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+
+    model = worker.get_model()
+    candidates = list(model.modules())
+    candidates.extend(
+        worker.vllm_config.compilation_config.static_forward_context.values()
+    )
+    seen_modules: set[int] = set()
+    warmed_signatures: set[tuple[torch.device, torch.dtype, int, int, int]] = set()
+    for module in candidates:
+        if id(module) in seen_modules:
+            continue
+        seen_modules.add(id(module))
+
+        dtype = worker.model_config.dtype
+        if isinstance(module, DeepseekV4B12xMLAAttention):
+            device = module.attn_sink.device
+            total_heads = int(module.n_local_heads) * dcp_world_size
+            query_head_dim = int(module.head_dim)
+            output_head_dim = int(module.head_dim)
+        elif isinstance(module, MLAAttention) and module.dcp_b12x:
+            device = next(module.parameters()).device
+            total_heads = int(module.num_heads) * dcp_world_size
+            query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        else:
+            continue
+
+        signature = (
+            device,
+            dtype,
+            total_heads,
+            query_head_dim,
+            output_head_dim,
+        )
+        if signature in warmed_signatures:
+            continue
+
+        warmup_b12x_dcp_a2a(
+            get_dcp_group(),
+            device=device,
+            dtype=dtype,
+            max_batch_size=worker.scheduler_config.max_num_batched_tokens,
+            total_heads=total_heads,
+            head_dim=output_head_dim,
+            query_head_dim=query_head_dim,
+        )
+        warmed_signatures.add(signature)
+
+    return len(warmed_signatures)
+
+
+def kernel_warmup(worker: "Worker"):
+    compilation_config = worker.vllm_config.compilation_config
+    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    compile_sizes = [
+        size
+        for size in (getattr(compilation_config, "compile_sizes", None) or [])
+        if isinstance(size, int)
+    ]
+    mhc_warmup_token_sizes = list(cudagraph_capture_sizes)
+    max_num_scheduled_tokens = getattr(
+        worker.scheduler_config, "max_num_scheduled_tokens", None
+    )
+    if max_num_scheduled_tokens is not None:
+        mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
+
+    # DSv4 mHC kernels run every decoder layer per token; warm them across
+    # token sizes first so the first real request doesn't pay JIT cost. No-op
+    # for non-DSv4 models (gated inside); still warms the boundary TileLang
+    # kernels used by the b12x mHC forward path.
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
+        cudagraph_capture_sizes=mhc_warmup_token_sizes,
     )
 
+    warmed_dcp_a2a = _warmup_b12x_dcp_a2a(worker)
+    if warmed_dcp_a2a:
+        logger.info(
+            "Warmed up %d B12X DCP collective signature(s).",
+            warmed_dcp_a2a,
+        )
+
     # Run next so input-prep kernels JIT against pristine runner state.
-    if worker.vllm_config.kernel_config.enable_jit_warmup:
-        kimi_k3_triton_warmup(worker)
-        fa4_cutedsl_warmup(worker)
-        sparse_mla_triton_warmup(worker)
-
-    if current_platform.has_device_capability(90):
-        _warmup_ll_bf16_router_gemm(worker.get_model())
-
-    if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
-        # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
-        # to the shared JIT warmup infrastructure.
-        # https://github.com/vllm-project/vllm/pull/47451
-        cutedsl_warmup()
-
-    if process_local_only:
-        return
-
+    sparse_mla_triton_warmup_if_needed(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
@@ -156,6 +294,79 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    warmed_mxfp8 = warmup_b12x_mxfp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_mxfp8:
+        logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
+    warmed_tensor_fp8 = warmup_b12x_tensor_fp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_tensor_fp8:
+        logger.info(
+            "Warmed up %d B12X tensor FP8 linear GEMM signatures.",
+            warmed_tensor_fp8,
+        )
+
+    warmed_mla_bmm = warmup_b12x_mla_mxfp8_bmm(worker.get_model())
+    if warmed_mla_bmm:
+        logger.info(
+            "Warmed up %d B12X MLA MXFP8 BMM variants.",
+            warmed_mla_bmm,
+        )
+
+    # Graph replay cannot JIT a missing specialization. Prewarm only the
+    # graph-visible token counts covered by the small-M kernel instead of
+    # retaining all 32 possible variants in every worker. M=1 also covers
+    # eager-only configurations and the ordinary single-request decode path.
+    mla_query_warmup_sizes = sorted(
+        {
+            1,
+            *(size for size in cudagraph_capture_sizes if 1 <= size <= 32),
+        }
+    )
+    warmed_mla_query = warmup_fused_mla_query(
+        worker.get_model(),
+        m_values=mla_query_warmup_sizes,
+    )
+    if warmed_mla_query:
+        logger.info(
+            "Warmed up %d fused MLA BF16/MXFP8 query variants.",
+            warmed_mla_query,
+        )
+
+    warmed_indexer = warmup_b12x_sparse_indexer(worker)
+    if warmed_indexer:
+        logger.info("Warmed up %d B12X sparse-indexer decode variants.", warmed_indexer)
+
+    moe_token_counts = [
+        worker.scheduler_config.max_num_batched_tokens,
+        *cudagraph_capture_sizes,
+        *compile_sizes,
+    ]
+    if max_num_scheduled_tokens is not None:
+        moe_token_counts.append(max_num_scheduled_tokens)
+    warmup_b12x_moe_dynamic(
+        worker.get_model(),
+        max_tokens=max(moe_token_counts),
+        token_counts=moe_token_counts,
+    )
+
     minimax_m3_msa_warmup(worker)
 
     enable_flashinfer_autotune = (
@@ -163,32 +374,41 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     )
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
-        logger.info_once("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
+        logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif not has_flashinfer():
+        logger.info("Skipping FlashInfer autotune because FlashInfer is unavailable.")
+    elif not current_platform.has_device_capability(90):
+        logger.info(
+            "Skipping FlashInfer autotune because the device capability is below 90."
+        )
+    elif not _uses_flashinfer_compute_kernels(worker):
+        logger.info(
+            "Skipping FlashInfer autotune because no FlashInfer compute kernels "
+            "are active."
+        )
+    else:
         flashinfer_autotune(worker.model_runner)
+
+    if current_platform.has_device_capability(90):
+        _warmup_ll_bf16_router_gemm()
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
+    attn_groups = getattr(worker.model_runner, "attn_groups", None)
     if (
         not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
+        and attn_groups
         # NOTE: This should be `any` instead of `all` but other hybrid attention
         # backends don't support this dummy run. Once we remove
         # `build_for_cudagraph_capture`, we can change it to `any`.
         and all(
             _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     ):
-        logger.info_once("Warming up FlashInfer attention.")
+        logger.info("Warming up FlashInfer attention.")
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
         worker.model_runner._dummy_run(
@@ -198,6 +418,9 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
+        cutedsl_warmup()
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
@@ -229,70 +452,86 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Every rank profiles the same tactics. When distributed, per-tactic
-    timings are averaged over the world CPU group so all ranks select the
-    same tactic.
+    Tuning is performed only on rank 0. The resulting cache is broadcast
+    to every rank so all ranks dispatch the same kernel tactic.
     """
-    from flashinfer.autotuner import AutoTuner, set_autotune_process_group
-
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
-
-    world = get_world_group()
-    is_leader = world.rank_in_group == 0
-    tuner = AutoTuner.get()
 
     autotune_kwargs: dict = {}
     skip_ops = _flashinfer_autotune_skip_ops(runner)
     if skip_ops:
-        logger.info_once(
+        logger.info(
             "Skipping FlashInfer autotuning for ops %s",
-            tuple(sorted(skip_ops)),
+            sorted(skip_ops),
         )
         autotune_kwargs["skip_ops"] = skip_ops
 
+    use_persistent_cache = True
+
+    # When distributed, tune on every rank so the collectives stay synchronized.
+    if get_world_group().world_size > 1:
+        use_persistent_cache = False
+
+    if not use_persistent_cache:
+        with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
+            runner._dummy_run(
+                num_tokens=runner.scheduler_config.max_num_batched_tokens,
+                skip_eplb=True,
+                is_profile=True,
+            )
+        get_world_group().barrier()
+        return
+
+    world = get_world_group()
+    is_leader = world.rank_in_group == 0
+
     cache_path = resolve_flashinfer_autotune_file(runner)
     if is_leader:
-        logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+        logger.info("Using FlashInfer autotune cache file: %s", cache_path)
 
     # We skip EPLB here since we don't want to record dummy metrics.
     # When autotuning with number of tokens m, flashinfer will autotune
     # operations for all number of tokens up to m, so we only need to
     # run with the max number of tokens.
-    # Randomize inputs to avoid every token pick the same experts,
-    # which lead to some EP ranks receiving no tokens and skipping their
-    # MoE kernel entirely, and cause hang due to all-reduce collective
-    # during synchronized autotuning.
     dummy_run_kwargs = dict(
         num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
-        randomize_inputs=True,
     )
 
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
+    with torch.inference_mode():
+        if is_leader:
+            with fi_utils.autotune(
+                tune_mode=True, cache=str(cache_path), **autotune_kwargs
+            ):
+                runner._dummy_run(**dummy_run_kwargs)
+        else:
+            runner._dummy_run(**dummy_run_kwargs)
+
+    # Broadcast autotune cache from rank 0 to all other ranks so every
+    # rank loads the same set of chosen tactics.
+    tune_results: bytes | None = None
     if is_leader and cache_path.exists():
         with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
+            tune_results = f.read()
 
-    group = world.cpu_group if world.world_size > 1 else None
-    set_autotune_process_group(group)
-    try:
-        with (
-            torch.inference_mode(),
-            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
-        ):
-            runner._dummy_run(**dummy_run_kwargs)
-    finally:
-        set_autotune_process_group(None)
+    tune_results = world.broadcast_object(tune_results, src=0)
 
-    if world.world_size > 1:
+    if tune_results is None:
+        logger.warning(
+            "No FlashInfer autotune cache entries found."
+            "Falling back to default tactics."
+        )
+    else:
+        if not is_leader and world.local_rank == 0:
+            write_flashinfer_autotune_cache(cache_path, tune_results)
         world.barrier()
-    if is_leader:
-        tuner.save_configs(str(cache_path))
+        from flashinfer.autotuner import AutoTuner
+
+        AutoTuner.get().load_configs(str(cache_path))
+        logger.info(
+            "FlashInfer autotune cache loaded on rank %d from %s.",
+            world.rank_in_group,
+            cache_path,
+        )

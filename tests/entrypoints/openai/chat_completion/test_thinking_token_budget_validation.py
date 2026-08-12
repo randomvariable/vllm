@@ -42,6 +42,29 @@ def test_chat_completion_request_accepts_minus_one_as_unlimited():
     assert request.thinking_token_budget is None
 
 
+@pytest.mark.parametrize("raw_value", [True, False, float("nan"), float("inf"), -1.0])
+def test_chat_completion_request_rejects_invalid_reasoning_marker_penalty(raw_value):
+    with pytest.raises(VLLMValidationError, match="reasoning_marker_penalty"):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_marker_penalty": raw_value,
+            }
+        )
+
+
+def test_chat_completion_request_accepts_reasoning_marker_penalty():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_marker_penalty": 2.5,
+        }
+    )
+    assert request.reasoning_marker_penalty == 2.5
+
+
 @pytest.mark.parametrize("raw_value", [0.6, 3.14, -2])
 def test_completion_request_rejects_invalid_thinking_token_budget(raw_value):
     with pytest.raises(VLLMValidationError, match="thinking_token_budget"):
@@ -74,3 +97,83 @@ def test_completion_request_accepts_minus_one_as_unlimited():
         }
     )
     assert request.thinking_token_budget is None
+
+
+@pytest.mark.parametrize("raw_value", [True, False, float("nan"), float("inf"), -1.0])
+def test_completion_request_rejects_invalid_reasoning_marker_penalty(raw_value):
+    with pytest.raises(VLLMValidationError, match="reasoning_marker_penalty"):
+        CompletionRequest.model_validate(
+            {
+                "model": "qwen",
+                "prompt": "hello",
+                "reasoning_marker_penalty": raw_value,
+            }
+        )
+
+
+def test_completion_request_accepts_reasoning_marker_penalty():
+    request = CompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "prompt": "hello",
+            "reasoning_marker_penalty": 2.5,
+        }
+    )
+    assert request.reasoning_marker_penalty == 2.5
+
+
+@pytest.mark.parametrize("raw_value", [-2, 0.6, 10.5])
+def test_chat_completion_request_rejects_invalid_reasoning_answer_reserve(raw_value):
+    with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_answer_reserve": raw_value,
+            }
+        )
+
+
+def test_chat_completion_request_accepts_reasoning_answer_reserve():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_answer_reserve": 128,
+        }
+    )
+    assert request.reasoning_answer_reserve == 128
+
+
+def test_chat_completion_request_reasoning_answer_reserve_minus_one_is_unset():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_answer_reserve": -1,
+        }
+    )
+    assert request.reasoning_answer_reserve is None
+
+
+@pytest.mark.parametrize("raw_value", [-2, 0.6, 10.5])
+def test_completion_request_rejects_invalid_reasoning_answer_reserve(raw_value):
+    with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
+        CompletionRequest.model_validate(
+            {
+                "model": "qwen",
+                "prompt": "hello",
+                "reasoning_answer_reserve": raw_value,
+            }
+        )
+
+
+def test_completion_request_accepts_reasoning_answer_reserve():
+    request = CompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "prompt": "hello",
+            "reasoning_answer_reserve": 128,
+        }
+    )
+    assert request.reasoning_answer_reserve == 128

@@ -192,3 +192,36 @@ CANN = "CANN"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+# Several of this fork's pinned dependencies live only on vendor indexes, and
+# those indexes also carry older copies of packages that PyPI has newer
+# versions of. The default first-match strategy therefore resolves stale
+# versions; best-match picks the newest across all of them.
+index-strategy = "unsafe-best-match"
+
+# Vendor indexes for the hardware this fork targets: NVIDIA sm_121a (DGX Spark)
+# and AMD gfx1151 (Strix Halo). Declared here so a local environment resolves
+# the same way the images do, without passing --extra-index-url by hand.
+
+# flashinfer-cubin and flashinfer-jit-cache are NOT on PyPI; they exist only
+# here. A resolution without this index fails misleadingly and makes the
+# pinned FlashInfer look incompatible with torch/CUDA when it is not.
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl/"
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130/"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+
+# ROCm Core SDK (TheRock). Supplies the rocm[...] distributions, including the
+# per-architecture device packages that carry the precompiled GPU kernels --
+# rocm[device-gfx1151] for Strix Halo. Without a matching device package,
+# kernel launches fail with hipErrorInvalidImage even though the GPU is
+# detected and the architecture appears in torch.cuda.get_arch_list().
+[[tool.uv.index]]
+name = "rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"

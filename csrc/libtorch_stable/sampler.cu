@@ -711,7 +711,14 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
             static_cast<int>(next_n), seqLensIs2D,
             outLogitsAux.mutable_data_ptr<float>());
 
+#ifndef USE_ROCM
     constexpr int kNumThreadsPerBlockMerge = 1024;
+#else
+    // 1024 threads exceed the 64 KB LDS limit / Wave32 occupancy budget on
+    // RDNA GPUs (e.g. gfx1151 Strix Halo); 512 keeps the merge kernel within
+    // limits.
+    constexpr int kNumThreadsPerBlockMerge = 512;
+#endif
     vllm::topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
         <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(
             outLogitsAux.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),

@@ -1120,6 +1120,12 @@ def deepgemm_post_process_fp8_weight_block(
         r = wq.size(0) // g
         wq = wq.view(g, r, d)
         ws = ws.view(g, r // quant_block_shape[0], d // quant_block_shape[1])
+        # Our pinned DeepGEMM has no SM120 fp8_bmm path, so SM12x dispatches to
+        # sm90_fp8_bmm, which expects raw row-major f32 block scales. Packing
+        # them into the SM100 layout here yields NaNs (cf.
+        # compute_fp8_einsum_recipe in models/deepseek_v4/nvidia/ops/o_proj.py).
+        if current_platform.is_device_capability_family(120):
+            return wq, ws.contiguous()
         dg_ws = deepgemm_post_process_weight_scale_block(
             ws=ws,
             mn=r,
@@ -1155,7 +1161,7 @@ def prepare_fp8_moe_layer_for_deepgemm(
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    block_shape: tuple[int],
+    block_shape: tuple[int, ...],
 ):
     w13, w13_scale = deepgemm_post_process_fp8_weight_block(
         wq=w13,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -716,3 +717,477 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+# --------------------------------------------------------------------------
+# Sparse-MLA indexer dispatch observability.
+#
+# These exercise the dispatch bookkeeping in ``rocm_fp8_paged_mqa_logits``
+# (import-failure diagnostic, route diagnostic, unsupported-layout guard),
+# not any kernel, so they mock architecture and AITER availability and run
+# on CPU without AITER installed.
+# --------------------------------------------------------------------------
+
+
+def _cpu_paged_mqa_logits_args(
+    block_size: int, *, next_n: int = 1, heads: int = 1
+) -> tuple:
+    """Minimal CPU tensors shaped so dispatch reaches the route decision.
+
+    ``head_dim`` is 4 so the packed ``[block_size, head_dim + 4]`` cache keeps
+    the fp32 scale section 4-byte aligned; the Torch reference reinterprets
+    that section and would otherwise fail on alignment rather than on the
+    behaviour under test.
+    """
+    head_dim = 4
+    return (
+        torch.zeros((1, next_n, heads, head_dim), dtype=torch.uint8),  # q_fp8
+        # [num_blocks, block_size, 1, head_dim + 4]
+        torch.zeros((1, block_size, 1, head_dim + 4), dtype=torch.uint8),
+        torch.zeros((next_n, heads), dtype=torch.float32),  # weights
+        torch.ones(1, dtype=torch.int32),  # context_lens
+        torch.zeros((1, 1), dtype=torch.int32),  # block_tables
+        torch.zeros(0, dtype=torch.int32),  # schedule_metadata
+        block_size,  # max_model_len, must cover one full block
+    )
+
+
+def _stub_paged_logits_dispatch(
+    monkeypatch,
+    mod,
+    *,
+    on_mi3xx: bool,
+    aiter_module,
+) -> None:
+    """Pin arch and AITER availability, and stub out the kernels/workspace."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(mod, "_ON_GFX942", on_mi3xx)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(mod, "paged_mqa_logits_module", lambda: aiter_module)
+
+    class _FakeWorkspaceManager:
+        def get_simultaneous(self, *shapes_and_dtypes):
+            return [
+                torch.zeros(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
+            ]
+
+    monkeypatch.setattr(
+        mod, "current_workspace_manager", lambda: _FakeWorkspaceManager()
+    )
+
+
+def _fake_fused_kernel(*args, **kwargs) -> None:
+    """Stand-in for the fused AITER kernel; records nothing, writes nothing."""
+    return None
+
+
+def _fake_stage1_kernel(*args, **kwargs) -> None:
+    return None
+
+
+def test_paged_mqa_logits_aiter_non_mi3xx_uses_torch_for_shuffle(monkeypatch):
+    """Non-MI300 AITER dispatch uses Torch for single-token shuffle decode."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = SimpleNamespace(
+        deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+        deepgemm_fp8_paged_mqa_logits_stage1=lambda *args, **kwargs: pytest.fail(
+            "stage-1 must not handle shuffled decode"
+        ),
+    )
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=False, aiter_module=aiter_module
+    )
+    monkeypatch.setattr(
+        mod,
+        "fp8_paged_mqa_logits_torch",
+        lambda *args: torch.zeros((1, 64), dtype=torch.float32),
+    )
+    reported: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        mod,
+        "_report_paged_logits_route",
+        lambda route, block_size: reported.append((route, block_size)),
+    )
+
+    mod.rocm_fp8_paged_mqa_logits(
+        *_cpu_paged_mqa_logits_args(block_size=64, next_n=1)
+    )
+
+    assert reported == [(mod._PAGED_LOGITS_ROUTE_TORCH, 64)]
+
+
+def test_paged_mqa_logits_module_import_failure_is_logged_once(monkeypatch):
+    """A failed AITER import must report the underlying reason, once.
+
+    Silently returning None is how a deployment lands on the slow Torch
+    reference for a reason nobody can recover from the logs.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(
+        mod,
+        "find_spec",
+        lambda name: object() if name == "aiter.ops.triton.pa_mqa_logits" else None,
+    )
+
+    boom = ImportError("libaiter.so: cannot open shared object file")
+
+    def _raise_import_error(name):
+        raise boom
+
+    monkeypatch.setattr(mod.importlib, "import_module", _raise_import_error)
+
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        mod.logger,
+        "warning_once",
+        lambda msg, *args, **kwargs: logged.append((msg, args)),
+    )
+
+    # Bypass the lru_cache so the diagnostic is observable in-test.
+    assert mod.paged_mqa_logits_module.__wrapped__() is None
+
+    assert len(logged) == 1, "import failure must be reported exactly once"
+    msg, args = logged[0]
+    assert "Failed to import AITER paged-MQA logits module" in msg
+    # The actual exception must be recoverable from the log, not just the fact
+    # that something failed.
+    assert boom in args
+
+
+def test_paged_mqa_logits_module_is_cached_so_diagnostic_fires_once(monkeypatch):
+    """The resolver is lru_cached, so a repeated miss logs only on first call."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(mod, "find_spec", lambda name: None)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mod.logger, "warning_once", lambda msg, *a, **k: calls.append(msg)
+    )
+
+    cached = functools.lru_cache(mod.paged_mqa_logits_module.__wrapped__)
+    assert cached() is None
+    assert cached() is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "on_mi3xx,aiter_available,expected_route",
+    [
+        (True, True, "_PAGED_LOGITS_ROUTE_FUSED"),
+        (False, True, "_PAGED_LOGITS_ROUTE_STAGE1"),
+        (False, False, "_PAGED_LOGITS_ROUTE_TORCH"),
+        (True, False, "_PAGED_LOGITS_ROUTE_TORCH"),
+    ],
+)
+@torch.inference_mode()
+def test_paged_mqa_logits_reports_selected_route(
+    monkeypatch, on_mi3xx, aiter_available, expected_route
+):
+    """Each reachable route names itself, so logs distinguish the paths.
+
+    Without AITER the arch is irrelevant: both gfx942 and gfx1151 fall back to
+    the Torch reference.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = (
+        SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+        )
+        if aiter_available
+        else None
+    )
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=on_mi3xx, aiter_module=aiter_module
+    )
+
+    reported: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        mod,
+        "_report_paged_logits_route",
+        lambda route, block_size: reported.append((route, block_size)),
+    )
+
+    # block_size 1 is the supported layout on every route.
+    mod.rocm_fp8_paged_mqa_logits(*_cpu_paged_mqa_logits_args(block_size=1))
+
+    assert reported == [(getattr(mod, expected_route), 1)]
+
+
+def test_report_paged_logits_route_logs_once_with_layout(monkeypatch):
+    """The route diagnostic is deduplicated and names arch, block size, layout.
+
+    Decode calls this per request, so it must not log per request.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        mod.logger, "info_once", lambda msg, *args, **kwargs: logged.append(args)
+    )
+    monkeypatch.setattr(mod, "_GCN_ARCH", "gfx1151")
+
+    mod._report_paged_logits_route(mod._PAGED_LOGITS_ROUTE_TORCH, 1)
+
+    assert logged == [(mod._PAGED_LOGITS_ROUTE_TORCH, "gfx1151", 1, "NORMAL")]
+
+    logged.clear()
+    mod._report_paged_logits_route(mod._PAGED_LOGITS_ROUTE_FUSED, 64)
+    assert logged == [(mod._PAGED_LOGITS_ROUTE_FUSED, "gfx1151", 64, "SHUFFLE")]
+
+
+@pytest.mark.parametrize("block_size", [16, 64, 256])
+@torch.inference_mode()
+def test_paged_mqa_logits_torch_handles_shuffled_layout_off_fused_path(
+    monkeypatch, block_size
+):
+    """Non-fused shuffled layouts use the Torch implementation."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    aiter_module = SimpleNamespace(
+        deepgemm_fp8_paged_mqa_logits=_fake_fused_kernel,
+        deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+    )
+    # on_mi3xx=False keeps us off the fused path in both cases.
+    _stub_paged_logits_dispatch(
+        monkeypatch, mod, on_mi3xx=False, aiter_module=aiter_module
+    )
+
+    called = []
+    monkeypatch.setattr(
+        mod,
+        "fp8_paged_mqa_logits_torch",
+        lambda *args: called.append(args) or torch.empty(0),
+    )
+    args = _cpu_paged_mqa_logits_args(block_size=block_size, next_n=2)
+    result = mod.rocm_fp8_paged_mqa_logits(*args)
+    assert called
+    assert result.numel() == 0
+
+
+@torch.inference_mode()
+def test_paged_mqa_logits_torch_reads_shuffle_layout(monkeypatch):
+    """Torch fallback decodes shuffled values across token and dim tiles."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    fp8_dtype = torch.float8_e4m3fn
+    monkeypatch.setattr(mod.current_platform, "fp8_dtype", lambda: fp8_dtype)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_ON_GFX942", False)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+
+    block_size, dim, heads = 64, 128, 3
+    logical_values = torch.tensor(
+        [
+            [((token + 1) * (lane + 3) % 29 - 14) / 8 for lane in range(dim)]
+            for token in range(block_size)
+        ],
+        dtype=torch.float32,
+    )
+    cache = torch.zeros((1, block_size, 1, dim + 4), dtype=torch.uint8)
+    flat_page = cache.reshape(1, -1)[0]
+    # Build physical bytes independently: writer order is
+    # [token_tile, dim_tile, token_lane, dim_lane].
+    packed_values = logical_values.reshape(
+        block_size // 16, 16, dim // 16, 16
+    ).permute(0, 2, 1, 3).contiguous()
+    flat_page[: block_size * dim] = packed_values.flatten().to(fp8_dtype).view(
+        torch.uint8
+    )
+    scales = torch.linspace(0.25, 1.75, block_size)
+    flat_page[block_size * dim :].view(torch.float32).copy_(scales)
+
+    q = torch.tensor(
+        [
+            [
+                [[((head + 1) * (lane + 1) % 17 - 8) / 4 for lane in range(dim)]
+                 for head in range(heads)]
+            ]
+        ],
+        dtype=torch.float32,
+    ).to(fp8_dtype)
+    weights = torch.tensor([[0.5, 1.25, 2.0]], dtype=torch.float32)
+    logits = mod.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        torch.tensor([block_size], dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        block_size,
+    )
+    quantized_values = logical_values.to(fp8_dtype).to(torch.float32)
+    expected = torch.zeros(block_size, dtype=torch.float32)
+    for token in range(block_size):
+        for head in range(heads):
+            dot = torch.dot(
+                q[0, 0, head].to(torch.float32), quantized_values[token]
+            )
+            expected[token] = expected[token] + torch.relu(dot) * weights[0, head]
+        expected[token] *= scales[token]
+    torch.testing.assert_close(logits[0, :block_size], expected)
+
+
+@torch.inference_mode()
+def test_paged_mqa_logits_torch_reads_multi_token_shuffle_layout(monkeypatch):
+    """Torch fallback reads independently packed speculative shuffled pages."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    fp8_dtype = torch.float8_e4m3fn
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_ON_GFX942", False)
+    monkeypatch.setattr(mod, "_ON_GFX950", False)
+
+    monkeypatch.setattr(mod.current_platform, "fp8_dtype", lambda: fp8_dtype)
+
+    block_size, dim, heads = 64, 128, 2
+    batch_size, next_n, max_model_len = 2, 3, 64
+    context_lens = torch.tensor([[17, 33, 64], [16, 31, 48]], dtype=torch.int32)
+    block_tables = torch.tensor([[4, 1], [7, 3]], dtype=torch.int32)
+    num_pages = 8
+
+    cache = torch.zeros((num_pages, block_size, 1, dim + 4), dtype=torch.uint8)
+    page_values: dict[int, torch.Tensor] = {}
+    for page in block_tables.flatten().unique().tolist():
+        values = torch.tensor(
+            [
+                [((page + 1) * (token + 3) * (lane + 5) % 37 - 18) / 7
+                 for lane in range(dim)]
+                for token in range(block_size)
+            ],
+            dtype=torch.float32,
+        )
+        scales = torch.linspace(0.25 + page / 20, 1.5 + page / 20, block_size)
+        packed_values = values.reshape(4, 16, 8, 16).permute(0, 2, 1, 3).contiguous()
+        flat_page = cache[page, :, 0].reshape(-1)
+        flat_page[: block_size * dim] = packed_values.flatten().to(fp8_dtype).view(
+            torch.uint8
+        )
+        flat_page[block_size * dim :].view(torch.float32).copy_(scales)
+        page_values[page] = values.to(fp8_dtype).to(torch.float32) * scales[:, None]
+
+    q_values = torch.tensor(
+        [
+            [
+                [
+                    [((query + 2) * (token + 1) * (head + 3) * (lane + 1) % 31 - 15)
+                     / 11
+                     for lane in range(dim)]
+                    for head in range(heads)
+                ]
+                for token in range(next_n)
+            ]
+            for query in range(batch_size)
+        ],
+        dtype=torch.float32,
+    )
+    q = q_values.to(fp8_dtype).view(batch_size, next_n, heads, dim)
+    weights = torch.tensor(
+        [[0.5, 1.25], [0.75, 1.5], [1.0, 1.75], [0.6, 1.1], [0.9, 1.3], [1.2, 1.6]],
+        dtype=torch.float32,
+    )
+
+    actual = mod.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0, dtype=torch.int32),
+        max_model_len,
+    )
+
+    expected = torch.full(
+        (batch_size * next_n, max_model_len), float("-inf"), dtype=torch.float32
+    )
+    for batch_idx in range(batch_size):
+        for token_idx in range(next_n):
+            row = batch_idx * next_n + token_idx
+            context_len = int(context_lens[batch_idx, token_idx])
+            query = q[row // next_n, token_idx].float()
+            for position in range(context_len):
+                page_idx = int(block_tables[batch_idx, position // block_size])
+                key = page_values[page_idx][position % block_size]
+                expected[row, position] = sum(
+                    torch.relu(torch.dot(query[head], key)) * weights[row, head]
+                    for head in range(heads)
+                )
+
+    torch.testing.assert_close(actual, expected)
+    for row, context_len in enumerate(context_lens.flatten().tolist()):
+        expected_topk = torch.argsort(expected[row, :context_len], descending=True)[:8]
+        actual_topk = torch.argsort(actual[row, :context_len], descending=True)[:8]
+        torch.testing.assert_close(actual_topk, expected_topk)
+
+
+@pytest.mark.parametrize("block_size", [1, 64, 256])
+@torch.inference_mode()
+def test_paged_mqa_logits_fused_path_accepts_any_block_size(monkeypatch, block_size):
+    """The fused gfx942/gfx950 kernel handles packing, so it stays ungated.
+
+    It receives Preshuffle/KVBlockSize, so gating it would break a correct
+    path.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    seen: list[dict] = []
+
+    def _record_fused(*args, **kwargs):
+        seen.append(kwargs)
+
+    _stub_paged_logits_dispatch(
+        monkeypatch,
+        mod,
+        on_mi3xx=True,
+        aiter_module=SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits=_record_fused,
+            deepgemm_fp8_paged_mqa_logits_stage1=_fake_stage1_kernel,
+        ),
+    )
+
+    mod.rocm_fp8_paged_mqa_logits(*_cpu_paged_mqa_logits_args(block_size=block_size))
+
+    assert len(seen) == 1
+    # The layout is communicated to the kernel, which is why it is safe.
+    assert seen[0]["KVBlockSize"] == block_size
+    assert seen[0]["Preshuffle"] is (block_size > 1)
+
+
+def test_deepseek_v4_indexer_cache_block_size_is_64():
+    """Pin the reachable indexer cache block size for DeepSeek-V4 on ROCm.
+
+    ``DeepseekV4IndexerBackend`` advertises only [256], and the indexer cache
+    spec carries compress_ratio=4, so the KV tensor is built with
+    ``storage_block_size`` = 256 // 4 = 64. block_size > 1 is therefore the
+    normal case, not a hypothetical, which is what makes the guard load-bearing.
+    """
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV4IndexerBackend
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    assert DeepseekV4IndexerBackend.get_supported_kernel_block_sizes() == [256]
+
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        alignment=512,
+    )
+    assert spec.storage_block_size == 64
+
+    # initialize_kv_cache_tensors uses storage_block_size when it diverges
+    # from block_size, so this is the block dim the kernels actually see.
+    assert spec.storage_block_size != spec.block_size
+    shape = DeepseekV4IndexerBackend.get_kv_cache_shape(
+        4, spec.storage_block_size, 1, 132
+    )
+    assert shape[1] == 64

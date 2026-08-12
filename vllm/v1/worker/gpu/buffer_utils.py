@@ -164,7 +164,7 @@ class StagedWriteTensor:
         self._staged_write_contents.extend(x)
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
-    def stage_write_elem(self, index: int, x: int) -> None:
+    def stage_write_elem(self, index: int, x: int | float) -> None:
         assert index >= 0
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(0)

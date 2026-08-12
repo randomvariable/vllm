@@ -1008,3 +1008,319 @@ def test_qwen3_nonstandard_block_size(
         device=device,
         op=op,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sliding-window paged decode: out-of-window KV blocks are skipped.
+#
+# kernel_paged_attention_2d starts its KV loop at
+#     start_block = max(seq_len - SLIDING_WINDOW, 0) // BLOCK_SIZE
+# instead of block 0. The window edge is not necessarily block aligned, so the
+# first included block must still be score-masked at token granularity. These
+# tests pin that boundary arithmetic against a full-attention reference which
+# reads every key and then masks, i.e. the pre-skip behaviour.
+# ---------------------------------------------------------------------------
+
+requires_gpu_triton_paged_decode = pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_rocm()),
+    reason="Triton paged-decode kernel requires a CUDA or ROCm device",
+)
+
+
+def _sliding_window_decode_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seq_lens: list[int],
+    sliding_window: int,
+    num_queries_per_kv: int,
+    scale: float,
+) -> torch.Tensor:
+    """Full-attention decode reference: read every key, then mask.
+
+    This is the pre-optimization semantics, where no block is skipped, so any
+    disagreement means the ``start_block`` arithmetic dropped a key that the
+    window still covers.
+    """
+    outputs = []
+    key_start = 0
+    for i, seq_len in enumerate(seq_lens):
+        k_i = key[key_start : key_start + seq_len].to(torch.float32)
+        v_i = value[key_start : key_start + seq_len].to(torch.float32)
+        key_start += seq_len
+
+        # Decode: the single query token sits at the end of the sequence.
+        q_pos = seq_len - 1
+        k_idx = torch.arange(seq_len, device=query.device)
+        keep = k_idx <= q_pos
+        if sliding_window > 0:
+            keep = keep & (k_idx >= q_pos - sliding_window + 1)
+
+        num_kv_heads = k_i.shape[1]
+        q_i = query[i].to(torch.float32).view(num_kv_heads, num_queries_per_kv, -1)
+
+        logits = torch.einsum("hqd,shd->hqs", q_i, k_i) * scale
+        logits = logits.masked_fill(~keep[None, None, :], float("-inf"))
+        probs = torch.softmax(logits, dim=-1)
+        out_i = torch.einsum("hqs,shd->hqd", probs, v_i)
+        outputs.append(out_i.reshape(-1, out_i.shape[-1]))
+
+    return torch.stack(outputs).to(query.dtype)
+
+
+def _build_decode_kv_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seq_lens: list[int],
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Write every token of every sequence into a paged KV cache.
+
+    Pure decode reads all ``seq_len`` tokens from the cache: there is no
+    chunked-prefill pass to supply the newest token, so unlike
+    ``test_contexted_kv_attention`` the current token is cached too.
+    """
+    max_blocks_per_seq = max(math.ceil(s / block_size) for s in seq_lens)
+    num_blocks = len(seq_lens) * max_blocks_per_seq
+
+    k_cache = torch.zeros(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    v_cache = torch.zeros(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    # Shuffled block ids, so a kernel cannot pass by assuming logical block
+    # order matches physical block order.
+    block_ids = torch.randperm(num_blocks, device=device).to(torch.int32)
+    block_table = block_ids.view(len(seq_lens), max_blocks_per_seq)
+
+    k_flat = k_cache.view(-1, num_kv_heads, head_size)
+    v_flat = v_cache.view(-1, num_kv_heads, head_size)
+
+    key_start = 0
+    for i, seq_len in enumerate(seq_lens):
+        for token in range(seq_len):
+            slot = int(block_table[i, token // block_size]) * block_size + (
+                token % block_size
+            )
+            k_flat[slot].copy_(key[key_start + token])
+            v_flat[slot].copy_(value[key_start + token])
+        key_start += seq_len
+
+    return k_cache, v_cache, block_table
+
+
+def _run_sliding_window_decode(
+    seq_lens: list[int],
+    sliding_window: int,
+    block_size: int,
+    device: str,
+    head_size: int = 64,
+    num_heads: int = 32,
+    num_queries_per_kv: int = 32,
+    dtype: torch.dtype = torch.float16,
+    poison_out_of_window: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one decode step through ``chunked_prefill_paged_decode``.
+
+    ``num_queries_per_kv`` is 32 so that ``use_rocm_custom_paged_attention``
+    rejects the config (it caps the GQA ratio at 16) and the Triton kernel
+    under test is exercised on ROCm as well as CUDA, including for the
+    ``sliding_window == 0`` control case.
+
+    Returns ``(kernel_output, reference_output)``.
+    """
+    set_random_seed(0)
+    torch.set_default_device(device)
+
+    num_seqs = len(seq_lens)
+    num_kv_heads = num_heads // num_queries_per_kv
+    total_kv = sum(seq_lens)
+
+    query = torch.empty(num_seqs, num_heads, head_size, dtype=dtype, device=device)
+    query.uniform_(-1e-3, 1e-3)
+    kv = torch.empty(total_kv, 2, num_kv_heads, head_size, dtype=dtype, device=device)
+    kv.uniform_(-1e-3, 1e-3)
+    key, value = kv.unbind(dim=1)
+
+    scale = float(1.0 / (head_size**0.5))
+    output_ref = _sliding_window_decode_reference(
+        query, key, value, seq_lens, sliding_window, num_queries_per_kv, scale
+    )
+
+    if poison_out_of_window:
+        # Fill the strictly out-of-window prefix with NaN. Those keys cannot
+        # influence the result, so a kernel starting at the window edge never
+        # reads them, while a kernel that loads every block folds 0 * NaN into
+        # the accumulator and returns NaN.
+        assert sliding_window > 0
+        key_start = 0
+        for seq_len in seq_lens:
+            first_in_window = max(seq_len - sliding_window, 0)
+            key[key_start : key_start + first_in_window].fill_(float("nan"))
+            value[key_start : key_start + first_in_window].fill_(float("nan"))
+            key_start += seq_len
+
+    k_cache, v_cache, block_table = _build_decode_kv_cache(
+        key, value, seq_lens, block_size, num_kv_heads, head_size, dtype, device
+    )
+
+    # k_cache [num_blocks, block_size, num_kv_heads, head_size]
+    #   -> [num_blocks, num_kv_heads, head_size // 8, block_size, 8]
+    k_cache = (
+        k_cache.view(-1, block_size, num_kv_heads, head_size // 8, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    # v_cache [num_blocks, block_size, num_kv_heads, head_size]
+    #   -> [num_blocks, num_kv_heads, head_size, block_size]
+    v_cache = (
+        v_cache.view(-1, block_size, num_kv_heads, head_size)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+
+    output = torch.empty_like(query)
+    # One query token per sequence, so max_query_len is 1: context_attention_fwd
+    # is skipped and all KV comes from the paged cache.
+    query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    chunked_prefill_paged_decode(
+        query,
+        key[:num_seqs],
+        value[:num_seqs],
+        output,
+        "auto",
+        k_cache,
+        v_cache,
+        block_table,
+        query_start_loc,
+        seq_lens_t,
+        max(seq_lens),
+        1,
+        k_scale,
+        v_scale,
+        sliding_window=sliding_window,
+    )
+
+    return output, output_ref
+
+
+@requires_gpu_triton_paged_decode
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize(
+    "seq_lens,sliding_window,block_size",
+    [
+        # sliding_window smaller than the block size: start_block must not
+        # round past the window edge.
+        ([64], 8, 32),
+        ([65], 1, 32),
+        ([128], 31, 32),
+        # Window edge not block aligned: the partial first block still needs
+        # the token-granular score mask. An off-by-one hides here.
+        ([100], 33, 32),
+        ([200], 45, 32),
+        ([257], 100, 32),
+        # seq_len at, just below and just above the window boundary.
+        ([64], 64, 32),
+        ([63], 64, 32),
+        ([65], 64, 32),
+        # seq_len <= sliding_window: nothing may be skipped (start_block == 0).
+        ([32], 128, 32),
+        ([96], 4096, 32),
+        # Long decode where most blocks are skipped.
+        ([4096], 256, 32),
+        ([8192], 129, 32),
+        # Mixed batch: per-sequence start_block within one kernel launch.
+        ([37, 4096, 128, 4095], 100, 32),
+    ],
+)
+@torch.inference_mode()
+def test_sliding_window_decode_block_skip_matches_full_attention(
+    seq_lens: list[int],
+    sliding_window: int,
+    block_size: int,
+    device: str,
+) -> None:
+    """Skipping out-of-window KV blocks must not change decode output."""
+    output, output_ref = _run_sliding_window_decode(
+        seq_lens=seq_lens,
+        sliding_window=sliding_window,
+        block_size=block_size,
+        device=device,
+    )
+    torch.testing.assert_close(output, output_ref, atol=1e-4, rtol=0)
+
+
+@requires_gpu_triton_paged_decode
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sliding_window_decode_skips_out_of_window_blocks(device: str) -> None:
+    """The skipped blocks must genuinely never be loaded.
+
+    Poisoning the strictly out-of-window prefix with NaN makes the
+    optimization observable: those keys are score-masked either way, but a
+    kernel that still loads them propagates NaN through ``0 * NaN`` in the
+    accumulator.
+    """
+    seq_lens = [4096]
+    sliding_window = 256
+    block_size = 32
+
+    # Guard that this configuration really does skip most blocks, otherwise
+    # the test would silently stop proving anything.
+    start_block = max(seq_lens[0] - sliding_window, 0) // block_size
+    num_blocks = math.ceil(seq_lens[0] / block_size)
+    assert start_block > 0.9 * num_blocks
+
+    output, output_ref = _run_sliding_window_decode(
+        seq_lens=seq_lens,
+        sliding_window=sliding_window,
+        block_size=block_size,
+        device=device,
+        poison_out_of_window=True,
+    )
+
+    assert not output.isnan().any(), "out-of-window KV blocks were still loaded"
+    torch.testing.assert_close(output, output_ref, atol=1e-4, rtol=0)
+
+
+@requires_gpu_triton_paged_decode
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_global_and_sliding_window_layers_decode(device: str) -> None:
+    """Global layers pass no window and must be unaffected by the skip.
+
+    Mirrors a hybrid model where global and sliding-window layers share a
+    decode batch: the global layer must still attend over the whole context
+    (``start_block == 0``) and must therefore differ from the windowed layer.
+    """
+    seq_lens = [4096, 133]
+    block_size = 32
+    sliding_window = 100
+
+    global_out, global_ref = _run_sliding_window_decode(
+        seq_lens=seq_lens,
+        sliding_window=0,
+        block_size=block_size,
+        device=device,
+    )
+    torch.testing.assert_close(global_out, global_ref, atol=1e-4, rtol=0)
+
+    swa_out, swa_ref = _run_sliding_window_decode(
+        seq_lens=seq_lens,
+        sliding_window=sliding_window,
+        block_size=block_size,
+        device=device,
+    )
+    torch.testing.assert_close(swa_out, swa_ref, atol=1e-4, rtol=0)
+
+    # Fixed seed means identical inputs, so a windowed layer whose output
+    # matched the global layer would mean the window was never applied.
+    assert not torch.allclose(global_out, swa_out, atol=1e-4, rtol=0)

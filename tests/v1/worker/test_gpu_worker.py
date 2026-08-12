@@ -1,17 +1,219 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
+import vllm.v1.worker.gpu_worker as gpu_worker_module
+from vllm.multimodal.video import (
+    PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
+    PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
+    PYNVVIDEOCODEC_MAX_RETAINED_DECODERS,
+    PYNVVIDEOCODEC_VIDEO_BACKEND,
+)
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_gpu_worker_keeps_cuda_warmup_import_lazy(monkeypatch: pytest.MonkeyPatch):
+    # Forkserver preloads this module. Binding kernel_warmup at module scope
+    # imports CUDA-initializing warmup dependencies into the server snapshot.
+    assert gpu_worker_module.kernel_warmup.__module__ == gpu_worker_module.__name__
+
+    run_kernel_warmup = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.warmup.kernel_warmup",
+        SimpleNamespace(kernel_warmup=run_kernel_warmup),
+    )
+    worker = object()
+    gpu_worker_module.kernel_warmup(worker)
+
+    run_kernel_warmup.assert_called_once_with(worker)
+
+
+def _worker_with_mm_config(
+    mm_config: SimpleNamespace,
+    *,
+    api_process_count: int = 1,
+) -> Worker:
+    worker = object.__new__(Worker)
+    worker.model_config = SimpleNamespace(multimodal_config=mm_config)
+    worker.parallel_config = SimpleNamespace(_api_process_count=api_process_count)
+    return worker
+
+
+def _mm_config(
+    *,
+    mm_ipc_gpu_memory_gb: float = 0,
+    video_backend: str | None = None,
+) -> SimpleNamespace:
+    video_kwargs = {} if video_backend is None else {"video_backend": video_backend}
+    return SimpleNamespace(
+        mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,
+        media_io_kwargs={"video": video_kwargs} if video_kwargs else {},
+    )
+
+
+def _pynvvideocodec_decoder_budget(api_process_count: int = 1) -> int:
+    return api_process_count * (
+        PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES * PYNVVIDEOCODEC_MAX_RETAINED_DECODERS
+        + PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES
+    )
+
+
+def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):
+    worker = object.__new__(Worker)
+    calls = []
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "kernel_warmup",
+        lambda warmed_worker: calls.append(warmed_worker),
+    )
+
+    worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == [worker]
+    assert worker._kernel_warmup_complete is True
+
+
+def test_failed_kernel_warmup_is_retryable(monkeypatch: pytest.MonkeyPatch):
+    worker = object.__new__(Worker)
+    calls = 0
+
+    def fail_once(_worker):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(gpu_worker_module, "kernel_warmup", fail_once)
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == 2
+    assert worker._kernel_warmup_complete is True
+
+
+def test_memory_profile_replays_model_after_kernel_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    calls = []
+    worker.device = "cuda:0"
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"),
+    )
+    worker.vllm_config = SimpleNamespace()
+    worker.get_model = lambda: object()
+    worker.get_kv_cache_spec = lambda: object()
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "deepseek_v4_compressor_triton_warmup",
+        lambda *args: calls.append("compressor"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device: calls.append(("reset_peak", device)),
+    )
+
+    worker._profile_model_with_kernel_warmup()
+
+    assert calls == [
+        "profile",
+        "compressor",
+        "kernel_warmup",
+        ("reset_peak", "cuda:0"),
+        "profile",
+    ]
+
+
+@pytest.mark.parametrize("video_backend", [None, "opencv"])
+def test_reserve_mm_ipc_gpu_memory_raw_frame_budget_only(
+    monkeypatch: pytest.MonkeyPatch,
+    video_backend: str | None,
+):
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        "opencv",
+    )
+    worker = _worker_with_mm_config(
+        _mm_config(mm_ipc_gpu_memory_gb=0.25, video_backend=video_backend)
+    )
+
+    assert worker._reserve_mm_ipc_gpu_memory(GiB_bytes) == int(0.75 * GiB_bytes)
+
+
+def test_reserve_mm_ipc_gpu_memory_includes_pynvvideocodec_decoder_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        "opencv",
+    )
+    worker = _worker_with_mm_config(
+        _mm_config(
+            mm_ipc_gpu_memory_gb=0.25,
+            video_backend=PYNVVIDEOCODEC_VIDEO_BACKEND,
+        )
+    )
+    available_bytes = 4 * GiB_bytes
+
+    assert worker._reserve_mm_ipc_gpu_memory(available_bytes) == (
+        available_bytes - int(0.25 * GiB_bytes) - _pynvvideocodec_decoder_budget()
+    )
+
+
+def test_reserve_mm_ipc_gpu_memory_uses_env_video_backend(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        PYNVVIDEOCODEC_VIDEO_BACKEND,
+    )
+    worker = _worker_with_mm_config(_mm_config())
+    available_bytes = 4 * GiB_bytes
+
+    assert worker._reserve_mm_ipc_gpu_memory(available_bytes) == (
+        available_bytes - _pynvvideocodec_decoder_budget()
+    )
+
+
+def test_reserve_mm_ipc_gpu_memory_scales_pynvvideocodec_budget_by_api_servers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        PYNVVIDEOCODEC_VIDEO_BACKEND,
+    )
+    worker = _worker_with_mm_config(_mm_config(), api_process_count=3)
+    available_bytes = 8 * GiB_bytes
+
+    assert worker._reserve_mm_ipc_gpu_memory(available_bytes) == (
+        available_bytes - _pynvvideocodec_decoder_budget(api_process_count=3)
+    )
+
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.

@@ -1,0 +1,42 @@
+# Public llm-d reference. Replace placeholders in a deployment overlay.
+# llm-d provides replica-pool and prefix-aware routing; vLLM owns DSpark.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-v4-flash-dspark
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: deepseek-v4-flash-dspark}
+  template:
+    metadata:
+      labels: {app: deepseek-v4-flash-dspark}
+    spec:
+      serviceAccountName: <REDACTED_SERVICE_ACCOUNT>
+      containers:
+        - name: vllm
+          image: <REDACTED_REGISTRY>/<REDACTED_REPOSITORY>@sha256:<REDACTED_DIGEST>
+          command: [vllm, serve]
+          args: ["<MODEL_ID>", "--tensor-parallel-size=2"]
+          env:
+            - name: VLLM_USE_B12X_MOE
+              value: "1"
+            - name: VLLM_DSPARK_CAPACITY_ENABLE
+              value: "0"
+          ports: [{name: modelserver, containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /health, port: modelserver}
+            periodSeconds: 10
+          resources:
+            requests: {memory: 1Gi}
+            limits: {memory: 4Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-v4-flash-dspark
+  labels:
+    llm-d.ai/inference-service: deepseek-v4-flash-dspark
+spec:
+  selector: {app: deepseek-v4-flash-dspark}
+  ports: [{name: modelserver, port: 8000, targetPort: modelserver}]

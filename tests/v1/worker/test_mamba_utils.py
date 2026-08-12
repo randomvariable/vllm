@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
@@ -152,6 +153,61 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     assert mamba_state_idx == {"keep": 99}
 
 
+def test_partial_prefix_copy_uses_boundary_state_not_stale_tail():
+    """Copy state at boundary 4, without reusing stale state at boundary 6."""
+    cfg = _TestConfig(block_size=4, num_blocks=3, num_layers=1)
+    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
+    conv_state = torch.full(
+        (cfg.num_blocks, cfg.conv_width, cfg.conv_inner_dim), -1.0
+    )
+    temporal_state = torch.full((cfg.num_blocks, cfg.temporal_state_dim), -1.0)
+    conv_state[0].fill_(4.0)
+    temporal_state[0].fill_(4.0)
+    conv_state[1].fill_(6.0)
+    temporal_state[1].fill_(6.0)
+    forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
+    copy_bufs = _make_copy_bufs(cfg, kv_cache_config, torch.device("cpu"))
+    req_state = _make_requests(["req"], [4], [[0, 1, 2]])["req"]
+    input_batch = _make_input_batch(["req"], [1], [0])
+    scheduler_output = _make_postprocess_scheduler_output(
+        ["req"], {"req": 5}
+    )
+    cache_config = MagicMock(enable_prefix_caching=True)
+    source_by_ptr = {
+        conv_state[0].data_ptr(): conv_state[0],
+        temporal_state[0].data_ptr(): temporal_state[0],
+    }
+    destination_by_ptr = {
+        conv_state[2].data_ptr(): conv_state[2],
+        temporal_state[2].data_ptr(): temporal_state[2],
+    }
+
+    def copy_from_metadata(src_ptrs, dst_ptrs, sizes):
+        for src_ptr, dst_ptr, size in zip(src_ptrs, dst_ptrs, sizes):
+            src = source_by_ptr[int(src_ptr)]
+            dst = destination_by_ptr[int(dst_ptr)]
+            assert size == src.numel() * src.element_size()
+            dst.copy_(src)
+
+    with patch("vllm.v1.worker.mamba_utils.batch_memcpy", copy_from_metadata):
+        preprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            cache_config,
+            {},
+            input_batch,
+            {"req": req_state},
+            forward_context,
+            _COPY_FUNCS,
+            copy_bufs,
+        )
+
+    torch.testing.assert_close(conv_state[2], conv_state[0])
+    torch.testing.assert_close(temporal_state[2], temporal_state[0])
+    assert not torch.equal(conv_state[2], conv_state[1])
+    assert not torch.equal(temporal_state[2], temporal_state[1])
+
+
 # -----------------------------------------------------------------------------
 # Golden tests for postprocess_mamba_fused_kernel
 # -----------------------------------------------------------------------------
@@ -174,7 +230,7 @@ class _TestConfig:
     dtype: torch.dtype = torch.float16
 
 
-class _MockCpuGpuBuffer:
+class _MockCpuGpuBuffer(CpuGpuBuffer):
     """Mock CpuGpuBuffer for testing without pinned memory."""
 
     def __init__(self, size: int, dtype: torch.dtype, device: torch.device):
@@ -295,7 +351,7 @@ def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheCo
             (cfg.conv_width, cfg.conv_inner_dim),
             (cfg.temporal_state_dim,),
         ),
-        dtypes=(cfg.dtype, cfg.dtype),
+        dtypes=cast(tuple[torch.dtype], (cfg.dtype, cfg.dtype)),
         mamba_cache_mode="all",
     )
     group = KVCacheGroupSpec(

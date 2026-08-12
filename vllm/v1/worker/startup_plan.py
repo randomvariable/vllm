@@ -131,12 +131,35 @@ def _applicable_kv_cache_memory_bytes(
     return kv_bytes
 
 
+def _startup_plan_disabled(worker: "Worker") -> bool:
+    """Whether startup plans are inapplicable to this worker's boot.
+
+    Plans are the KV-only fast path: applying one sets
+    ``kv_cache_memory_bytes`` and skips memory profiling entirely. An
+    absolute ``--gpu-memory-utilization-gb`` budget is a whole-engine target
+    that profiling is what enforces, so plans are neither applied nor saved
+    while it is active -- saving one would also let a later fractional boot
+    reuse a value measured under different semantics.
+
+    Args:
+        worker: The worker whose cache config selects the memory budget.
+
+    Returns:
+        True when the startup plan must not be applied or saved.
+    """
+    return (
+        not envs.VLLM_ENABLE_STARTUP_PLAN
+        or getattr(worker.cache_config, "gpu_memory_utilization_gb", None) is not None
+    )
+
+
 def maybe_apply_startup_plan(worker: "Worker") -> None:
     """If enabled and ``--kv-cache-memory`` was not set explicitly, apply a
     persisted plan by setting ``worker.cache_config.kv_cache_memory_bytes``.
-    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``."""
+    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``, and never applied while an
+    absolute ``--gpu-memory-utilization-gb`` budget is active."""
     if (
-        not envs.VLLM_ENABLE_STARTUP_PLAN
+        _startup_plan_disabled(worker)
         or worker.cache_config.kv_cache_memory_bytes is not None
     ):
         return
@@ -166,9 +189,10 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
 
 def maybe_save_startup_plan(worker: "Worker", kv_cache_memory_bytes: int) -> None:
     """Atomically persist this boot's profiling result for future boots.
-    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``; failures are logged,
-    never raised."""
-    if not envs.VLLM_ENABLE_STARTUP_PLAN:
+    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``, and never saved while an
+    absolute ``--gpu-memory-utilization-gb`` budget is active; failures are
+    logged, never raised."""
+    if _startup_plan_disabled(worker):
         return
     fingerprint = compute_plan_fingerprint(
         worker.vllm_config, worker.rank, worker.parallel_config.world_size

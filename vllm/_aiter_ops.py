@@ -135,6 +135,7 @@ def is_aiter_found_and_supported() -> bool:
     """Check if AITER library is available and platform supports it.
 
     Checks: platform (ROCm), device arch is CDNA 3 or better, and library existence.
+    Also supports gfx1151 Strix Halo.
     Does NOT check environment variables - that's handled by rocm_aiter_ops.is_enabled().
 
     This function determines if aiter CAN be used, not if it SHOULD be used.
@@ -146,11 +147,16 @@ def is_aiter_found_and_supported() -> bool:
 
     This allows explicit backend selection via attention_config to work even when
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
+
+    gfx1151 (Strix Halo / RDNA3.5) support: AITER's Triton flash-attention,
+    unified-attention, RMSNorm/RoPE, and BF16 MoE kernels have gfx1151 paths
+    (ROCm 7.14). FP8/FP4 and MLA remain gated off per-op (gfx1151 has no FP8
+    tensor cores; MLA is gfx942/gfx950/gfx1250-only).
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import get_cdna_version
+        from vllm.platforms.rocm import get_cdna_version, on_gfx1151
 
-        return get_cdna_version() > 2
+        return get_cdna_version() > 2 or on_gfx1151()
     return False
 
 

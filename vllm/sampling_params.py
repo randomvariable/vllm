@@ -71,9 +71,62 @@ def validate_thinking_token_budget(value: int | float | bool | None) -> int | No
     return value
 
 
+def validate_reasoning_answer_reserve(value: int | float | bool | None) -> int | None:
+    """Validate ``reasoning_answer_reserve``; return ``None`` if unset.
+
+    ``0`` is rejected rather than accepted as a no-op: reserving zero tokens
+    for the answer cannot force a reasoning block to close before the output
+    budget is spent, which is the only thing the parameter exists to do.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)) or not isinstance(value, int):
+        raise VLLMValidationError(
+            "`reasoning_answer_reserve` must be a positive integer or -1 for unset.",
+            parameter="reasoning_answer_reserve",
+            value=value,
+        )
+    if value == -1:
+        return None
+    if value < 1:
+        raise VLLMValidationError(
+            "`reasoning_answer_reserve` must be a positive integer or -1 for unset.",
+            parameter="reasoning_answer_reserve",
+            value=value,
+        )
+    return value
+
+
+def validate_reasoning_marker_penalty(value: float | int | None) -> float | None:
+    """Validate the per-request reasoning marker penalty."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite non-negative float.",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    if not math.isfinite(value) or value < 0:
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite non-negative float.",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    return float(value)
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
+]
+ReasoningMarkerPenalty = Annotated[
+    float | None,
+    BeforeValidator(validate_reasoning_marker_penalty),
+]
+ReasoningAnswerReserve = Annotated[
+    int | None,
+    BeforeValidator(validate_reasoning_answer_reserve),
 ]
 
 
@@ -364,6 +417,37 @@ class SamplingParams(
     skip_reading_prefix_cache: bool | None = None
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
+    reasoning_marker_penalty: ReasoningMarkerPenalty = None
+    """Penalty applied to configured reasoning markers while thinking.
+
+    A marker may span several tokens, in which case the penalty applies to its
+    final token only, and only where the preceding tokens already match, so a
+    shared prefix is not discouraged on its own.
+    """
+    reasoning_answer_reserve: ReasoningAnswerReserve = None
+    """Number of output tokens to reserve for the final answer.
+
+    While the request is inside a reasoning block, the reasoning-end token is
+    forced as soon as ``max_tokens - len(output_tok_ids) <=
+    reasoning_answer_reserve``, so the model always leaves at least this many
+    tokens of the output budget available to write an answer. Unlike
+    ``thinking_token_budget``, which caps reasoning tokens in absolute terms,
+    this couples the cut-off to the remaining output budget.
+
+    The forced close marker is itself emitted from the reserved tokens, so the
+    budget actually left for answer text is
+    ``reasoning_answer_reserve - len(reasoning_end_token_ids)``. Marker length
+    is model-dependent and therefore cannot be validated here; size the reserve
+    with the configured ``reasoning_end_str`` in mind.
+
+    Both parameters are independent force-close triggers and may be combined;
+    whichever fires first wins. ``None`` (or ``-1``) disables the reserve and
+    adds no work to the sampling path. The value must be a positive integer
+    smaller than ``max_tokens`` and must leave room for any ``min_tokens``
+    requirement, otherwise the request is rejected at validation time. When
+    ``max_tokens`` exceeds what the prompt leaves under ``max_model_len``, it
+    is clamped to that prompt-aware cap so the reserve boundary is reachable.
+    """
 
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
@@ -388,6 +472,8 @@ class SamplingParams(
         stop_token_ids: list[int] | None = None,
         bad_words: list[str] | None = None,
         thinking_token_budget: int | None = None,
+        reasoning_marker_penalty: float | None = None,
+        reasoning_answer_reserve: int | None = None,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
@@ -450,6 +536,8 @@ class SamplingParams(
             stop_token_ids=stop_token_ids,
             bad_words=bad_words,
             thinking_token_budget=thinking_token_budget,
+            reasoning_marker_penalty=reasoning_marker_penalty,
+            reasoning_answer_reserve=reasoning_answer_reserve,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -486,6 +574,12 @@ class SamplingParams(
 
         self.thinking_token_budget = validate_thinking_token_budget(
             self.thinking_token_budget
+        )
+        self.reasoning_marker_penalty = validate_reasoning_marker_penalty(
+            self.reasoning_marker_penalty
+        )
+        self.reasoning_answer_reserve = validate_reasoning_answer_reserve(
+            self.reasoning_answer_reserve
         )
 
         if self.stop is None:
@@ -602,6 +696,25 @@ class SamplingParams(
                 f"min_tokens must be less than or equal to "
                 f"max_tokens={self.max_tokens}, got {self.min_tokens}."
             )
+        if self.reasoning_answer_reserve is not None and self.max_tokens is not None:
+            if self.reasoning_answer_reserve >= self.max_tokens:
+                raise VLLMValidationError(
+                    "reasoning_answer_reserve must be less than "
+                    f"max_tokens={self.max_tokens}, got "
+                    f"{self.reasoning_answer_reserve}; otherwise no output "
+                    "budget remains for the reasoning block.",
+                    parameter="reasoning_answer_reserve",
+                    value=self.reasoning_answer_reserve,
+                )
+            if self.min_tokens > self.max_tokens - self.reasoning_answer_reserve:
+                raise VLLMValidationError(
+                    "reasoning_answer_reserve leaves only "
+                    f"{self.max_tokens - self.reasoning_answer_reserve} tokens "
+                    f"before the reserve is reached, which cannot satisfy "
+                    f"min_tokens={self.min_tokens}.",
+                    parameter="reasoning_answer_reserve",
+                    value=self.reasoning_answer_reserve,
+                )
         if self.stream_interval is not None and self.stream_interval < 1:
             raise VLLMValidationError(
                 f"stream_interval must be at least 1, got {self.stream_interval}.",

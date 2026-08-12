@@ -8,8 +8,9 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    prepare_flashinfer_autotune_cache_dir,
+    publish_flashinfer_autotune_cache,
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
@@ -82,6 +83,31 @@ def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
+def _warmup_deepseek_v4_prefill_metadata(worker: "Worker") -> None:
+    if not current_platform.is_cuda():
+        return
+
+    runner = worker.model_runner
+    hf_config = getattr(runner.model_config, "hf_config", None)
+    window_size = int(getattr(hf_config, "sliding_window", 4096) or 4096)
+    max_num_prefills = int(worker.scheduler_config.max_num_seqs)
+
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        warmup_deepseek_v4_prefill_metadata_kernel,
+    )
+
+    launches = warmup_deepseek_v4_prefill_metadata_kernel(
+        runner.device,
+        max_num_prefills=max_num_prefills,
+        window_size=window_size,
+    )
+    if launches:
+        logger.info(
+            "Warmed up DeepSeek V4 prefill metadata kernel with %d launches.",
+            launches,
+        )
+
+
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
@@ -111,6 +137,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
     world = get_world_group()
     is_leader = world.rank_in_group == 0
     cache_path = resolve_flashinfer_autotune_file(runner)
+    prepare_flashinfer_autotune_cache_dir(world, cache_path, is_leader=is_leader)
 
     dummy_run_kwargs = dict(
         num_tokens=num_tokens,
@@ -174,8 +201,9 @@ def _run_flashinfer_sparse_mla_decode_autotune(
         world.barrier()
         return True
 
-    write_flashinfer_autotune_cache(cache_path, tune_results)
-    world.barrier()
+    publish_flashinfer_autotune_cache(
+        world, cache_path, tune_results, is_leader=is_leader
+    )
 
     AutoTuner.get().load_configs(str(cache_path))
     logger.info(
@@ -234,6 +262,7 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
         "Warming up DeepSeek V4 sparse MLA attention for mixed tokens=%s.",
         mixed_tokens,
     )
+    _warmup_deepseek_v4_prefill_metadata(worker)
     mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(worker, mixed_tokens)
     if not mixed_warmup_done:
         if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:

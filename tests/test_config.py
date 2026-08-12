@@ -21,6 +21,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     PoolerConfig,
+    ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -64,6 +65,63 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+def test_auto_breakable_cudagraph_takes_precedence_over_aot(monkeypatch):
+    minimax_model_config = SimpleNamespace(architectures=["MiniMaxM3SparseForCausalLM"])
+    regular_model_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+
+    monkeypatch.delenv("VLLM_USE_AOT_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+
+    assert vllm_config_module._should_auto_enable_breakable_cudagraph(
+        minimax_model_config
+    )
+    assert not vllm_config_module._should_auto_enable_breakable_cudagraph(
+        regular_model_config
+    )
+
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+    assert vllm_config_module._should_auto_enable_breakable_cudagraph(
+        minimax_model_config
+    )
+
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
+    assert vllm_config_module._should_auto_enable_breakable_cudagraph(
+        minimax_model_config
+    )
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    assert not vllm_config_module._should_auto_enable_breakable_cudagraph(
+        minimax_model_config
+    )
+
+
+def test_minimax_auto_breakable_disables_aot_env(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    minimax_model_config = SimpleNamespace(
+        architectures=["MiniMaxM3SparseForCausalLM"],
+    )
+
+    enabled = vllm_config_module._maybe_auto_enable_breakable_cudagraph(
+        minimax_model_config
+    )
+
+    assert enabled
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+    assert os.environ["VLLM_USE_AOT_COMPILE"] == "0"
+    assert envs.VLLM_USE_BREAKABLE_CUDAGRAPH is True
+    assert envs.VLLM_USE_AOT_COMPILE is False
+
+
+def test_v2_model_runner_allows_reasoning_parser_config():
+    config = VllmConfig(reasoning_config=ReasoningConfig(reasoning_parser="kimi_k2"))
+
+    assert (
+        "reasoning budget enforcement"
+        not in config._get_v2_model_runner_unsupported_features()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1777,6 +1835,75 @@ def test_draft_sample_method_gumbel_is_rejected():
             method="ngram",
             num_speculative_tokens=1,
             draft_sample_method="gumbel",
+        )
+
+
+def test_dspark_capacity_config_validation():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        dspark_confidence_threshold=0.25,
+        dspark_budget_frac=0.5,
+        dspark_capacity_verification_mode="mask",
+    )
+    assert speculative_config.dspark_confidence_threshold == 0.25
+    assert speculative_config.dspark_budget_frac == 0.5
+    assert speculative_config.dspark_capacity_verification_mode == "mask"
+    assert (
+        SpeculativeConfig(
+            method="ngram", num_speculative_tokens=1
+        ).dspark_capacity_verification_mode
+        == "varlen"
+    )
+    assert (
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            dspark_capacity_verification_mode="compact",
+        ).dspark_capacity_verification_mode
+        == "varlen"
+    )
+    assert (
+        SpeculativeConfig(
+            method="ngram", num_speculative_tokens=1
+        ).dspark_confidence_threshold
+        == 0.0
+    )
+
+    for threshold in (-0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="dspark_confidence_threshold"):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                dspark_confidence_threshold=threshold,
+            )
+
+    for budget_frac in (0.0, -0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="dspark_budget_frac"):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                dspark_budget_frac=budget_frac,
+            )
+
+    for config_field, value in (
+        ("dspark_confidence_temperature", float("nan")),
+        ("dspark_confidence_temperature", float("inf")),
+        ("dspark_sps_overhead_ms", float("nan")),
+        ("dspark_sps_overhead_ms", float("inf")),
+    ):
+        with pytest.raises(ValueError, match=config_field):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                **{config_field: value},
+            )
+
+    with pytest.raises(ValueError, match="dspark_sps_curve"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            dspark_sps_curve=[(1, float("nan"))],
         )
 
 

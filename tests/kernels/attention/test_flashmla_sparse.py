@@ -4,6 +4,13 @@ import pytest
 import torch
 
 
+def test_deepseek_v4_c128a_active_width_uses_capture_upper_bound():
+    from vllm.models.deepseek_v4.sparse_mla import _get_c128a_active_topk_width
+
+    assert _get_c128a_active_topk_width(16_384, 128, 8_192) == 128
+    assert _get_c128a_active_topk_width(1_048_576, 128, 8_192) == 8_192
+
+
 def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
     from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
 

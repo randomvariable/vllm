@@ -170,6 +170,7 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
         "batched_triton": UnquantizedMoeBackend.BATCHED_TRITON,
         "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+        "b12x": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
         "aiter": UnquantizedMoeBackend.AITER,
     }
     if backend := mapping.get(runner_backend):
@@ -334,8 +335,9 @@ def convert_to_unquantized_kernel_format(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if unquantized_backend == UnquantizedMoeBackend.AITER:
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
-        w13_weight.is_shuffled = True
-        w2_weight.is_shuffled = True
+        w13_weight._shuffled = True
+        w2_weight._shuffled = True
+        return w13_weight, w2_weight
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
         if moe_config.is_act_and_mul:

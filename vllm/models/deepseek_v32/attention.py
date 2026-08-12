@@ -31,14 +31,12 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+
+from .kernels import fused_norm_rope, fused_q
 
 
 class DeepseekV32Indexer(nn.Module):
-    indexer_cache_cls = DeepseekV32IndexerCache
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -57,6 +55,7 @@ class DeepseekV32Indexer(nn.Module):
         self.rope_dim = config.qk_rope_head_dim
         self.q_lora_rank = q_lora_rank
 
+        # No tensor parallel, just replicated.
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.head_dim * self.n_head,
@@ -64,7 +63,8 @@ class DeepseekV32Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-
+        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+        # FP8 wk weights are upcasted to BF16 during loading to keep this fused.
         self.wk_weights_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.head_dim, self.n_head],
@@ -80,8 +80,9 @@ class DeepseekV32Indexer(nn.Module):
         self.quant_block_size = 128
         self.topk_indices_buffer = topk_indices_buffer
 
+        # fp8 naive cache: value in fp8 + fp32 scale per quant_block_size element.
         assert cache_config is not None, "DeepSeek V3.2 indexer requires cache_config"
-        self.k_cache = type(self).indexer_cache_cls(
+        self.k_cache = DeepseekV32IndexerCache(
             head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
@@ -119,7 +120,7 @@ class DeepseekV32Indexer(nn.Module):
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-
+        # Fused wk + weights_proj: one GEMM, then split.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
@@ -130,13 +131,14 @@ class DeepseekV32Indexer(nn.Module):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-
+        # RoPE (NeoX) can introduce extra leading dims; reshape back to flat.
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
         k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
+        # Only quant q here; k quant is fused with cache insertion.
         q = q.view(-1, self.head_dim)
         q_fp8, q_scale = per_token_group_quant_fp8(
             q,
@@ -156,10 +158,9 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32Attention(MLAAttention):
+    # Narrow the base's broadly-typed `indexer` to the concrete type so the
+    # `if self.indexer is not None` guards below type-check its attributes.
     indexer: "DeepseekV32Indexer | None"
-    indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
-
-    require_fp8_kv_cache: bool = True
 
     def __init__(
         self,
@@ -167,7 +168,6 @@ class DeepseekV32Attention(MLAAttention):
         config: DeepseekV2Config | DeepseekV3Config,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
-        attn_backend: "type | None" = None,
     ) -> None:
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -200,6 +200,11 @@ class DeepseekV32Attention(MLAAttention):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             scaling = scaling * mscale * mscale
 
+        # DSA "shared indexer" pattern: only some layers carry an indexer; the
+        # rest reuse the top-k written by the previous indexer layer into the
+        # shared topk_indices_buffer. DeepSeek-V3.2 builds it on every layer
+        # (index_topk_freq defaults to 1); GLM-5.2 uses index_topk_freq=4 so
+        # only layers [0,1,2,6,10,...] (+ MTP) carry one.
         layer_id = extract_layer_index(prefix)
         index_topk_freq = getattr(config, "index_topk_freq", 1)
         index_topk_pattern = getattr(config, "index_topk_pattern", None)
@@ -212,10 +217,12 @@ class DeepseekV32Attention(MLAAttention):
             skip_topk = index_topk_pattern[layer_id] == "S"
         else:
             skip_topk = False
-
+        # MTP/nextn layers always build a full indexer (they toggle at runtime).
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
 
+        # Build kv_b_proj + indexer first; they are passed to MLAAttention.__init__
+        # (which runs nn.Module.__init__ and registers them).
         kv_b_proj = ColumnParallelLinear(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
@@ -225,7 +232,7 @@ class DeepseekV32Attention(MLAAttention):
         )
         indexer = None
         if not skip_topk or is_mtp_layer:
-            indexer = type(self).indexer_cls(
+            indexer = DeepseekV32Indexer(
                 vllm_config,
                 config,
                 hidden_size,
@@ -236,6 +243,8 @@ class DeepseekV32Attention(MLAAttention):
                 prefix=f"{prefix}.indexer",
             )
 
+        # Set up the MLA engine (impl, KV cache, scales, backend, registration,
+        # and process_weights_after_loading) via the MLAAttention base.
         super().__init__(
             num_heads=num_local_heads,
             scale=scaling,
@@ -251,41 +260,41 @@ class DeepseekV32Attention(MLAAttention):
             use_sparse=True,
             indexer=indexer,
             topk_indices_buffer=topk_indices_buffer,
-            attn_backend=attn_backend,
         )
 
         self.num_local_heads = num_local_heads
         self.qk_head_dim = qk_head_dim
         self.indexer = indexer
         self.topk_indices_buffer = topk_indices_buffer
-
+        # Runtime toggle for index_share_for_mtp_iteration: MTP draft step 0
+        # computes the top-k, steps 1+ set this True to reuse it.
         self.skip_topk = False
-        enable_short_prefill_scoring_skip = (
-            not is_mtp_layer
-            and not skip_topk
-            and not self.use_pcp
-            and current_platform.is_cuda()
+        # Fused fp8 paths: Triton fused norm/rope/cache + fused-q. Two layouts,
+        # picked by the sparse MLA backend's query support:
+        #   * supports_quant_query_input (FlashInfer sparse, SM100): per-tensor
+        #     fp8 cache + a single packed fp8 MQA query.
+        #   * not supported (FlashMLA sparse, SM90/SM100): fp8_ds_mla cache
+        #     (per-128 block-scaled fp8 NoPE + unquantized bf16 RoPE) + a bf16
+        #     (ql_nope, q_pe) query tuple. FA3 cannot mix a bf16 query with an
+        #     fp8 KV cache, so FlashMLA (which dequantizes internally) is used.
+        #     FlashMLA sparse runs on both Hopper and Blackwell, so this is the
+        #     only DSA path on SM90 and an opt-in alternative on SM100.
+        assert is_quantized_kv_cache(self.kv_cache_dtype), (
+            "deepseek_v32 (nvidia) requires an fp8 KV cache served by a sparse "
+            "MLA backend. Launch with --kv-cache-dtype fp8 (FlashInfer sparse) "
+            "or --kv-cache-dtype fp8_ds_mla (FlashMLA sparse)."
         )
-        self._dense_mha_metadata_layer_name = (
-            self.layer_name if enable_short_prefill_scoring_skip else ""
-        )
-
-        if self.require_fp8_kv_cache:
-            assert is_quantized_kv_cache(self.kv_cache_dtype), (
-                "deepseek_v32 (nvidia) requires an fp8 KV cache served by a sparse "
-                "MLA backend. Launch with --kv-cache-dtype fp8 (FlashInfer sparse) "
-                "or --kv-cache-dtype fp8_ds_mla (FlashMLA sparse)."
+        self._fp8_query = self.impl.supports_quant_query_input
+        if not self._fp8_query:
+            assert self.kv_cache_dtype == "fp8_ds_mla", (
+                "deepseek_v32 (nvidia) on a bf16-query sparse MLA backend "
+                "(FlashMLA sparse) requires the fp8_ds_mla KV cache layout. "
+                "Launch with --kv-cache-dtype fp8_ds_mla."
             )
-            self._fp8_query = self.impl.supports_quant_query_input
-            if not self._fp8_query:
-                assert self.kv_cache_dtype == "fp8_ds_mla", (
-                    "deepseek_v32 (nvidia) on a bf16-query sparse MLA backend "
-                    "(FlashMLA sparse) requires the fp8_ds_mla KV cache layout. "
-                    "Launch with --kv-cache-dtype fp8_ds_mla."
-                )
-
-            self._fp8_kv_needs_view = self.kv_cache_dtype != "fp8_ds_mla"
-
+        # The paged KV cache is stored as uint8 and viewed as fp8 for the decode
+        # (per-tensor fp8). The fp8_ds_mla layout is consumed as raw bytes.
+        self._fp8_kv_needs_view = self.kv_cache_dtype != "fp8_ds_mla"
+        # GLM-5.2 uses interleaved indexer RoPE; DeepSeek-V3.2 uses NeoX.
         self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
 
         # Remaining MLA projections (registered on this module).
@@ -304,7 +313,9 @@ class DeepseekV32Attention(MLAAttention):
             prefix=f"{prefix}.q_b_proj",
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=config.rms_norm_eps)
-
+        # reduce_results=False: the attention all-reduce is fused with the
+        # following post_attention_layernorm in the decoder layer via
+        # fused_allreduce_rms_norm.
         self.o_proj = RowParallelLinear(
             num_heads * v_head_dim,
             hidden_size,
@@ -353,6 +364,27 @@ class DeepseekV32Attention(MLAAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        self._fused_attention(
+            positions, q_c, kv_c, k_pe, index_k, index_weights, output
+        )
+        return self.o_proj(output)[0]
+
+    @eager_break_during_capture
+    def _fused_attention(
+        self,
+        positions: torch.Tensor,
+        q_c: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        index_k: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        # One eager break for the whole attention. In FULL cudagraph mode (pure
+        # decode) this decorator is a no-op, so everything here is captured; in
+        # PIECEWISE (prefill) it runs eagerly. The cache writes, sparse indexer,
+        # and forward_mqa all depend on per-step metadata and must not be split
+        # out (PIECEWISE capture would otherwise miss them).
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         if isinstance(attn_metadata_raw, dict):
@@ -366,7 +398,10 @@ class DeepseekV32Attention(MLAAttention):
         assert isinstance(slot_mapping, dict)
         mla_slot = slot_mapping.get(self.layer_name)
 
-        if self.indexer is not None and not self.skip_topk:
+        # index_k is None when skip_topk (MTP draft steps 1+ under
+        # index_share_for_mtp_iteration): treat this forward as a shared
+        # layer so the step-0 top-k is reused instead of cleared/recomputed.
+        if self.indexer is not None and index_k is not None:
             has_indexer = True
             indexer_k_norm_w = self.indexer.k_norm.weight
             indexer_k_norm_bias = self.indexer.k_norm.bias
@@ -424,7 +459,7 @@ class DeepseekV32Attention(MLAAttention):
         q_nope = q_nope.transpose(0, 1)
         ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
 
-        if self.indexer is not None and not self.skip_topk:
+        if self.indexer is not None and has_indexer:
             index_q = self.indexer.wq_b(q_c)[0]
             index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
         else:
@@ -446,27 +481,7 @@ class DeepseekV32Attention(MLAAttention):
             quantize_mqa=self._fp8_query,
         )
 
-        self._sparse_indexer_and_attn(
-            q_c,
-            index_q_fp8,
-            index_weights_out,
-            ql_nope,
-            mqa_q,
-            output,
-        )
-        return self.o_proj(output)[0]
-
-    @eager_break_during_capture
-    def _sparse_indexer_and_attn(
-        self,
-        q_c: torch.Tensor,
-        index_q_fp8: torch.Tensor | None,
-        index_weights_out: torch.Tensor | None,
-        ql_nope: torch.Tensor,
-        mqa_q: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        if self.indexer is not None and not self.skip_topk:
+        if self.indexer is not None and has_indexer:
             sparse_attn_indexer(
                 q_c,
                 self.indexer.k_cache.prefix,
@@ -482,21 +497,11 @@ class DeepseekV32Attention(MLAAttention):
                 self.indexer.max_model_len,
                 self.indexer.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=True,
-                use_pcp=False,
-                dense_mha_metadata_layer_name=self._dense_mha_metadata_layer_name,
-                use_fp4_cache=False,
+                True,  # skip_k_cache_insert
+                False,  # use_fp4_cache
                 # fused_norm_rope already cleared the topk buffer this forward.
                 skip_topk_buffer_clear=True,
             )
-
-        attn_metadata_raw = get_forward_context().attn_metadata
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.layer_name)
-        elif isinstance(attn_metadata_raw, list):
-            attn_metadata = attn_metadata_raw[0].get(self.layer_name)
-        else:
-            attn_metadata = attn_metadata_raw
 
         if attn_metadata is None:
             output.zero_()
@@ -512,14 +517,12 @@ class DeepseekV32Attention(MLAAttention):
                 :num_actual
             ]
         else:
+            # FlashMLA sparse: bf16 (ql_nope, q_pe) tuple. mqa_q is the RoPE'd
+            # q_pe; ql_nope is consumed directly.
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
         attn_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
-
-        # NOTE(woosuk): While the below does not need to be in the eager region,
-        # we put it here to avoid copying the attention output. Move this back to the
-        # captured region once forward_mqa supports `out` argument.
         x = attn_out.view(
             num_actual, self.num_local_heads, self.kv_lora_rank
         ).transpose(0, 1)

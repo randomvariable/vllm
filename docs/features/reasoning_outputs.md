@@ -317,6 +317,106 @@ for output in outputs:
     print("text:", output.outputs[0].text)
 ```
 
+## Answer Reserve
+
+`reasoning_answer_reserve` is a per-request sampling parameter that reserves a
+slice of the output budget for the final answer. While the request is inside a
+reasoning block, vLLM forces `reasoning_end_str` as soon as
+
+```text
+max_tokens - tokens_generated <= reasoning_answer_reserve
+```
+
+so the model always exits the reasoning block with at least
+`reasoning_answer_reserve` tokens left to write an answer. Without it, a
+reasoning model that never converges can consume all of `max_tokens` inside the
+thinking block and return `finish_reason="length"` with no usable answer.
+
+Use it when the failure you care about is "spent the whole budget thinking and
+emitted nothing". It expresses that intent directly and is portable across
+prompt lengths and `max_tokens` values, because the trigger is relative to the
+remaining output budget rather than an absolute count.
+
+### Relationship to `thinking_token_budget`
+
+Both parameters drive the same force-close path, but from different triggers:
+
+| Parameter | Trigger | Expresses |
+|-----------|---------|-----------|
+| `thinking_token_budget` | absolute count of reasoning tokens | "think for at most N tokens" |
+| `reasoning_answer_reserve` | remaining output budget | "always leave N tokens for the answer" |
+
+They are independent and are **not** mutually exclusive. When both are set,
+whichever condition is reached first closes the reasoning block; the other has
+no further effect for that block. Setting only one is the common case.
+
+The reserve costs nothing when reasoning terminates naturally: if the model
+emits `reasoning_end_str` before the boundary, the reserve never fires, and it
+does not re-trigger while the model is writing the answer. Leaving the
+parameter unset (or `-1`) adds no work to the sampling path.
+
+### What the reserve actually buys
+
+The forced close marker is emitted from the reserved tokens, so the budget left
+for answer *text* is `reasoning_answer_reserve` minus the token length of the
+configured `reasoning_end_str`. A single-token `</think>` costs one token; a
+longer phrase such as
+`"I have to give the solution based on the thinking directly now.</think>"`
+costs more. Marker length is model- and configuration-dependent and therefore
+cannot be validated for you — size the reserve with your configured
+`reasoning_end_str` in mind.
+
+### Validation
+
+`reasoning_answer_reserve` must be a positive integer, must be strictly less
+than `max_tokens`, and must leave room for `min_tokens` — that is,
+`min_tokens <= max_tokens - reasoning_answer_reserve`. A reserve that cannot be
+satisfied is a configuration error and fails closed at request validation
+rather than being silently adjusted at sample time.
+
+`0` is rejected rather than accepted as a no-op: reserving zero tokens cannot
+force a reasoning block to close before the output budget is spent, which is
+the only thing the parameter exists to do. Use `-1` or omit the field to
+disable the feature.
+
+Because the reserve boundary is expressed relative to `max_tokens` while the
+request is independently length-capped at `max_model_len`, a request carrying a
+reserve has its `max_tokens` clamped to `max_model_len - prompt_length`. Without
+that clamp, an explicitly supplied oversized `max_tokens` would place the
+boundary at an output position the request never reaches, and the reserve would
+silently never fire. If clamping makes the reserve unsatisfiable, the request is
+rejected.
+
+### Online Serving
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      { "role": "user", "content": "9.11 and 9.8, which is greater?" }
+    ],
+    "max_tokens": 2048,
+    "reasoning_answer_reserve": 512
+  }'
+```
+
+### Offline Inference
+
+```python
+sampling_params = SamplingParams(max_tokens=2048, reasoning_answer_reserve=512)
+```
+
+!!! warning "Tool calls"
+    The force-close path does not treat a tool-call marker as an implicit
+    reasoning end, so a forced `reasoning_end_str` can currently be injected in
+    the middle of tool-call arguments (upstream issue #44676). This affects
+    `thinking_token_budget` and `reasoning_answer_reserve` equally. If your
+    workload emits tool calls from inside the reasoning block, size the reserve
+    so the boundary is unlikely to land mid-call, or leave it unset until the
+    upstream fix lands.
+
 ## Automatic `enable_thinking` Activation
 
 Some models (such as Gemma 4, DeepSeek-V4-Pro and IBM Granite 3.2) require `enable_thinking: true` in their chat template kwargs to activate thinking mode — without it, reasoning tokens are never generated regardless of other settings.

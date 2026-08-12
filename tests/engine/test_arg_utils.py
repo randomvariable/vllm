@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
@@ -9,7 +10,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CacheConfig,
+    CompilationConfig,
+    ModelConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -223,6 +230,43 @@ def test_jit_monitor_mode_arg(mode):
     engine_args = EngineArgs(model="test", jit_monitor_mode=mode)
     assert engine_args.jit_monitor_mode == mode
     assert engine_args.create_observability_config().jit_monitor_mode == mode
+
+
+def test_dspark_capacity_verification_mode_arg():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--spec-method",
+            "ngram",
+            "--spec-tokens",
+            "1",
+            "--dspark-capacity-verification-mode",
+            "mask",
+        ]
+    )
+
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.dspark_capacity_verification_mode == "mask"
+    speculative_config = engine_args.create_speculative_config(None, None)
+    assert speculative_config is not None
+    assert speculative_config.dspark_capacity_verification_mode == "mask"
+
+
+def test_dspark_capacity_verification_mode_conflicts_with_speculative_config():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--speculative-config",
+            '{"method":"ngram","num_speculative_tokens":1,'
+            '"dspark_capacity_verification_mode":"mask"}',
+            "--dspark-capacity-verification-mode",
+            "varlen",
+        ]
+    )
+
+    engine_args = EngineArgs.from_cli_args(args)
+    with pytest.raises(ValueError, match="dspark_capacity_verification_mode"):
+        engine_args.create_speculative_config(None, None)
 
 
 def test_hf_token_get_kwargs():
@@ -467,6 +511,19 @@ def test_attention_config():
     engine_args = EngineArgs.from_cli_args(args)
     with pytest.raises(ValueError, match="mutually exclusive"):
         engine_args.create_engine_config()
+
+
+def test_b12x_virtual_tp_cli_args_removed():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--virtual-tp-sharding", "b12x-padded"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-allow-odd-tp"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-attention-head-alignment", "8"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-moe-intermediate-alignment", "32"])
 
 
 def test_prefix_cache_default():
@@ -886,4 +943,125 @@ class TestDpDeviceIdSharding:
         with pytest.raises(ValueError, match="needs devices"):
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
+            )
+
+
+class TestGpuMemoryBudget:
+    """The absolute GiB GPU-memory budget (`--gpu-memory-utilization-gb`).
+
+    It is an opt-in alternative to the fractional
+    `--gpu-memory-utilization`, aimed at unified-memory devices where a
+    fraction of total device memory is a poor control. The two are
+    mutually exclusive at every public boundary, with no precedence rule
+    and no silent discard.
+    """
+
+    @staticmethod
+    def _cache_config(*cli_args: str) -> CacheConfig:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = parser.parse_args(["--model", "facebook/opt-125m", *cli_args])
+        assert args is not None
+        return EngineArgs.from_cli_args(args).create_engine_config().cache_config
+
+    def test_no_flags_resolves_default_fraction(self):
+        """Neither control set keeps the historical 0.92 fraction."""
+        cache_config = self._cache_config()
+        assert cache_config.gpu_memory_utilization == 0.92
+        assert cache_config.gpu_memory_utilization_gb is None
+
+    def test_fractional_cli(self):
+        cache_config = self._cache_config("--gpu-memory-utilization", "0.5")
+        assert cache_config.gpu_memory_utilization == 0.5
+        assert cache_config.gpu_memory_utilization_gb is None
+
+    @pytest.mark.parametrize("value", ["40", "40.5", "0.5"])
+    def test_absolute_cli(self, value):
+        """Absolute budgets accept fractional GiB and leave the fraction unset."""
+        cache_config = self._cache_config("--gpu-memory-utilization-gb", value)
+        assert cache_config.gpu_memory_utilization_gb == float(value)
+        assert cache_config.gpu_memory_utilization is None
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+    def test_absolute_cli_rejects_non_positive_and_non_finite(self, value):
+        with pytest.raises(Exception):  # noqa: B017 - pydantic/argparse error
+            self._cache_config("--gpu-memory-utilization-gb", value)
+
+    def test_both_budget_flags_rejected(self):
+        """Mutually exclusive at the CLI, including an explicit default value."""
+        for fraction in ("0.5", "0.92"):
+            with pytest.raises(SystemExit):
+                self._cache_config(
+                    "--gpu-memory-utilization",
+                    fraction,
+                    "--gpu-memory-utilization-gb",
+                    "40",
+                )
+
+    def test_absolute_with_explicit_kv_cache_memory_rejected(self):
+        """Explicit KV sizing skips profiling, so it cannot enforce a
+        whole-engine budget."""
+        with pytest.raises(ValueError, match="gpu_memory_utilization_gb"):
+            self._cache_config(
+                "--gpu-memory-utilization-gb",
+                "40",
+                "--kv-cache-memory-bytes",
+                str(8 * 1024**3),
+            )
+
+    def test_fraction_with_explicit_kv_cache_memory_still_allowed(self):
+        """Historical fraction + explicit KV behaviour is unchanged."""
+        cache_config = self._cache_config(
+            "--gpu-memory-utilization",
+            "0.5",
+            "--kv-cache-memory-bytes",
+            str(8 * 1024**3),
+        )
+        assert cache_config.gpu_memory_utilization == 0.5
+        assert cache_config.kv_cache_memory_bytes == 8 * 1024**3
+
+    def test_python_engine_args_mirror_cli(self):
+        """EngineArgs used directly (no CLI) has the same semantics."""
+        assert (
+            EngineArgs(model="facebook/opt-125m")
+            .create_engine_config()
+            .cache_config.gpu_memory_utilization
+            == 0.92
+        )
+
+        absolute = (
+            EngineArgs(model="facebook/opt-125m", gpu_memory_utilization_gb=40.0)
+            .create_engine_config()
+            .cache_config
+        )
+        assert absolute.gpu_memory_utilization_gb == 40.0
+        assert absolute.gpu_memory_utilization is None
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            EngineArgs(
+                model="facebook/opt-125m",
+                gpu_memory_utilization=0.92,
+                gpu_memory_utilization_gb=40.0,
+            ).create_engine_config()
+
+    def test_llm_forwards_absolute_budget(self):
+        """LLM.__init__ forwards both controls with CLI-identical semantics."""
+        from vllm.entrypoints.llm import LLM
+
+        signature = inspect.signature(LLM.__init__)
+        assert signature.parameters["gpu_memory_utilization"].default is None
+        assert signature.parameters["gpu_memory_utilization_gb"].default is None
+
+    def test_absolute_budget_flag_is_in_a_mutually_exclusive_group(self):
+        """argparse rejects the pair at parse time, before CacheConfig runs."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "--model",
+                    "facebook/opt-125m",
+                    "--gpu-memory-utilization",
+                    "0.5",
+                    "--gpu-memory-utilization-gb",
+                    "40",
+                ]
             )

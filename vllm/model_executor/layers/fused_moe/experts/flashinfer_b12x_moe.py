@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+from threading import Lock
 from typing import Any
+from weakref import WeakValueDictionary
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -25,6 +29,52 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+
+@dataclass(frozen=True)
+class _B12xWrapperKey:
+    owner_id: int
+    num_experts: int
+    top_k: int
+    hidden_size: int
+    intermediate_size: int
+    max_num_tokens: int
+    num_local_experts: int
+    output_dtype: torch.dtype
+    device: str
+    activation: str
+    swiglu_alpha: float
+    swiglu_beta: float
+    swiglu_limit: float | None
+
+
+_B12X_WRAPPERS: WeakValueDictionary[_B12xWrapperKey, Any] = WeakValueDictionary()
+_B12X_WRAPPERS_LOCK = Lock()
+
+
+def _get_b12x_wrapper(key: _B12xWrapperKey) -> Any:
+    with _B12X_WRAPPERS_LOCK:
+        wrapper = _B12X_WRAPPERS.get(key)
+        if wrapper is None:
+            from flashinfer.fused_moe import B12xMoEWrapper
+
+            wrapper = B12xMoEWrapper(
+                num_experts=key.num_experts,
+                top_k=key.top_k,
+                hidden_size=key.hidden_size,
+                intermediate_size=key.intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=key.max_num_tokens,
+                num_local_experts=key.num_local_experts,
+                output_dtype=key.output_dtype,
+                device=key.device,
+                activation=key.activation,
+                swiglu_alpha=key.swiglu_alpha,
+                swiglu_beta=key.swiglu_beta,
+                swiglu_limit=key.swiglu_limit,
+            )
+            _B12X_WRAPPERS[key] = wrapper
+        return wrapper
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -47,6 +97,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         MoEActivation.SILU: "silu",
         MoEActivation.GELU_TANH: "gelu_tanh",
         MoEActivation.RELU2_NO_MUL: "relu2",
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE: "swigluoai_uninterleave",
     }
 
     def __init__(
@@ -60,22 +111,19 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         )
         self.out_dtype = moe_config.in_dtype
         self.num_local_experts = moe_config.num_local_experts
-        self.ep_rank = moe_config.moe_parallel_config.ep_rank
-        # FC2 input scale tensor bound in process_weights_after_loading: the
-        # calibrated (now-zeroed) a2_gscale for static-quant checkpoints, or
-        # a synthesized uniform-1.0 tensor for W4A16 checkpoints that lack
-        # one. Holding it on the instance keeps apply() alloc-free.
-        self._fc2_input_scale: torch.Tensor | None = None
-
-        # Shape params for B12xMoEWrapper construction.
         self.global_num_experts = moe_config.num_experts
         self.topk = moe_config.experts_per_token
         self.hidden_dim = moe_config.hidden_dim
         self.intermediate_size_per_partition = (
             moe_config.intermediate_size_per_partition
         )
-        self.max_num_tokens = moe_config.max_num_tokens
-        self.local_expert_offset = self.ep_rank * self.num_local_experts
+        self.max_num_tokens = moe_config.max_num_tokens * moe_config.dp_size
+        self.device = str(torch.device(moe_config.device))
+        # FC2 input scale tensor bound in process_weights_after_loading: the
+        # calibrated (now-zeroed) a2_gscale for static-quant checkpoints, or
+        # a synthesized uniform-1.0 tensor for W4A16 checkpoints that lack
+        # one. Holding it on the instance keeps apply() alloc-free.
+        self._fc2_input_scale: torch.Tensor | None = None
 
         activation = moe_config.activation
         if activation not in self._ACTIVATION_MAP:
@@ -86,8 +134,64 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             )
         self._activation_str = self._ACTIVATION_MAP[activation]
 
-        # Lazily created on first apply() call.
-        self._wrapper: Any | None = None
+        self._swiglu_alpha = getattr(quant_config, "gemm1_alpha", None)
+        if self._swiglu_alpha is None:
+            self._swiglu_alpha = getattr(moe_config, "swiglu_alpha", None)
+        self._swiglu_alpha = (
+            1.0 if self._swiglu_alpha is None else self._swiglu_alpha
+        )
+        self._swiglu_beta = getattr(quant_config, "gemm1_beta", None)
+        if self._swiglu_beta is None:
+            self._swiglu_beta = getattr(moe_config, "swiglu_beta", None)
+        self._swiglu_beta = 0.0 if self._swiglu_beta is None else self._swiglu_beta
+
+        # A SwiGLU clamp limit is expressed through the kernel's
+        # ``swigluoai_uninterleave`` activation, the only gated variant that
+        # honours ``swiglu_limit``. With swiglu_alpha=1.0/swiglu_beta=0.0 it
+        # reduces to silu(clamp(gate)) * clamp(up), matching the reference
+        # ``silu_and_mul_with_clamp`` op. Plain "silu" ignores the limit, so
+        # selecting it here would silently drop the clamp.
+        self._swiglu_limit = self.quant_config.gemm1_clamp_limit
+        if self._swiglu_limit is None:
+            self._swiglu_limit = moe_config.swiglu_limit
+        if self._swiglu_limit is not None:
+            if activation not in (
+                MoEActivation.SILU,
+                MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            ):
+                raise ValueError(
+                    f"FlashInferB12xExperts cannot apply a SwiGLU clamp limit "
+                    f"to activation {activation!r}; only "
+                    f"{MoEActivation.SILU!r} is supported."
+                )
+            self._activation_str = "swigluoai_uninterleave"
+        elif activation is MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            raise ValueError(
+                "FlashInferB12xExperts requires a SwiGLU clamp limit for "
+                f"activation {activation!r}."
+            )
+        if activation is MoEActivation.SILU:
+            self._swiglu_alpha = 1.0
+            self._swiglu_beta = 0.0
+
+        self._wrapper = _get_b12x_wrapper(
+            _B12xWrapperKey(
+                owner_id=id(get_current_vllm_config_or_none()),
+                num_experts=self.global_num_experts,
+                top_k=self.topk,
+                hidden_size=self.hidden_dim,
+                intermediate_size=self.intermediate_size_per_partition,
+                max_num_tokens=self.max_num_tokens,
+                num_local_experts=self.num_local_experts,
+                output_dtype=self.out_dtype,
+                device=self.device,
+                activation=self._activation_str,
+                swiglu_alpha=self._swiglu_alpha,
+                swiglu_beta=self._swiglu_beta,
+                swiglu_limit=self._swiglu_limit,
+            )
+        )
+
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
 
@@ -193,6 +297,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             MoEActivation.SILU,
             MoEActivation.GELU_TANH,
             MoEActivation.RELU2_NO_MUL,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         )
 
     @staticmethod
@@ -219,7 +324,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # b12x_fused_moe manages its own internal workspace.
+        # B12xMoEWrapper manages its own internal workspace.
         workspace1 = (1,)
         workspace2 = (0,)
         output_shape = (M, K)
@@ -231,24 +336,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # quantization internally.  Returning True prevents the modular kernel
         # from pre-quantizing activations.
         return True
-
-    def _ensure_wrapper(self) -> None:
-        """Lazily create B12xMoEWrapper on first use."""
-        if self._wrapper is not None:
-            return
-
-        from flashinfer.fused_moe import B12xMoEWrapper
-
-        self._wrapper = B12xMoEWrapper(
-            num_experts=self.global_num_experts,
-            top_k=self.topk,
-            hidden_size=self.hidden_dim,
-            intermediate_size=self.intermediate_size_per_partition,
-            use_cuda_graph=True,
-            max_num_tokens=self.max_num_tokens,
-            num_local_experts=self.num_local_experts,
-            activation=self._activation_str,
-        )
 
     def apply(
         self,
@@ -281,12 +368,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             "process_weights_after_loading must run before FlashInferB12xExperts.apply"
         )
 
-        self._ensure_wrapper()
-        wrapper = self._wrapper
-        assert wrapper is not None
-
-        wrapper_output = wrapper.run(
+        wrapper_output = self._wrapper.run(
             x=hidden_states,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,
             w1_alpha=self.g1_alphas,
@@ -294,7 +379,5 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_sf_mma,
             w2_alpha=self.g2_alphas,
-            token_selected_experts=topk_ids.to(torch.int32),
-            token_final_scales=topk_weights,
         )
         output.copy_(wrapper_output)
