@@ -394,7 +394,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       ca-certificates curl git gcc g++ python3-dev \
       cuda-nvcc-13-3 cuda-cudart-dev-13-3 \
       libibverbs1 librdmacm1 libnuma1 libgomp1 \
-      libucx0 python3 python3-pip && \
+      libucx0 python3 python3-pip libmimalloc-dev && \
     useradd --create-home --uid 10001 --shell /usr/sbin/nologin vllm
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages uv
@@ -457,6 +457,7 @@ LABEL org.opencontainers.image.title="vllm-spark-cross-runtime" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+ENV LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libmimalloc.so.2"
 USER vllm
 WORKDIR /opt/vllm
 ENTRYPOINT ["vllm"]
