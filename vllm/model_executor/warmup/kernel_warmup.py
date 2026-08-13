@@ -350,6 +350,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
             warmed_dcp_a2a,
         )
 
+    # Run next so input-prep kernels JIT against pristine runner state.
+    sparse_mla_triton_warmup(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
