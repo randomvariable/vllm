@@ -19,7 +19,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
-    compute_topk_logprobs,
+    compute_topk_scores,
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
@@ -108,7 +108,7 @@ class Sampler:
             expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
             cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
             num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
-            logprobs_tensors = compute_topk_logprobs(
+            logprobs_tensors = compute_topk_scores(
                 logits,
                 num_logprobs,
                 sampled,
