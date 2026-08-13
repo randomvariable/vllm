@@ -56,6 +56,12 @@ from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
     deepseek_v4_compressor_triton_warmup,
 )
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
+from vllm.multimodal.video import (
+    PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
+    PYNVVIDEOCODEC_DECODER_CACHE_SIZE as PYNVVIDEOCODEC_MAX_RETAINED_DECODERS,
+    PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
+    VIDEO_LOADER_REGISTRY,
+)
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
     CudaProfilerWrapper,
