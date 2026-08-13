@@ -7,6 +7,12 @@
 #include "quantization/vectorization_utils.cuh"
 #include "concat_mla_q.cuh"
 
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+  #define NVFP4_ENABLE_ELTS16 1
+  #include "quantization/fp4/nvfp4_utils.cuh"
+  #include "nvfp4_kv_cache.h"
+#endif
+
 #ifdef USE_ROCM
   #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
 #else
@@ -829,12 +835,8 @@ void reshape_and_cache_flash(
 
   if (kv_cache_dtype == "nvfp4" || kv_cache_dtype == "nvfp4_4over6") {
 #if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
-    // NVFP4 dispatch is compiled separately for SM100+.
-    extern void reshape_and_cache_nvfp4_dispatch(
-        torch::stable::Tensor & key, torch::stable::Tensor & value,
-        torch::stable::Tensor & key_cache, torch::stable::Tensor & value_cache,
-        torch::stable::Tensor & slot_mapping, torch::stable::Tensor & k_scale,
-        torch::stable::Tensor & v_scale, const std::string& kv_cache_dtype);
+    // NVFP4 dispatch is compiled separately for SM100+; it reads
+    // kv_cache_dtype to pick the store-time scale search.
     reshape_and_cache_nvfp4_dispatch(key, value, key_cache, value_cache,
                                      slot_mapping, k_scale, v_scale,
                                      kv_cache_dtype);
