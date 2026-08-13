@@ -266,6 +266,11 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
 # every build and invalidated the multi-hour CUDA compile layers below.
 ARG VLLM_SOURCE_COMMIT=unknown
 ARG VLLM_SCM_VERSION=0.1.dev1
+# Stage-wide, not per-RUN: the Rust build resolves the project version too, so
+# a wheel-only override left ./build_rust.sh failing with "setuptools-scm was
+# unable to detect version". setup.py's own VLLM_VERSION_OVERRIDE path just
+# forwards to this variable, so setting it once covers every consumer.
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SCM_VERSION}
 COPY . /src/vllm
 RUN printf '%s\n' "${VLLM_SOURCE_COMMIT}" > /src/vllm-build-commit
 
@@ -295,7 +300,6 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
       true; \
     } && \
     ccache -z && \
-    VLLM_VERSION_OVERRIDE="${VLLM_SCM_VERSION}" \
     _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
     ccache -sv | tee /src/ccache-stats-vllm.txt
