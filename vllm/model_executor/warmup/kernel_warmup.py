@@ -44,7 +44,7 @@ from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
 )
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
-    sparse_mla_triton_warmup_if_needed,
+    sparse_mla_triton_warmup,
 )
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
@@ -279,7 +279,7 @@ def kernel_warmup(worker: "Worker"):
         )
 
     # Run next so input-prep kernels JIT against pristine runner state.
-    sparse_mla_triton_warmup_if_needed(worker)
+    sparse_mla_triton_warmup(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
