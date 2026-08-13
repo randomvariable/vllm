@@ -1,0 +1,21 @@
+vllm/model_executor/models/qwen3_5.py
+  s_a35c62a3e8a532::t_d03a4c949bcb1b 246
+  s_a35c62a3e8a532::t_92aad6416bb54c 247
+  s_a35c62a3e8a532::t_9ad42874d18726 250-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "b97b4d4defa58cbe7070354007f540fcc5fb1eb1",
+  "prompts": {},
+  "sessions": {
+    "s_a35c62a3e8a532": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_042660812ffectGJyC3FvO6l9h",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
