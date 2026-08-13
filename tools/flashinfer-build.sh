@@ -51,11 +51,17 @@ pushd flashinfer
     
     if [[ "${BUILD_WHEEL}" == "true" ]]; then
         # Build wheel for distribution
-        uv build --no-build-isolation --wheel --out-dir ../flashinfer-dist .
-        echo "✅ FlashInfer wheel built successfully in flashinfer-dist/"
+        uv build --python /opt/venv/bin/python --no-build-isolation --wheel --out-dir "${FLASHINFER_DIST_DIR}" .
+        if [[ "${BUILD_JIT_CACHE}" == "true" ]]; then
+            FLASHINFER_LOCAL_VERSION="${FLASHINFER_JIT_CACHE_LOCAL_VERSION}" \
+            FLASHINFER_WHEEL_PLATFORM_TAG="${FLASHINFER_WHEEL_PLATFORM_TAG}" \
+                uv build --python /opt/venv/bin/python --no-build-isolation --wheel \
+                --out-dir "${FLASHINFER_DIST_DIR}" ./flashinfer-jit-cache
+        fi
+        echo "✅ FlashInfer wheels built successfully in ${FLASHINFER_DIST_DIR}/"
     else
         # Install directly (for Dockerfile)
-        uv pip install --system --no-build-isolation --force-reinstall .
+        uv pip install --python /opt/venv/bin/python --no-build-isolation --force-reinstall .
         echo "✅ FlashInfer installed successfully"
     fi
 popd
