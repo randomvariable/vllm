@@ -1,0 +1,14 @@
+vllm/utils/torch_utils.py
+  h_15da545fc8cfbe 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "2e28076beee8f418434e87fb1b3c3686e9f58b22",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
