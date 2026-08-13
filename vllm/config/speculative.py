@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-import functools
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
