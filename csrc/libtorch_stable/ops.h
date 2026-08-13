@@ -467,6 +467,24 @@ std::tuple<int64_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
 int64_t open_mem_handle(torch::stable::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
 
+// All-gather / reduce-scatter counterparts to the custom all-reduce above,
+// defined in custom_all_gather_reduce_scatter.cu and registered by
+// custom_all_gather_reduce_scatter_ops.cpp.
+void custom_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
+                       torch::stable::Tensor& out, fptr_t reg_buffer,
+                       int64_t reg_buffer_sz_bytes);
+void mnnvl_lamport_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
+                              torch::stable::Tensor& out, fptr_t local_buffer,
+                              fptr_t multicast_buffer, fptr_t epoch_buffer,
+                              int64_t stage_sz_bytes);
+void custom_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
+                           torch::stable::Tensor& out, fptr_t reg_buffer,
+                           int64_t reg_buffer_sz_bytes);
+void mnnvl_lamport_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
+                                  torch::stable::Tensor& out,
+                                  fptr_t local_buffer, fptr_t epoch_buffer,
+                                  int64_t stage_sz_bytes);
+
 // Activation kernels (shared CUDA/ROCm)
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void silu_and_mul_clamp(torch::stable::Tensor& out,

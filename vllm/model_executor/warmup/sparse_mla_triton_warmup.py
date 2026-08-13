@@ -85,7 +85,7 @@ def _compile_combine_topk_swa_indices_kernel(
     _COMBINE_TOPK_SWA_INDICES_KERNEL.warmup(vllm_config)
 
 
-def sparse_mla_triton_warmup(worker: "Worker") -> None:
+def sparse_mla_triton_warmup_if_needed(worker: "Worker") -> None:
     runner = worker.model_runner
     if runner.is_pooling_model:
         return

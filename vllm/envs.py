@@ -351,6 +351,8 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_DISABLE_MMAP: bool = False
+    VLLM_LOADER_NUM_THREADS: int = 1
 
 
 def get_default_cache_root():
@@ -2340,6 +2342,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
     "VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4": lambda: os.getenv("VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "0") not in ("", "0", "false", "False"),
     "VLLM_SKIP_MM_PROFILING": lambda: os.getenv("VLLM_SKIP_MM_PROFILING", "0") not in ("", "0", "false", "False"),
+    "VLLM_DISABLE_MMAP": lambda: os.getenv("VLLM_DISABLE_MMAP", "0") == "1",
+    "VLLM_LOADER_NUM_THREADS": lambda: int(os.getenv("VLLM_LOADER_NUM_THREADS", "1")),
 
 }
 

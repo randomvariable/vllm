@@ -121,7 +121,7 @@ class RejectionSampler:
             cu_num_logits,
             num_warps=1,
         )
-        expanded_logits = num_logits != num_reqs
+        expanded_logits = num_logits != input_batch.idx_mapping.shape[0]
         return compute_topk_scores(
             logits,
             max_num_logprobs,

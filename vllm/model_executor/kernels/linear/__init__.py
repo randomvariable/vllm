@@ -89,6 +89,13 @@ from vllm.model_executor.kernels.linear.mxfp4.marlin import (
 from vllm.model_executor.kernels.linear.mxfp4.xpu import (
     XPUMxFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp6 import (
+    MxFp6LinearKernel,
+    MxFp6LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.mxfp6.emulation import (
+    EmulationMxfp6LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8 import (
     B12xMxfp8LinearKernel,
     Mxfp8LinearKernel,
@@ -503,6 +510,15 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     ],
 }
 
+_POSSIBLE_MXFP6_KERNELS: dict[PlatformEnum, list[type[MxFp6LinearKernel]]] = {
+    PlatformEnum.CUDA: [
+        EmulationMxfp6LinearKernel,
+    ],
+    PlatformEnum.ROCM: [
+        EmulationMxfp6LinearKernel,
+    ],
+}
+
 # TODO make all kernels inherit from MMLinearKernel
 # then bound _KernelT only to MMLinearKernel
 _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel | MMLinearKernel)
@@ -899,6 +915,59 @@ def init_mxfp4_linear_kernel() -> MxFp4LinearKernel:
     )
 
 
+def init_mxfp6_linear_kernel(
+    weight_quant_key: QuantKey,
+    activation_quant_key: QuantKey | None = None,
+) -> MxFp6LinearKernel:
+    """Select and instantiate the best MXFP6 linear kernel for the
+    current platform."""
+    config = MxFp6LinearLayerConfig(
+        weight_quant_key=weight_quant_key,
+        activation_quant_key=activation_quant_key,
+    )
+
+    linear_backend = _get_linear_backend()
+
+    platform = current_platform._enum
+    possible = list(_POSSIBLE_MXFP6_KERNELS.get(platform, []))
+
+    # Apply --linear-backend filtering when set.
+    if linear_backend != "auto":
+        filtered = _filter_kernels_by_backend(linear_backend, possible)
+        if not filtered:
+            raise ValueError(
+                f"--linear-backend={linear_backend} was requested but no "
+                f"'{linear_backend}' kernel exists for MXFP6 layers."
+            )
+        possible = filtered
+
+    failure_reasons = []
+    for kernel_cls in possible:
+        if kernel_cls.__name__ in envs.VLLM_DISABLED_KERNELS:
+            failure_reasons.append(
+                f" {kernel_cls.__name__} disabled by environment variable"
+            )
+            continue
+
+        is_supported, reason = kernel_cls.is_supported()
+        if not is_supported:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        can_implement, reason = kernel_cls.can_implement(config)
+        if not can_implement:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        logger.info_once("Using %s for MXFP6 GEMM", kernel_cls.__name__)
+        return kernel_cls(config)
+
+    raise ValueError(
+        "Failed to find a kernel that can implement the "
+        "MXFP6 linear layer. Reasons: \n" + "\n".join(failure_reasons)
+    )
+
+
 def init_wfp8_a16_linear_kernel(
     weight_quant_key: QuantKey,
     activation_quant_key: QuantKey,
@@ -1079,6 +1148,10 @@ def register_linear_kernel(
         if platform not in _POSSIBLE_MXFP4_KERNELS:
             _POSSIBLE_MXFP4_KERNELS[platform] = []
         _POSSIBLE_MXFP4_KERNELS[platform].append(kernel_class)
+    elif kernel_type == "mxfp6":
+        if platform not in _POSSIBLE_MXFP6_KERNELS:
+            _POSSIBLE_MXFP6_KERNELS[platform] = []
+        _POSSIBLE_MXFP6_KERNELS[platform].append(kernel_class)
     else:
         raise ValueError(f"Unrecognized kernel type: {kernel_type}")
 
@@ -1138,6 +1211,10 @@ __all__ = [
     "MxFp4LinearLayerConfig",
     "FlashInferMxFp4LinearKernel",
     "MarlinMxFp4LinearKernel",
+    "init_mxfp6_linear_kernel",
+    "Mxfp6LinearKernel",
+    "Mxfp6LinearLayerConfig",
+    "EmulationMxfp6LinearKernel",
     "FlashInferCutedslMxfp8LinearKernel",
     "FlashInferCutlassMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",

@@ -218,7 +218,10 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Per-decoder upper bound reserved for persistent PyNvVideoCodec surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
+# Number of HW-decoder slots retained per API-server process; same slot-count
+# concept as DEFAULT_HW_DECODERS, used in the per-server memory-budget formula.
 PYNVVIDEOCODEC_DEFAULT_HW_DECODERS = 2
+PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = PYNVVIDEOCODEC_DEFAULT_HW_DECODERS
 # Per-API-server CUDA context and driver allocation, measured with
 # PyNvVideoCodec 2.0.4 on H100.
 PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES = int(1.8 * 1024 * MiB_bytes)

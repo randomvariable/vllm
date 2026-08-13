@@ -58,7 +58,11 @@ if HAS_TRITON:
             HAS_TRITON = False
 
         # Check Triton CPU
-        if "cpu" in version("vllm"):
+        # `version()` can return None for editable/local installs, which
+        # would make `"cpu" in None` raise. Treat a missing/empty version as
+        # not-a-CPU-build so the active-driver result above stands.
+        vllm_version = version("vllm") or ""
+        if "cpu" in vllm_version:
             if "cpu" in backends:
                 HAS_TRITON = True
             else:

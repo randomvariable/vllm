@@ -140,8 +140,10 @@ class DefaultModelState(ModelState):
             # For piecewise cudagraphs and eager, use unpadded sizes.
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
-        query_start_loc_cpu = torch.from_numpy(
-            input_batch.query_start_loc_np[: num_reqs + 1]
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
+        max_query_len = (
+            input_batch.max_req_tokens or input_batch.num_scheduled_tokens.max().item()
         )
         query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
         max_query_len = input_batch.max_query_len

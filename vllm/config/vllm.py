@@ -33,6 +33,7 @@ from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .diffusion import DiffusionConfig
 from .ec_transfer import ECTransferConfig
+from .ec_manager_config import EncoderCacheManagerConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
@@ -235,10 +236,10 @@ def enable_norm_pad_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
-    """Enable MLA dual RMS norm fusion when AITer has fused_qk_rmsnorm."""
-    from vllm._aiter_ops import check_aiter_fused_qk_rmsnorm, rocm_aiter_ops
+    """Enable MLA dual RMS norm fusion on ROCm with AITER."""
+    from vllm._aiter_ops import rocm_aiter_ops
 
-    return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
+    return rocm_aiter_ops.is_enabled()
 
 
 def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
@@ -413,6 +414,10 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
+    ec_manager_config: EncoderCacheManagerConfig | None = Field(
+        default_factory=EncoderCacheManagerConfig
+    )
+    """The configurations for encoder cache manager."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
     reasoning_config: ReasoningConfig | None = None
@@ -687,6 +692,11 @@ class VllmConfig:
                 "Model Runner V1. Use Model Runner V2 or disable PIECEWISE "
                 "CUDA graphs."
             )
+
+    @property
+    def is_encoder_only(self) -> bool:
+        """Whether the model is encoder-only (no decoder)."""
+        return self.model_config is not None and self.model_config.is_encoder_decoder
 
     @property
     def needs_dp_coordinator(self) -> bool:

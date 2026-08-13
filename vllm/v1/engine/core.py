@@ -1666,6 +1666,15 @@ class EngineCoreProc(EngineCore):
                 kv_cache_max_concurrency=(
                     self.vllm_config.cache_config.kv_cache_max_concurrency
                 ),
+                tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=self.vllm_config.parallel_config.pipeline_parallel_size,
+                decode_context_parallel_size=self.vllm_config.parallel_config.decode_context_parallel_size,
+                data_parallel_rank=self.engine_index,
+                max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                max_num_batched_tokens=(
+                    self.vllm_config.scheduler_config.max_num_batched_tokens
+                ),
+                instance_id=self.vllm_config.instance_id,
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:
