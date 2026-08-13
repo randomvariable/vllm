@@ -78,3 +78,63 @@ A slow edit-test loop is treated as a defect, not a cost of doing business. Rebu
 - **Review the loop daily**, alongside the upstream rebase above. If any routine step has become slow, fix the tooling before continuing feature work.
 - **Environment staleness must fail closed.** A harness that cannot find the source it is meant to test, or that silently falls back to an installed package or a fallback kernel, must error rather than report success. Prove *which* files a run actually loaded — resolved package path and compiled extension imports — before trusting a pass. Test harnesses that overlay source into a container must run pytest with `--import-mode=importlib`, otherwise the mount shadows the installed package and its compiled extensions vanish silently. Devloop probes and pytest Python invocations must use safe-path mode (`python -P`) in addition to pytest `--import-mode=importlib`, so mounted checkout metadata cannot shadow image metadata.
 - **Do not add another language** to solve build orchestration. This tree is already Python, C++/HIP/CUDA and Rust; dev tooling belongs in Rust (`cargo-make`, already a dependency via `setuptools-rust`). A hermetic build system such as Bazel or Pants is not justified by polyglot pain alone: the recurring costs here have been SDK packaging, cross-compilation toolchain files and artefact staleness, none of which it addresses, and it would fight the ROCm SDK's layout harder than CMake does.
+
+## Keep `.git` and doc trees out of the Spark build context
+
+CI clones this fork fresh for every run, so a root `.git` in the build context
+differs byte-for-byte between runs even when the commit is identical
+(`FETCH_HEAD`, reflogs, pack checksums). With `.git` in context the
+`COPY . /src/vllm` layer digest changed every build, which invalidated every
+compile layer beneath it: on 2026-08-12 that was 67 min for the vLLM wheel and
+118 min for the FlashInfer AOT set, on every single build, including rebuilds
+of an unchanged commit.
+
+`.dockerignore` therefore excludes `.git`, `.github`, `docs`, `examples` and
+`benchmarks`, and the two things the build genuinely needed from git arrive as
+build args: `VLLM_SOURCE_COMMIT` and `VLLM_SCM_VERSION`
+(`0.1.dev1+g<9-char sha>`, reproducing what setuptools-scm derived from the
+shallow clone). **Do not reintroduce `.git` into the context** to "fix"
+versioning — set the build args instead.
+
+Related ordering rule: the FlashInfer AOT stage sits **before** the full source
+`COPY`, with narrow copies of `third_party/flashinfer` and
+`tools/flashinfer-build.sh`. It has no other dependency on the repository, and
+placing it after the full copy meant any edit anywhere in the fork rebuilt its
+~2 h layer.
+
+## ccache only survives a clean buildkitd shutdown
+
+BuildKit persists a cache mount when buildkitd releases the ref; a run that is
+cancelled or evicted loses that window and the next daemon start deletes the
+orphaned mutable refs. That is why `/vllm-spark-ccache-cross` kept reporting
+`0 files` at stage entry while `//root/.cache/uv` — untouched, because its
+layer was cached — survived from July. The pipeline allows a 120 s termination
+grace period so the step's trap can stop buildkitd cleanly. Prefer letting a
+bad build fail on its own over cancelling it, and expect a cold compile after
+any cancellation.
+
+`CCACHE_DEPEND=true` is set because both compile paths already emit dependency
+files (CMake `-MD`, FlashInfer `nvcc --generate-dependencies-with-compile`). On
+the 2026-08-12 build, 2740 of 2755 FlashInfer lookups fell out of direct mode
+into the slower preprocessed lookup.
+
+## The FlashInfer AOT matrix is over-built (measured, not yet trimmed)
+
+`tools/flashinfer-build.sh` runs `python3 -m flashinfer.aot` with no arguments,
+so it builds FlashInfer's full default config: fp16 **and** bf16, four FA3 and
+three FA2 head-dim pairs, sliding-window and logits-soft-cap variants, plus the
+Gemma (head_dim 256), OAI-OSS (head_dim 64 + SWA), XQA and comm kernel sets —
+3413 compile units, ~2 h cold.
+
+Measured against a live `deepseek-v4-flash` rank 0, the serving process had
+exactly three FlashInfer native modules mapped: `sparse_mla_sm120`, `sampling`
+and `trtllm_utils`.
+
+Trimming the matrix (`--f16-dtype bfloat16`, `--use-logits-soft-cap false`,
+`--add-gemma false`, `--add-oai-oss false`) is therefore the largest remaining
+build-time lever. It is **not** applied yet because a missing kernel surfaces
+at serving time as `MissingJITCacheError` (JIT fallback is disabled in the
+image), and the image serves `deepseek-v4-flash-dspark`, `hy3-299b-nvfp4` and
+`laguna`. Any trim must be validated by bringing up all three on the trimmed
+image and exercising them, not by reasoning about which kernels "should" be
+needed.
