@@ -118,25 +118,37 @@ files (CMake `-MD`, FlashInfer `nvcc --generate-dependencies-with-compile`). On
 the 2026-08-12 build, 2740 of 2755 FlashInfer lookups fell out of direct mode
 into the slower preprocessed lookup.
 
-## The FlashInfer AOT matrix stays full, by decision
+## What the FlashInfer AOT matrix actually buys (measured)
 
 `tools/flashinfer-build.sh` runs `python3 -m flashinfer.aot` with no arguments,
 so it builds FlashInfer's full default config: fp16 **and** bf16, four FA3 and
 three FA2 head-dim pairs, sliding-window and logits-soft-cap variants, plus the
 Gemma (head_dim 256), OAI-OSS (head_dim 64 + SWA), XQA and comm kernel sets —
-3413 compile units, the single largest stage in the build.
+3413 compile units, the single largest stage in the build. The Dockerfile
+strips the `flashinfer-jit-cache==` pin from `requirements/cuda.txt` and
+installs the wheel this stage produces, so these units are what ships.
 
-Measured against a live `deepseek-v4-flash` rank 0, the serving process had
-exactly three FlashInfer native modules mapped: `sparse_mla_sm120`, `sampling`
-and `trtllm_utils`. Trimming the matrix to match is therefore a large nominal
-build-time lever, and it is deliberately **not** taken.
+Measured on a live `deepseek-v4-flash` rank 0, only three FlashInfer native
+modules were mapped, and only two of them came from that wheel:
 
-This image is the homelab DGX Spark runtime, not a per-model artifact. A kernel
-that is absent from the AOT set does not degrade — it fails at serving time
-with `MissingJITCacheError`, because JIT fallback is disabled in the image. A
-matrix cut to whatever the current model happens to touch would turn every new
-model, quantisation or head-dim on Spark into a three-hour rebuild discovered
-by a crash-looping pod. Build minutes are cheaper than that.
+| Loaded module | Origin |
+| --- | --- |
+| `sampling.so`, `trtllm_utils.so` | the AOT wheel built here |
+| `sparse_mla_sm120.so` | JIT-compiled at runtime into `FLASHINFER_WORKSPACE_BASE` |
 
-Attack build time through caching and parallelism, which are model-independent,
-rather than by narrowing the kernel matrix.
+The MoE path does not use FlashInfer at all. `--moe-backend flashinfer_b12x`
+resolves to the vendored `third_party/b12x` submodule — the logs show
+`Using 'B12X_MXFP4' Mxfp4 MoE backend`, `Using B12xExperts`, and CuTeDSL
+kernels such as `W4A16FusedMoeKernel` compiled during inference.
+
+**JIT fallback is enabled**, not disabled: `jit_monitor_mode` is `warn`, and
+both `sparse_mla_sm120` and the CuTeDSL MoE kernels are compiled at runtime in
+the normal course of serving. A kernel absent from the AOT set therefore costs
+a first-call compile spike, not a crash. Do not justify the matrix size by
+claiming a missing kernel is a hard failure — that is measurably untrue.
+
+The matrix is nonetheless kept full **by decision**: this is the shared homelab
+Spark runtime rather than a per-model artifact, and the alternative to build
+minutes on an otherwise idle builder is latency spikes on live traffic whenever
+a new shape appears. Attack build time through caching and parallelism, which
+are model-independent, rather than by narrowing the kernel matrix.
