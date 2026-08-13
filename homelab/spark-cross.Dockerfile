@@ -226,10 +226,15 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH_LIST" \
     FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64 \
     FLASHINFER_JIT_CACHE_LOCAL_VERSION=cu130 \
-    # Four parallel nvcc jobs stay below server6's eviction threshold. Eight
-    # reached 44 GiB RSS and caused the kubelet to evict the build before its
-    # 56 GiB cgroup limit. Do not raise without a successful measured build.
-    MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 \
+    # Eight parallel jobs once reached 44 GiB RSS and got the build evicted
+    # under a 56 GiB cgroup limit, so this stage was pinned to four. Measured
+    # again on 2026-08-13 mid-stage: four jobs held 16.5 GiB RSS and 3.8 of
+    # server6's 32 cores, with ~40 GiB of node memory free -- the stage was
+    # starved, not memory-bound. Six jobs is ~25 GiB at the observed 4.1 GiB
+    # per job, inside the 44 GiB limit with node headroom to spare. Raise
+    # further only from a measured build, not from spare core count: nvcc RSS
+    # per unit climbs sharply through the FA3 and MLA kernels.
+    MAX_JOBS=6 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh && \
     { ccache -sv | tee /src/ccache-stats-flashinfer.txt; \
