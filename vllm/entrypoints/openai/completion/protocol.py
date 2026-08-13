@@ -27,11 +27,15 @@ from vllm.logprobs import Logprob
 from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
+    EntropyThreshold,
     ReasoningAnswerReserve,
     RepetitionDetectionParams,
     RequestOutputKind,
+    ResetWindow,
     SamplingParams,
     StructuredOutputsParams,
+    TemperatureHigh,
+    TemperatureLow,
     ThinkingTokenBudget,
     validate_reasoning_marker_penalty,
 )
@@ -247,6 +251,47 @@ class CompletionRequest(OpenAIBaseModel):
     reasoning_marker_penalty: Annotated[
         float | None, BeforeValidator(validate_reasoning_marker_penalty)
     ] = None
+    temperature_low: TemperatureLow = Field(
+        default=None,
+        description=(
+            "ReSET temperature used when a decoded token's entropy is below "
+            "the threshold, i.e. the model is confident (arXiv 2606.13233). "
+            "Finite float in (0, 2]."
+        ),
+    )
+    temperature_high: TemperatureHigh = Field(
+        default=None,
+        description=(
+            "ReSET temperature used when a decoded token's entropy is above "
+            "the threshold, i.e. the model is uncertain (arXiv 2606.13233). "
+            "Finite float in (0, 2]."
+        ),
+    )
+    entropy_threshold: EntropyThreshold = Field(
+        default=None,
+        description=(
+            "ReSET entropy threshold `tau0` (arXiv 2606.13233), the per-token "
+            "Shannon entropy bound (nats) separating confident tokens from "
+            "uncertain ones. Finite float greater than 0."
+        ),
+    )
+    reset_window: ResetWindow = Field(
+        default=None,
+        description=(
+            "ReSET sliding-window width `w` (arXiv 2606.13233), used for the "
+            "step-entropy estimate. Positive integer."
+        ),
+    )
+    reasoning_answer_temperature: ReasoningAnswerTemperature = Field(
+        default=None,
+        description=(
+            "Temperature to switch to once the model has left the reasoning "
+            "block, overriding `temperature` and any annealing schedule. "
+            "Only applies after a natural end-of-thinking marker completes; "
+            "a request that never enters reasoning never takes the "
+            "override. Requires a reasoning control to be configured."
+        ),
+    )
     reasoning_answer_reserve: ReasoningAnswerReserve = Field(
         default=None,
         description=(
@@ -413,6 +458,11 @@ class CompletionRequest(OpenAIBaseModel):
             thinking_token_budget=self.thinking_token_budget,
             reasoning_marker_penalty=self.reasoning_marker_penalty,
             reasoning_answer_reserve=self.reasoning_answer_reserve,
+            temperature_low=self.temperature_low,
+            temperature_high=self.temperature_high,
+            entropy_threshold=self.entropy_threshold,
+            reset_window=self.reset_window,
+            reasoning_answer_temperature=self.reasoning_answer_temperature,
         )
 
     @model_validator(mode="before")

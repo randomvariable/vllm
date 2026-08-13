@@ -54,3 +54,10 @@ are independent and can be set together. The penalty discourages selected
 tokens; the budget counts reasoning tokens separately and forces
 `reasoning_end_str` when the limit is reached; the reserve forces
 `reasoning_end_str` once the remaining output budget drops to it.
+
+[ReSET entropy-threshold temperature](../features/reasoning_outputs.md#reset-entropy-threshold-temperature)
+(`temperature_low`, `temperature_high`, `entropy_threshold`, `reset_window`)
+and [answer temperature](../features/reasoning_outputs.md#answer-temperature)
+(`reasoning_answer_temperature`) are orthogonal to all three: those parameters
+decide where the reasoning block ends, while ReSET and the answer temperature
+decide how tokens are sampled.

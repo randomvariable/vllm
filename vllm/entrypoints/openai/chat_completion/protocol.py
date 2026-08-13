@@ -11,7 +11,13 @@ from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
-from pydantic import Field, PrivateAttr, model_serializer, model_validator
+from pydantic import (
+    BeforeValidator,
+    Field,
+    PrivateAttr,
+    model_serializer,
+    model_validator,
+)
 
 from vllm.config import ModelConfig
 from vllm.config.utils import replace
@@ -41,11 +47,18 @@ from vllm.logprobs import Logprob
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     BeamSearchParams,
+    EntropyThreshold,
+    ReasoningAnswerReserve,
+    ReasoningAnswerTemperature,
     RepetitionDetectionParams,
     RequestOutputKind,
+    ResetWindow,
     SamplingParams,
     StructuredOutputsParams,
+    TemperatureHigh,
+    TemperatureLow,
     ThinkingTokenBudget,
+    validate_reasoning_marker_penalty,
 )
 from vllm.utils import random_uuid
 
@@ -243,6 +256,62 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
+    reasoning_marker_penalty: Annotated[
+        float | None, BeforeValidator(validate_reasoning_marker_penalty)
+    ] = None
+    temperature_low: TemperatureLow = Field(
+        default=None,
+        description=(
+            "ReSET temperature used when a decoded token's entropy is below "
+            "the threshold, i.e. the model is confident (arXiv 2606.13233). "
+            "Finite float in (0, 2]."
+        ),
+    )
+    temperature_high: TemperatureHigh = Field(
+        default=None,
+        description=(
+            "ReSET temperature used when a decoded token's entropy is above "
+            "the threshold, i.e. the model is uncertain (arXiv 2606.13233). "
+            "Finite float in (0, 2]."
+        ),
+    )
+    entropy_threshold: EntropyThreshold = Field(
+        default=None,
+        description=(
+            "ReSET entropy threshold `tau0` (arXiv 2606.13233), the per-token "
+            "Shannon entropy bound (nats) separating confident tokens from "
+            "uncertain ones. Finite float greater than 0."
+        ),
+    )
+    reset_window: ResetWindow = Field(
+        default=None,
+        description=(
+            "ReSET sliding-window width `w` (arXiv 2606.13233), used for the "
+            "step-entropy estimate. Positive integer."
+        ),
+    )
+    reasoning_answer_temperature: ReasoningAnswerTemperature = Field(
+        default=None,
+        description=(
+            "Temperature to switch to once the model has left the reasoning "
+            "block, overriding `temperature` and any annealing schedule. "
+            "Only applies after a natural end-of-thinking marker completes; "
+            "a request that never enters reasoning never takes the "
+            "override. Requires a reasoning control to be configured."
+        ),
+    )
+    reasoning_answer_reserve: ReasoningAnswerReserve = Field(
+        default=None,
+        description=(
+            "Number of output tokens to reserve for the final answer. While "
+            "inside a reasoning block, the reasoning-end token is forced once "
+            "the remaining output budget drops to this value, so the model "
+            "cannot spend all of max_tokens thinking. The close marker is "
+            "emitted from the reserved tokens, so answer text gets "
+            "reserve minus the marker length. Positive integer; -1 means "
+            "unset."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -723,6 +792,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
+            reasoning_marker_penalty=self.reasoning_marker_penalty,
+            reasoning_answer_reserve=self.reasoning_answer_reserve,
+            temperature_low=self.temperature_low,
+            temperature_high=self.temperature_high,
+            entropy_threshold=self.entropy_threshold,
+            reset_window=self.reset_window,
+            reasoning_answer_temperature=self.reasoning_answer_temperature,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
