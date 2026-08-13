@@ -89,6 +89,13 @@ from vllm.model_executor.kernels.linear.mxfp4.marlin import (
 from vllm.model_executor.kernels.linear.mxfp4.xpu import (
     XPUMxFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp6 import (
+    MxFp6LinearKernel,
+    MxFp6LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.mxfp6.emulation import (
+    EmulationMxfp6LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8 import (
     B12xMxfp8LinearKernel,
     Mxfp8LinearKernel,
@@ -488,6 +495,14 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         EmulationNvFp4LinearKernel,
+    ],
+}
+_POSSIBLE_MXFP6_KERNELS: dict[PlatformEnum, list[type[MxFp6LinearKernel]]] = {
+    PlatformEnum.CUDA: [
+        EmulationMxfp6LinearKernel,
+    ],
+    PlatformEnum.ROCM: [
+        EmulationMxfp6LinearKernel,
     ],
 }
 
@@ -898,6 +913,56 @@ def init_mxfp4_linear_kernel() -> MxFp4LinearKernel:
         "MXFP4 linear layer. Reasons: \n" + "\n".join(failure_reasons)
     )
 
+def init_mxfp6_linear_kernel(
+    weight_quant_key: QuantKey,
+    activation_quant_key: QuantKey | None = None,
+) -> MxFp6LinearKernel:
+    """Select and instantiate the best MXFP6 linear kernel for the
+    current platform."""
+    config = MxFp6LinearLayerConfig(
+        weight_quant_key=weight_quant_key,
+        activation_quant_key=activation_quant_key,
+    )
+
+    linear_backend = _get_linear_backend()
+
+    platform = current_platform._enum
+    possible = list(_POSSIBLE_MXFP6_KERNELS.get(platform, []))
+
+    if linear_backend != "auto":
+        filtered = _filter_kernels_by_backend(linear_backend, possible)
+        if not filtered:
+            raise ValueError(
+                f"--linear-backend={linear_backend} was requested but no "
+                f"'{linear_backend}' kernel exists for MXFP6 layers."
+            )
+        possible = filtered
+
+    failure_reasons = []
+    for kernel_cls in possible:
+        if kernel_cls.__name__ in envs.VLLM_DISABLED_KERNELS:
+            failure_reasons.append(
+                f" {kernel_cls.__name__} disabled by environment variable"
+            )
+            continue
+
+        is_supported, reason = kernel_cls.is_supported()
+        if not is_supported:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        can_implement, reason = kernel_cls.can_implement(config)
+        if not can_implement:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        logger.info_once("Using %s for MXFP6 GEMM", kernel_cls.__name__)
+        return kernel_cls(config)
+
+    raise ValueError(
+        "Failed to find a kernel that can implement the "
+        "MXFP6 linear layer. Reasons: \n" + "\n".join(failure_reasons)
+    )
 
 def init_wfp8_a16_linear_kernel(
     weight_quant_key: QuantKey,
@@ -1113,6 +1178,7 @@ __all__ = [
     "TritonInt8ScaledMMLinearKernel",
     "ZentorchInt8ScaledMMLinearKernel",
     "ZentorchWNA16LinearKernel",
+    "init_mxfp6_linear_kernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
     "AllSparkLinearKernel",
@@ -1156,5 +1222,7 @@ __all__ = [
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
     "B12xFp8BlockScaledMMKernel",
-    "B12xTensorFP8ScaledMMLinearKernel",
+    "MxFp6LinearKernel",
+    "MxFp6LinearLayerConfig",
+    "EmulationMxfp6LinearKernel",
 ]
