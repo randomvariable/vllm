@@ -80,10 +80,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # --- acquire the source: this Dockerfile lives in the vllm fork (homelab/), ---
 # so the build context IS the source -- a straight copy, no clone. The builder
 # (an external CI harness) owns which commit is checked out.
-# .git comes along so setuptools-scm can derive the version; the built commit is
-# recorded for image provenance.
+# .git is excluded by .dockerignore (common CI pattern) so setuptools-scm
+# cannot derive the version. The external CI harness must supply it.
+ARG VLLM_SCM_VERSION=0.1.dev1
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SCM_VERSION}
 COPY . /src/vllm
-RUN cd /src/vllm && git rev-parse HEAD > /src/vllm-build-commit
 
 # --- Rust vllm-rs frontend ----------------------------------------------------
 # Must run before the wheel build: setup.py's optional Rust extensions otherwise
@@ -314,8 +315,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 COPY --from=builder /wheels /wheels
 COPY --from=builder /wheels-gguf /wheels-gguf
 COPY --from=builder /runtime-requirements /runtime-requirements
-COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
-
 # Install runtime deps from the fork's ROCm requirements MINUS torch/triton/
 # vision/audio (the base image already provides the working release rocm build);
 # then the vLLM wheel --no-deps, then the GGUF plugin wheel if it built.
