@@ -6,7 +6,7 @@ multi-hour build cycles.
 
 ## FlashInfer is MANDATORY in DGX Spark (CUDA sm_121a) images
 
-The production DGX deployments — `deepseek-v4-flash-dspark` (sparse MLA), `hy3-299b-nvfp4` (NVFP4 MoE), `laguna` (AWQ MoE) — run on FlashInfer sm_12x kernels, so a FlashInfer-less DGX image is pointless for them. **Never strip `flashinfer-python` / `flashinfer-cubin` / `flashinfer-jit-cache` from `requirements/cuda.txt` at image-build time.**
+DGX Spark serving runs on FlashInfer sm_12x kernels — `deepseek-v4-flash-dspark` (sparse MLA) is the current deployment, and any NVFP4 or AWQ MoE model landing on Spark needs the same kernel surface. A FlashInfer-less DGX image is pointless for this hardware. **Never strip `flashinfer-python` / `flashinfer-cubin` / `flashinfer-jit-cache` from `requirements/cuda.txt` at image-build time.**
 
 ## Verify dependency claims by actual resolution, with the repo's indexes
 
@@ -118,23 +118,25 @@ files (CMake `-MD`, FlashInfer `nvcc --generate-dependencies-with-compile`). On
 the 2026-08-12 build, 2740 of 2755 FlashInfer lookups fell out of direct mode
 into the slower preprocessed lookup.
 
-## The FlashInfer AOT matrix is over-built (measured, not yet trimmed)
+## The FlashInfer AOT matrix stays full, by decision
 
 `tools/flashinfer-build.sh` runs `python3 -m flashinfer.aot` with no arguments,
 so it builds FlashInfer's full default config: fp16 **and** bf16, four FA3 and
 three FA2 head-dim pairs, sliding-window and logits-soft-cap variants, plus the
 Gemma (head_dim 256), OAI-OSS (head_dim 64 + SWA), XQA and comm kernel sets —
-3413 compile units, ~2 h cold.
+3413 compile units, the single largest stage in the build.
 
 Measured against a live `deepseek-v4-flash` rank 0, the serving process had
 exactly three FlashInfer native modules mapped: `sparse_mla_sm120`, `sampling`
-and `trtllm_utils`.
+and `trtllm_utils`. Trimming the matrix to match is therefore a large nominal
+build-time lever, and it is deliberately **not** taken.
 
-Trimming the matrix (`--f16-dtype bfloat16`, `--use-logits-soft-cap false`,
-`--add-gemma false`, `--add-oai-oss false`) is therefore the largest remaining
-build-time lever. It is **not** applied yet because a missing kernel surfaces
-at serving time as `MissingJITCacheError` (JIT fallback is disabled in the
-image), and the image serves `deepseek-v4-flash-dspark`, `hy3-299b-nvfp4` and
-`laguna`. Any trim must be validated by bringing up all three on the trimmed
-image and exercising them, not by reasoning about which kernels "should" be
-needed.
+This image is the homelab DGX Spark runtime, not a per-model artifact. A kernel
+that is absent from the AOT set does not degrade — it fails at serving time
+with `MissingJITCacheError`, because JIT fallback is disabled in the image. A
+matrix cut to whatever the current model happens to touch would turn every new
+model, quantisation or head-dim on Spark into a three-hour rebuild discovered
+by a crash-looping pod. Build minutes are cheaper than that.
+
+Attack build time through caching and parallelism, which are model-independent,
+rather than by narrowing the kernel matrix.
