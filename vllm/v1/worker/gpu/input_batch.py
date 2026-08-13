@@ -111,6 +111,9 @@ class InputBatch:
     # a query length this batch's own split does not reach, so attention metadata
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
+    # Upper bound on tokens per request in this batch, or None when the split
+    # is exact and no cudagraph descriptor promises a larger value.
+    max_req_tokens: int | None = None
 
     @classmethod
     def make_dummy(
@@ -118,6 +121,7 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        max_req_tokens: int | None = None,
         max_query_len: int | None = None,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
@@ -204,6 +208,7 @@ class InputBatch:
             has_structured_output_reqs=False,
             prompt_lens=None,
             max_query_len=max_query_len,
+            max_req_tokens=max_req_tokens,
         )
 
 
