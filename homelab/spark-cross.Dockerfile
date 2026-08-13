@@ -50,6 +50,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CCACHE_COMPILERCHECK=content \
     CCACHE_EXTRAFILES=/root/.ccache-keyfile \
     CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime \
+    CCACHE_DEPEND=true \
     VERBOSE=1 \
     CMAKE_VERBOSE_MAKEFILE=ON
 
@@ -59,6 +60,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # between builds. Both are needed: NOHASHDIR covers the CWD, BASEDIR covers the
 # arguments. Neither affects CCACHE_EXTRAFILES, which is hashed by content and
 # is what carries the effective cross-target flags into the key.
+#
+# DEPEND keys on the compiler's own dependency output instead of making ccache
+# preprocess every unit itself. Both compile paths already pass a dependency
+# option (CMake uses -MD, FlashInfer's AOT rules use nvcc
+# --generate-dependencies-with-compile), and on the 2026-08-12 build 2740 of
+# 2755 FlashInfer lookups fell out of direct mode into the slower preprocessed
+# lookup; depend mode removes that second path for both hits and misses.
 ENV CCACHE_BASEDIR=/src/vllm
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
