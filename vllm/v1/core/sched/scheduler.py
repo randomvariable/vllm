@@ -246,7 +246,7 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
-        self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
@@ -256,6 +256,15 @@ class Scheduler(SchedulerInterface):
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
             self.use_eagle = speculative_config.use_eagle()
+            if speculative_config.use_eagle():
+                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.uses_draft_model():
+                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_dflash():
+                # DFlash requires an extra lookahead slot since it uses in-fill-style
+                # decoding instead of standard next-token sampling, so it has a query
+                # for the last sampled token plus queries for each draft token.
+                self.num_lookahead_tokens = self.num_spec_tokens + 1
 
         # Create the KV cache manager.
         if hash_block_size is None:
