@@ -197,7 +197,6 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     uv pip install --python /opt/venv/bin/python \
       'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests numpy \
       nvidia-ml-py 'apache-tvm-ffi>=0.1,<0.2' filelock && \
-    uv pip install --system filelock && \
     FI_NVCC_PREPEND="-target-dir sbsa-linux" && \
     # 12.1a alone is not sufficient. FlashInfer names each AOT module after the
     # arch it was built for (fp4_quantization_121), but its runtime resolver
