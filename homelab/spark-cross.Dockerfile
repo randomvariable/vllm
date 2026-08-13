@@ -300,6 +300,35 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
       --py-limited-api=cp38 --plat-name linux_aarch64 && \
     ccache -sv | tee /src/ccache-stats-vllm.txt
 
+# Fail the build on an unresolved internal C++ symbol.
+#
+# A Python extension legitimately leaves CPython and libtorch symbols to be
+# resolved at load time, so the link cannot use -z defs. But libtorch's stable
+# ABI is C (aoti_torch_*), so no legitimately-deferred symbol takes a
+# torch::stable::Tensor argument: any undefined symbol whose mangled name
+# contains N5torch6stable6Tensor is one of ours that failed to link.
+#
+# On 2026-08-13 a call-site `extern` declaration of
+# reshape_and_cache_nvfp4_dispatch omitted the trailing kv_cache_dtype
+# argument. It mangled to a different symbol than the definition, the
+# extension linked clean, and the failure only appeared when the deployed pod
+# imported vllm -- after a three-hour build and a rollout. This check costs
+# seconds and catches that class in the builder.
+RUN set -eu; \
+    tmp="$(mktemp -d)"; \
+    unzip -q -o /wheels/vllm-*.whl -d "$tmp"; \
+    undef="$(find "$tmp" -name '*.so' -exec aarch64-linux-gnu-nm -D -u {} + \
+             | grep 'N5torch6stable6Tensor' || true)"; \
+    if [ -n "$undef" ]; then \
+      echo 'ERROR: unresolved internal symbols taking torch::stable::Tensor:' >&2; \
+      echo "$undef" | sort -u | while read -r sym; do \
+        echo "  $sym  ->  $(echo "$sym" | sed 's/^ *U *//' | c++filt)" >&2; \
+      done; \
+      exit 1; \
+    fi; \
+    echo 'symbol check: no unresolved internal torch::stable symbols'; \
+    rm -rf "$tmp"
+
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
 # b12x is pinned as a submodule so SM120/SM121 MoE fixes can be carried
