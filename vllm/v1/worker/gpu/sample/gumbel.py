@@ -101,6 +101,7 @@ def _temperature_kernel(
     cached_last_end_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SCHEDULE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -131,6 +132,7 @@ def apply_temperature(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
+    schedule: TemperatureSchedule | None = None,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
@@ -140,8 +142,10 @@ def apply_temperature(
         logits.stride(0),
         expanded_idx_mapping,
         temperature,
+        *schedule_args(schedule, temperature),
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_SCHEDULE=schedule is not None,
     )
 
 
