@@ -171,40 +171,11 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
     rustup toolchain install 1.95 && \
     rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu
 
-# Build context is fork source. Keep .git so setuptools-scm derives its version,
-# and record exact source commit in runtime image.
-COPY . /src/vllm
-RUN cd /src/vllm && git rev-parse HEAD > /src/vllm-build-commit
-
-RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,target=/src/vllm/target,sharing=locked \
-    cd /src/vllm && \
-    rustup toolchain install 1.95 && \
-    rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu && \
-    ./build_rust.sh && \
-    test -x vllm/vllm-rs && \
-    readelf -h vllm/vllm-rs | grep -q 'Machine:.*AArch64' && \
-    rust_so="$(find vllm -maxdepth 1 -name '_rust_tool_parser*.so' -print -quit)" && \
-    test -n "$rust_so" && readelf -h "$rust_so" | grep -q 'Machine:.*AArch64'
-
-# id= is explicit rather than derived from target so the store keeps a stable
-# identity across builds and across any future change of CCACHE_DIR.
-RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sharing=locked \
-    --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
-    cd /src/vllm && \
-    printf '%s\n' "$NVCC_PREPEND_FLAGS" "$TORCH_CUDA_ARCH_LIST" > "$CCACHE_EXTRAFILES" && \
-    { echo '== ccache at PipelineRun entry =='; \
-      ccache -sv || true; \
-      find "$CCACHE_DIR" -type f 2>/dev/null | wc -l || true; \
-      true; \
-    } && \
-    ccache -z && \
-    _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
-      --py-limited-api=cp38 --plat-name linux_aarch64 && \
-    ccache -sv | tee /src/ccache-stats-vllm.txt
+# FlashInfer only needs its own submodule tree and the build script, so copy
+# just those. Keeping this stage ahead of the full source COPY means an edit
+# anywhere else in the fork no longer invalidates its ~2h AOT compile layer.
+COPY third_party/flashinfer /src/vllm/third_party/flashinfer
+COPY tools/flashinfer-build.sh /src/vllm/tools/flashinfer-build.sh
 
 # FlashInfer publishes no cu133 wheel or JIT-cache index. Its cu130 runtime
 # wheel remains compatible; CUDA_VERSION controls the 13.3 AOT compiler.
@@ -274,6 +245,47 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
       rm -f "$CCACHE_LOGFILE"; \
       true; \
     } 2>&1 | tee /src/ccache-log-flashinfer.txt
+
+# Source commit and setuptools-scm version arrive as build args so the context
+# can exclude .git. CI re-clones the fork for every run, and a fresh clone's
+# .git bytes (FETCH_HEAD, reflogs, pack checksums) differ even for an
+# identical commit -- with .git in the context the COPY layer digest changed
+# every build and invalidated the multi-hour CUDA compile layers below.
+ARG VLLM_SOURCE_COMMIT=unknown
+ARG VLLM_SCM_VERSION=0.1.dev1
+COPY . /src/vllm
+RUN printf '%s\n' "${VLLM_SOURCE_COMMIT}" > /src/vllm-build-commit
+
+RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/vllm/target,sharing=locked \
+    cd /src/vllm && \
+    rustup toolchain install 1.95 && \
+    rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu && \
+    ./build_rust.sh && \
+    test -x vllm/vllm-rs && \
+    readelf -h vllm/vllm-rs | grep -q 'Machine:.*AArch64' && \
+    rust_so="$(find vllm -maxdepth 1 -name '_rust_tool_parser*.so' -print -quit)" && \
+    test -n "$rust_so" && readelf -h "$rust_so" | grep -q 'Machine:.*AArch64'
+
+# id= is explicit rather than derived from target so the store keeps a stable
+# identity across builds and across any future change of CCACHE_DIR.
+RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
+    cd /src/vllm && \
+    printf '%s\n' "$NVCC_PREPEND_FLAGS" "$TORCH_CUDA_ARCH_LIST" > "$CCACHE_EXTRAFILES" && \
+    { echo '== ccache at PipelineRun entry =='; \
+      ccache -sv || true; \
+      find "$CCACHE_DIR" -type f 2>/dev/null | wc -l || true; \
+      true; \
+    } && \
+    ccache -z && \
+    VLLM_VERSION_OVERRIDE="${VLLM_SCM_VERSION}" \
+    _PYTHON_HOST_PLATFORM=linux-aarch64 python3 setup.py bdist_wheel --dist-dir /wheels \
+      --py-limited-api=cp38 --plat-name linux_aarch64 && \
+    ccache -sv | tee /src/ccache-stats-vllm.txt
 
 # GGUF remains outside core image's critical path until its extension reliably
 # cross-compiles. Any fetch or build failure leaves an empty optional wheel dir.
