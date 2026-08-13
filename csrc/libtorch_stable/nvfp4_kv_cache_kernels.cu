@@ -19,6 +19,7 @@
 
 #include "libtorch_stable/dispatch_utils.h"
 #include "libtorch_stable/torch_utils.h"
+#include "libtorch_stable/nvfp4_kv_cache.h"
 
 #include <cmath>
 #include <string>
