@@ -550,7 +550,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor qk_weight, Tensor output_norm_weight, Tensor! output, "
       "int num_blocks, float eps, float output_norm_eps) -> ()");
 #endif
-      "Tensor? q_fp8_out=None, float q_fp8_scale=1.0) -> ()");
 
   // Apply repetition penalties to logits in-place.
   ops.def(
