@@ -1,0 +1,16 @@
+vllm/v1/worker/gpu/sample/sampler.py
+  h_15da545fc8cfbe 23,121
+vllm/v1/worker/gpu_worker.py
+  h_15da545fc8cfbe 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f32facbc06d3523902688e2ada56aef2be712435",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
