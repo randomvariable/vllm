@@ -1,0 +1,14 @@
+vllm/model_executor/warmup/kernel_warmup.py
+  h_15da545fc8cfbe 53,328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7dd3bd69bb3fab9872043b77e9dc6a8c4f17f2bb",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
