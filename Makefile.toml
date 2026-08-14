@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Development loop entry points, run from the repo root.
+#
+#   cargo make doctor              # what is and is not present
+#   cargo make setup               # create image and volumes if absent
+#   cargo make build               # incremental HIP/C++ build
+#   cargo make build -- -j 8       # extra args go to setup.py build_ext
+#   cargo make test -- tests/kernels/attention/test_x.py -k foo
+#
+# There is deliberately no Cargo.toml beside this file: cargo-make runs without
+# one, and adding a root workspace would pull `rust/` into the same build graph.
+#
+# The harness itself lives in homelab/devloop as a separate workspace. It is NOT
+# part of `rust/`, which ships as a product under deny.toml's dependency policy,
+# and which `cargo build` there must not be made to compile.
+
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
+[env]
+DEVLOOP = "homelab/devloop"
+
+[tasks.default]
+alias = "doctor"
+
+# Debug profile on purpose: this wrapper spawns a container and then waits, so
+# runtime is irrelevant, while a release build would add minutes after an edit.
+[tasks.devloop-build]
+description = "Compile the devloop harness"
+command = "cargo"
+args = ["build", "--quiet", "--manifest-path", "${DEVLOOP}/Cargo.toml"]
+
+[tasks.doctor]
+description = "Build the devloop harness and report environment state"
+dependencies = ["devloop-build"]
+command = "${DEVLOOP}/target/debug/vllm-devloop"
+args = ["doctor"]
+
+[tasks.setup]
+description = "Create the devtools image and volumes if absent (idempotent)"
+dependencies = ["devloop-build"]
+command = "${DEVLOOP}/target/debug/vllm-devloop"
+args = ["setup"]
+
+[tasks.build]
+description = "Incremental HIP/C++ build in the devtools container"
+dependencies = ["devloop-build"]
+command = "${DEVLOOP}/target/debug/vllm-devloop"
+args = ["build", "${@}"]
+
+[tasks.test]
+description = "Run pytest in the devtools container"
+dependencies = ["devloop-build"]
+command = "${DEVLOOP}/target/debug/vllm-devloop"
+args = ["test", "${@}"]
+
+[tasks.devloop-check]
+description = "fmt, clippy and unit tests for the devloop harness itself"
+script_runner = "@shell"
+script = '''
+set -eu
+cd "${DEVLOOP}"
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+'''
