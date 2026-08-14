@@ -1,0 +1,16 @@
+homelab/devloop/src/docker.rs
+  h_15da545fc8cfbe 122-123,185-192
+pyproject.toml
+  h_15da545fc8cfbe 52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e9fdd6f569c478dd70c528f9010182c84370da69",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
