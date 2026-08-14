@@ -537,7 +537,11 @@ class Dots3NoteDecoderLayer(DeepseekV32DecoderLayer):
                 prefix=f"{prefix}.mlp",
                 reduce_results=False,
             )
-        self.use_sequence_parallel_moe = False
+        self.use_sequence_parallel_moe = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+            and isinstance(self.mlp, DeepseekV2MoE)
+        )
         self.tp_size = parallel_config.tensor_parallel_size
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
