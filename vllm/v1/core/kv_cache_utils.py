@@ -1899,8 +1899,10 @@ def _get_kv_cache_groups_uniform_groups(
     # Split each SWA UniformKV group into smaller groups to align their
     # numbers of layer tuples. The packed block planner overlays groups, so
     # their page sizes do not need to match.
+    all_page_sizes = full_mla_spec.get_page_sizes()
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
+        sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
         is_nondefault_cp_mla = all(
             isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))

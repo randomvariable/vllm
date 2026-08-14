@@ -648,25 +648,6 @@ class VllmConfig:
         if speculative_config is None:
             return 0
         if speculative_config.use_dflash():
-            return self.num_speculative_tokens + 1
-        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
-            return self.num_speculative_tokens
-        return 0
-    @property
-    def num_lookahead_tokens(self) -> int:
-        """KV slots to reserve past the tokens the target model is scheduled for.
-
-        The drafter writes KV for positions beyond the target model's query
-        range, so every component that reserves blocks must add this margin:
-        the scheduler through `allocate_slots`, and the worker warmup, which
-        builds its own `SchedulerOutput`s. Consumers must read this property
-        rather than re-deriving their own per-method lookahead, so the
-        scheduler and warmup cannot drift apart.
-        """
-        speculative_config = self.speculative_config
-        if speculative_config is None:
-            return 0
-        if speculative_config.use_dflash():
             # DFlash requires an extra lookahead slot since it uses in-fill-style
             # decoding instead of standard next-token sampling, so it has a query
             # for the last sampled token plus queries for each draft token.

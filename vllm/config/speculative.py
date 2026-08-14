@@ -1950,47 +1950,6 @@ class SpeculativeConfig:
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
 
-        if not math.isfinite(self.dspark_confidence_threshold) or not (
-            0.0 <= self.dspark_confidence_threshold <= 1.0
-        ):
-            raise ValueError(
-                "dspark_confidence_threshold must be in [0, 1], got "
-                f"{self.dspark_confidence_threshold}."
-            )
-        if not math.isfinite(self.dspark_budget_frac) or not (
-            0.0 < self.dspark_budget_frac <= 1.0
-        ):
-            raise ValueError(
-                f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
-            )
-        if (
-            not math.isfinite(self.dspark_confidence_temperature)
-            or self.dspark_confidence_temperature <= 0.0
-        ):
-            raise ValueError(
-                "dspark_confidence_temperature must be > 0, got "
-                f"{self.dspark_confidence_temperature}."
-            )
-        if (
-            not math.isfinite(self.dspark_sps_overhead_ms)
-            or self.dspark_sps_overhead_ms < 0.0
-        ):
-            raise ValueError(
-                "dspark_sps_overhead_ms must be >= 0, got "
-                f"{self.dspark_sps_overhead_ms}."
-            )
-        if isinstance(self.dspark_sps_curve, str):
-            if self.dspark_sps_curve != "auto":
-                raise ValueError(
-                    'dspark_sps_curve must be a list of (batch_num_tokens, '
-                    f'steps_per_sec) pairs or "auto", got '
-                    f"{self.dspark_sps_curve!r}."
-                )
-        elif self.dspark_sps_curve is not None:
-            self.dspark_sps_curve = [
-                (int(b), float(s)) for b, s in self.dspark_sps_curve
-            ]
-
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
