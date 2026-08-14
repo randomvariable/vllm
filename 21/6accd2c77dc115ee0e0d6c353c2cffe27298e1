@@ -1,0 +1,14 @@
+third_party/b12x
+  h_15da545fc8cfbe 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "216accd2c77dc115ee0e0d6c353c2cffe27298e1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
