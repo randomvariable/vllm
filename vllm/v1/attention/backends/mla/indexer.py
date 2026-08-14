@@ -490,6 +490,20 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
+def get_indexer_max_num_blocks_per_req(
+    max_model_len: int,
+    block_size: int,
+    configured_cp_world_size: int,
+    dcp_replicated: bool,
+    dcp_kv_shard_count: int | None = None,
+) -> int:
+    """Size indexer metadata for the cache group's effective DCP layout."""
+    effective_cp_world_size = (
+        1 if dcp_replicated else int(dcp_kv_shard_count or configured_cp_world_size)
+    )
+    return cdiv(max_model_len, block_size * effective_cp_world_size)
+
+
 def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
@@ -904,6 +918,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        use_dcp_local_kv = self.dcp_world_size > 1 and dcp_local_seq_lens is not None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -1068,7 +1083,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     use_native=use_native,
                     next_n=next_n,
                     max_decode_len=max_decode_len,
-                    force_flatten=use_varlen,
+                    force_flatten=self.supports_varlen,
                 )
             )
 

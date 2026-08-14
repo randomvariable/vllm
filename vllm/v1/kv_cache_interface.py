@@ -756,6 +756,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 432 B/token (same record as MLAAttentionSpec;
+            # the swa_cache stores the identical nvfp4 latent).
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 432
+            if self.model_version == "glm_fp8_rope":
+                return self.block_size * 368
         if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
             # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to

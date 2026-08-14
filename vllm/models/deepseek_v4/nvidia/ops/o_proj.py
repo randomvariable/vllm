@@ -57,12 +57,19 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
 
+    The packed layout is a tcgen05/TMEM feature, so it keys off SM100
+    exactly rather than "anything newer than SM90". SM12x (GB10, RTX 50xx)
+    reports a numerically higher capability but has no TMEM, so it must use
+    the SM90 block-scale layout — the checkpoint stores wo_a scales as
+    [g, r/128, d/128], which only matches sfb_gran_mn=128.
+
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
-    tma_aligned_scales = cap.major >= 10
+    packed_tmem_scales = cap.major == 10
+    einsum_recipe = (1, 1, 128) if packed_tmem_scales else (1, 128, 128)
+    tma_aligned_scales = packed_tmem_scales
     return einsum_recipe, tma_aligned_scales
 
 

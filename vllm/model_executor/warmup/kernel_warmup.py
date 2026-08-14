@@ -246,7 +246,7 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     return len(warmed_signatures)
 
 
-def kernel_warmup(worker: "Worker"):
+def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
     compile_sizes = [
@@ -280,6 +280,12 @@ def kernel_warmup(worker: "Worker"):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     sparse_mla_triton_warmup(worker)
+
+    # The remaining warmups drive collectives / _dummy_run and must run in DP
+    # lockstep, so elastic-EP's process-local warmup stops here.
+    if process_local_only:
+        return
+
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
@@ -385,6 +391,15 @@ def kernel_warmup(worker: "Worker"):
         logger.info(
             "Skipping FlashInfer autotune because no FlashInfer compute kernels "
             "are active."
+        )
+    elif getattr(worker.model_runner, "block_tables", None) is None:
+        # `flashinfer_autotune` issues a dummy run that prepares attention
+        # tables, which only exist once `initialize_kv_cache` has run. This
+        # warmup is also invoked during memory profiling, before the KV cache
+        # is sized, so autotuning here would fail on a missing block table.
+        logger.info(
+            "Skipping FlashInfer autotune because the KV cache is not "
+            "initialized yet."
         )
     else:
         flashinfer_autotune(worker.model_runner)

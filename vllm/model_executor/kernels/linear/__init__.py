@@ -874,9 +874,15 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
     )
 
 
-def init_mxfp4_linear_kernel() -> MxFp4LinearKernel:
+def init_mxfp4_linear_kernel(
+    activation_quant_key: QuantKey | None = None,
+) -> MxFp4LinearKernel:
     """Select and instantiate the best MXFP4 linear kernel for the
     current platform."""
+    config = MxFp4LinearLayerConfig(
+        activation_quant_key=activation_quant_key,
+    )
+
     linear_backend = _get_linear_backend()
 
     platform = current_platform._enum
@@ -906,7 +912,7 @@ def init_mxfp4_linear_kernel() -> MxFp4LinearKernel:
             continue
 
         logger.info_once("Using %s for MXFP4 GEMM", kernel_cls.__name__)
-        return kernel_cls(MxFp4LinearLayerConfig())
+        return kernel_cls(config)
 
     raise ValueError(
         "Failed to find a kernel that can implement the "

@@ -6,6 +6,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.model import LogprobsMode
+from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -24,6 +25,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -37,6 +39,7 @@ class Sampler:
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
+        reasoning_config: ReasoningConfig | None = None,
         seed: int | None = None,
     ):
         if logprobs_mode not in ("processed_logprobs", "raw_logprobs"):
@@ -51,6 +54,7 @@ class Sampler:
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+        self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
 
