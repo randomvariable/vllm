@@ -5,7 +5,29 @@
 macro (find_python_from_executable EXECUTABLE SUPPORTED_VERSIONS)
   file(REAL_PATH ${EXECUTABLE} EXECUTABLE)
   set(Python_EXECUTABLE ${EXECUTABLE})
+  # Cross-compilation: with CMAKE_CROSSCOMPILING true, FindPython hunts a
+  # *target* interpreter and re-roots the Python.h/library search into
+  # CMAKE_FIND_ROOT_PATH, rejecting the host x86 python. vLLM does not need a
+  # target python: Python.h is arch-neutral, the host interpreter drives the
+  # build-time codegen (run_python), and the abi3 extensions never link
+  # libpython (Python_add_library MODULE below). So discover python exactly as
+  # a native build would, then restore cross mode for Torch/CUDA. The
+  # Python_add_library function and Python::Module/SABIModule targets this
+  # defines persist after cross mode is restored.
+  set(_vllm_fp_cross "${CMAKE_CROSSCOMPILING}")
+  if(CMAKE_CROSSCOMPILING)
+    set(CMAKE_CROSSCOMPILING FALSE)
+    set(_vllm_fp_mode_inc "${CMAKE_FIND_ROOT_PATH_MODE_INCLUDE}")
+    set(_vllm_fp_mode_lib "${CMAKE_FIND_ROOT_PATH_MODE_LIBRARY}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
+  endif()
   find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule)
+  if(_vllm_fp_cross)
+    set(CMAKE_CROSSCOMPILING "${_vllm_fp_cross}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE "${_vllm_fp_mode_inc}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY "${_vllm_fp_mode_lib}")
+  endif()
   if (NOT Python_FOUND)
     message(FATAL_ERROR "Unable to find python matching: ${EXECUTABLE}.")
   endif()
