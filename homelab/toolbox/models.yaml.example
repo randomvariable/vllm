@@ -1,0 +1,35 @@
+# Copy to models.yaml beside vllm_toolbox.py, or set VLLM_TOOLBOX_PRESETS.
+# hardware must be gfx1151, sm_121a, or both.
+models:
+  - name: "Hy3 iFP2"
+    source: "<hf-repo-or-path>"
+    hardware: gfx1151
+    gguf_file: "*Q2_0_ROCMFPX*.gguf"
+    tokenizer: "<optional-tokenizer-repo-or-path>"
+    max_model_len: 16384
+    gpu_memory_utilization: 0.92
+    extra_args: "--enable-prefix-caching"
+    notes: "Strix Halo optimised 2-bit ROCmFPX quant"
+
+  - name: "Qwen3 MoE A3B AWQ"
+    source: "<hf-repo-or-path>"
+    hardware: gfx1151
+    max_model_len: 32768
+    gpu_memory_utilization: 0.90
+    extra_args: "--quantization awq"
+    notes: "96GB-UMA-friendly MoE preset"
+
+  - name: "Blackwell FP4 example"
+    source: "<hf-repo-or-path>"
+    hardware: sm_121a
+    max_model_len: 32768
+    gpu_memory_utilization: 0.90
+    notes: "DGX Spark FP4 tensor-core model"
+
+  - name: "Portable model example"
+    source: "<hf-repo-or-path>"
+    hardware: both
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+    extra_args: ""
+    notes: "Available on either toolbox platform"
