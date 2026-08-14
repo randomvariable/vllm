@@ -1,0 +1,20 @@
+.gitmodules
+  h_15da545fc8cfbe 1-12
+third_party/b12x
+  h_15da545fc8cfbe 1
+third_party/deep_gemm
+  h_15da545fc8cfbe 1
+third_party/flashinfer
+  h_15da545fc8cfbe 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "3a9db6027769f4cbb9f9431d5c88f04f91001e07",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
