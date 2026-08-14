@@ -2425,6 +2425,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.encoder_runner.clear()
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
+            if self.model_state.supports_mm_inputs:
+                self.model_state.encoder_runner.clear()
             del self.model_state
         # Detach the layer-level KV/state cache tensors before dropping the
         # models; the model objects can outlive this runner.
