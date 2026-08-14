@@ -237,8 +237,6 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     MAX_JOBS=6 FLASHINFER_NVCC_THREADS=1 \
     BUILD_JIT_CACHE=true BUILD_NVEP=0 \
     ./tools/flashinfer-build.sh && \
-    uv build --python /opt/venv/bin/python --no-build-isolation --wheel \
-      --out-dir /wheels-flashinfer ./third_party/flashinfer/flashinfer-cubin && \
     { ccache -sv | tee /src/ccache-stats-flashinfer.txt; \
       ccache --print-stats | tee -a /src/ccache-stats-flashinfer.txt; \
       echo '== effective ccache config =='; \
@@ -412,13 +410,13 @@ COPY --from=builder /src/vllm-build-commit /opt/vllm-build-commit
 COPY --from=builder /src/ccache-stats-vllm.txt /src/ccache-stats-flashinfer.txt \
      /src/ccache-log-flashinfer.txt /opt/
 
-# Resolve dependencies from the pinned requirements used by the Spark image.
-# Build and install the matching local cubin wheel before the local Python
-# wheel so FlashInfer's import-time version check sees the same 0.6.18 release.
+# Resolve the local Python wheel's dependencies against the same indexes used by
+# requirements/cuda.txt. The JIT-cache wheel has no dependencies of its own.
+# The upstream cubin package is deliberately absent so it cannot shadow these
+# TOPK=256-capable native artifacts.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /runtime-requirements/cuda.txt && \
-    uv pip install --system --no-index --find-links /wheels-flashinfer \
-      'flashinfer-cubin==0.6.18' && \
+    uv pip install --system flashinfer-cubin==0.6.18 && \
     uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl && \
     uv pip install --system --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
