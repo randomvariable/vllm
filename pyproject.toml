@@ -49,6 +49,7 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
+fallback_version = "0.0.0.dev0"
 
 [tool.setuptools.packages.find]
 where = ["."]
