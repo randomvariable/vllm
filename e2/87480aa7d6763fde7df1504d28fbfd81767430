@@ -1,0 +1,19 @@
+vllm/model_executor/layers/quantization/exl3.py
+  s_8cbe8c4c1893a7::t_b804efced1ca71 201-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e287480aa7d6763fde7df1504d28fbfd81767430",
+  "prompts": {},
+  "sessions": {
+    "s_8cbe8c4c1893a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1bc0b76-c45b-421b-a492-9dd4eee77349",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
