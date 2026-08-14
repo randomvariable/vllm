@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
+    VLLM_DISABLE_MMAP: bool = False
+    VLLM_LOADER_NUM_THREADS: int = 1
     VLLM_USE_LAYERNAME: bool = True
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
@@ -1600,6 +1602,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
+    "VLLM_DISABLE_MMAP": lambda: bool(int(os.getenv("VLLM_DISABLE_MMAP", "0"))),
+    "VLLM_LOADER_NUM_THREADS": lambda: int(
+        os.getenv("VLLM_LOADER_NUM_THREADS", "1")
+    ),
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.
     "VLLM_USE_LAYERNAME": lambda: bool(int(os.getenv("VLLM_USE_LAYERNAME", "1"))),

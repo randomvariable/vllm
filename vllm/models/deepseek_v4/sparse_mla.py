@@ -335,6 +335,18 @@ class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
+def _get_c128a_active_topk_width(
+    max_seq_len: int, compress_ratio: int, max_compressed_tokens: int
+) -> int:
+    return min(
+        max(
+            triton.next_power_of_2(max(max_seq_len // compress_ratio, 1)),
+            _C128A_TOPK_ALIGNMENT,
+        ),
+        max_compressed_tokens,
+    )
+
+
 class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:

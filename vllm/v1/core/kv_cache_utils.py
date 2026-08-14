@@ -1902,6 +1902,62 @@ def _get_kv_cache_groups_uniform_groups(
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         layers_per_size: dict[int, list[str]] = defaultdict(list)
+        is_nondefault_cp_mla = all(
+            isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            and (
+                getattr(spec, "dcp_replicated", False)
+                or getattr(spec, "dcp_kv_shard_count", None) is not None
+            )
+            for spec in sm_spec.kv_cache_specs.values()
+        )
+        if not is_nondefault_cp_mla:
+            assert max(sm_page_sizes) <= max(all_page_sizes), (
+                "KV cache page size mismatch: non-first group pages "
+                f"{sorted(sm_page_sizes)} exceed full-MLA group pages "
+                f"{sorted(all_page_sizes)}. non-first group specs: "
+                + repr(
+                    {
+                        name: (
+                            type(spec).__name__,
+                            spec.page_size_bytes,
+                            getattr(spec, "cache_dtype_str", None),
+                            getattr(spec, "model_version", None),
+                            getattr(spec, "compress_ratio", None),
+                            getattr(spec, "alignment", None),
+                            spec.block_size,
+                            getattr(spec, "head_size", None),
+                            str(getattr(spec, "dtype", None)),
+                            getattr(spec, "dcp_replicated", None),
+                        )
+                        for name, spec in sm_spec.kv_cache_specs.items()
+                    }
+                )
+                + "; full-MLA group specs: "
+                + repr(
+                    {
+                        name: (
+                            type(spec).__name__,
+                            spec.page_size_bytes,
+                            getattr(spec, "cache_dtype_str", None),
+                            getattr(spec, "model_version", None),
+                            getattr(spec, "compress_ratio", None),
+                            getattr(spec, "alignment", None),
+                            spec.block_size,
+                            getattr(spec, "head_size", None),
+                            str(getattr(spec, "dtype", None)),
+                        )
+                        for name, spec in full_mla_spec.kv_cache_specs.items()
+                    }
+                )
+            )
+
+        # Unify page size by padding layers' page_size to the nearest larger page_size.
+        # Compute candidate (nearest larger page_size) for each unique page size.
+        size_to_candidate: dict[int, int] = {}
+        for ps in sm_page_sizes:
+            if ps <= max(all_page_sizes):
+                size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+        # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             layers_per_size[layer_spec.page_size_bytes].append(layer_name)
         # NOTE(yifan): for now, inside a UniformKV group, each page_size should

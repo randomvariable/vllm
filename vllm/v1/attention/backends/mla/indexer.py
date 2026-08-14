@@ -543,19 +543,7 @@ def get_indexer_max_num_blocks_per_req(
     return cdiv(max_model_len, block_size * effective_cp_world_size)
 
 
-def _supports_varlen_paged_mqa_logits(
-    use_b12x_sparse_indexer: bool | None = None,
-) -> bool:
-    if use_b12x_sparse_indexer is None and current_platform.is_cuda():
-        from vllm.model_executor.layers.sparse_attn_indexer import (
-            use_b12x_sparse_indexer as resolve_b12x_sparse_indexer,
-        )
-
-        use_b12x_sparse_indexer = resolve_b12x_sparse_indexer()
-    if use_b12x_sparse_indexer:
-        # B12X consumes the already-flattened rank-1 seq_lens and repeated
-        # block-table rows directly, so it does not need DeepGEMM's indices.
-        return True
+def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
@@ -1375,7 +1363,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     use_native=use_native,
                     next_n=next_n,
                     max_decode_len=max_decode_len,
-                    force_flatten=use_varlen,
+                    force_flatten=self.supports_varlen,
                 )
             )
 

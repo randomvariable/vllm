@@ -284,6 +284,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     """
     mapping: dict[str, list[Mxfp4MoeBackend]] = {
         "b12x": list(B12X_BACKENDS),
+        "flashinfer_b12x": list(B12X_BACKENDS),
         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
         "flashinfer_trtllm": [
             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,

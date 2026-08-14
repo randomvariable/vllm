@@ -110,11 +110,15 @@ def _resolve_dsv4_kv_cache_dtype(
     """
     if use_fp8_ds_mla_layout:
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
+        # nvfp4_ds_mla is also a valid block-scaled format (NVFP4 instead of
+        # FP8) used by the b12x MLA sparse backend.
+        assert kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla") or (
+            kv_cache_dtype.startswith("fp8")
+        ), (
+            f"DeepseekV4 fp8_ds_mla layout only supports fp8/nvfp4 kv-cache, "
             f"got {kv_cache_dtype}"
         )
-        if kv_cache_dtype != "fp8_ds_mla":
+        if kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             if cache_config is not None:
                 cache_config.cache_dtype = "fp8_ds_mla"
             kv_cache_dtype = "fp8_ds_mla"

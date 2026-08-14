@@ -54,6 +54,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
+from vllm.model_executor.warmup.v1_block_table_warmup import (
+    warm_v1_block_table_kernels,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -273,29 +276,16 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     return len(warmed_signatures)
 
 
-def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:
+def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if not worker.use_v2_model_runner:
+        # Pooling models do not use the generation slot-mapping path.
+        if not worker.model_runner.is_pooling_model:
+            warm_v1_block_table_kernels(worker.model_runner)
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
-
-    if worker.vllm_config.kernel_config.enable_jit_warmup:
-        logger.info("JIT kernel warmup starting.")
-        jit_warmup_start = time.perf_counter()
-        try:
-            worker.model_runner.jit_warmup_registry.warmup()
-        except Exception:
-            logger.exception(
-                "JIT kernel warmup failed after %.2fs.",
-                time.perf_counter() - jit_warmup_start,
-            )
-            raise
-        logger.info(
-            "JIT kernel warmup finished in %.2fs.",
-            time.perf_counter() - jit_warmup_start,
-        )
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
@@ -327,7 +317,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
         fa4_cutedsl_warmup(worker)
-        sparse_mla_triton_warmup(worker)
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
@@ -352,6 +341,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
 
     # Run next so input-prep kernels JIT against pristine runner state.
     sparse_mla_triton_warmup(worker)
+
+    # The remaining warmups drive collectives / _dummy_run and must run in DP
+    # lockstep, so elastic-EP's process-local warmup stops here.
+    if process_local_only:
+        return False
+
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
@@ -459,6 +454,15 @@ def runtime_kernel_warmup(worker: "Worker") -> None:
         logger.info_once(
             "Skipping FlashInfer autotune because no FlashInfer compute kernels "
             "are active."
+        )
+    elif getattr(worker.model_runner, "block_tables", None) is None:
+        # `flashinfer_autotune` issues a dummy run that prepares attention
+        # tables, which only exist once `initialize_kv_cache` has run. This
+        # warmup is also invoked during memory profiling, before the KV cache
+        # is sized, so autotuning here would fail on a missing block table.
+        logger.info(
+            "Skipping FlashInfer autotune because the KV cache is not "
+            "initialized yet."
         )
     else:
         flashinfer_autotune(worker.model_runner)

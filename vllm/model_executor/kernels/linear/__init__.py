@@ -1016,57 +1016,6 @@ def init_mxfp6_linear_kernel(
         "MXFP6 linear layer. Reasons: \n" + "\n".join(failure_reasons)
     )
 
-def init_mxfp6_linear_kernel(
-    weight_quant_key: QuantKey,
-    activation_quant_key: QuantKey | None = None,
-) -> MxFp6LinearKernel:
-    """Select and instantiate the best MXFP6 linear kernel for the
-    current platform."""
-    config = MxFp6LinearLayerConfig(
-        weight_quant_key=weight_quant_key,
-        activation_quant_key=activation_quant_key,
-    )
-
-    linear_backend = _get_linear_backend()
-
-    platform = current_platform._enum
-    possible = list(_POSSIBLE_MXFP6_KERNELS.get(platform, []))
-
-    if linear_backend != "auto":
-        filtered = _filter_kernels_by_backend(linear_backend, possible)
-        if not filtered:
-            raise ValueError(
-                f"--linear-backend={linear_backend} was requested but no "
-                f"'{linear_backend}' kernel exists for MXFP6 layers."
-            )
-        possible = filtered
-
-    failure_reasons = []
-    for kernel_cls in possible:
-        if kernel_cls.__name__ in envs.VLLM_DISABLED_KERNELS:
-            failure_reasons.append(
-                f" {kernel_cls.__name__} disabled by environment variable"
-            )
-            continue
-
-        is_supported, reason = kernel_cls.is_supported()
-        if not is_supported:
-            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
-            continue
-
-        can_implement, reason = kernel_cls.can_implement(config)
-        if not can_implement:
-            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
-            continue
-
-        logger.info_once("Using %s for MXFP6 GEMM", kernel_cls.__name__)
-        return kernel_cls(config)
-
-    raise ValueError(
-        "Failed to find a kernel that can implement the "
-        "MXFP6 linear layer. Reasons: \n" + "\n".join(failure_reasons)
-    )
-
 def init_wfp8_a16_linear_kernel(
     weight_quant_key: QuantKey,
     activation_quant_key: QuantKey,
