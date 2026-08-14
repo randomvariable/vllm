@@ -1,0 +1,14 @@
+vllm/platforms/rocm.py
+  h_15da545fc8cfbe 4,43-55,110,213-235,245-253,279-287,429-433,445-506,945,953-965,1134-1179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ed7fac673a3b54398bf414121ff7a8a2e64d5b1d",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
