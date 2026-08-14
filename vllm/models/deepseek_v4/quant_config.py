@@ -179,7 +179,12 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                # Empty moe_quant_algo means the checkpoint made no per-layer
+                # distinction; the fp4 experts are NVFP4 model-wide.
+                if (
+                    self.moe_quant_algo in ("", "NVFP4")
+                    and self._is_nvfp4_expert_layer(prefix)
+                ):
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )

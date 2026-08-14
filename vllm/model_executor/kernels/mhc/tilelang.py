@@ -300,6 +300,40 @@ def _mhc_pre_tilelang_fake(
     return post_mix, comb_mix, layer_input
 
 
+def _mhc_pre_broadcast_tilelang_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    fn_broadcast: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = residual.shape[0]
+    hidden_size = residual.shape[-1]
+    hc_mult = fn.shape[1] // hidden_size
+
+    residual_out = torch.empty(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    post_mix = torch.empty(
+        num_tokens, hc_mult, 1, dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    return residual_out, post_mix, comb_mix, layer_input
+
+
 def mhc_pre_broadcast_tilelang(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -639,7 +673,7 @@ def mhc_fused_post_pre_tilelang(
             hidden_size,
             hc_mult3,
             tile_n=tile_n,
-            n_splits=n_splits,
+            split_k=n_splits,
         )
     else:
         mhc_post_tilelang(
@@ -885,12 +919,12 @@ def mhc_pre_tilelang(*args, **kwargs):
 
 
 def mhc_pre_broadcast_tilelang(*args, **kwargs):
-    """Call broadcast MHC pre through the registered custom op.
+    """Call MHC pre (broadcast) through the registered custom op.
 
-    The implementation invokes DeepGEMM through a pybind extension, which
-    cannot be traced by Dynamo. Keeping that call behind a custom-op boundary
-    lets full-graph compilation represent the operation without entering its
-    Python implementation.
+    Same rationale as ``mhc_pre_tilelang``: the broadcast variant calls
+    DeepGEMM's ``tf32_hc_prenorm_gemm`` directly, which torch.compile cannot
+    trace. Routing through the custom op keeps the raw C++ call out of the
+    Dynamo graph during memory profiling and CUDA graph capture.
     """
     return torch.ops.vllm.mhc_pre_broadcast_tilelang(*args, **kwargs)
 
