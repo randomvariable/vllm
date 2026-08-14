@@ -20,6 +20,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import (
+    _C128A_TOPK_ALIGNMENT,
     get_c128a_topk_width,
     get_compressed_slot_mapping,
 )
