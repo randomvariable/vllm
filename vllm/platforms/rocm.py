@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import glob
 import os
 import platform
 from datetime import timedelta
@@ -39,6 +40,19 @@ try:
         amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
+    AmdSmiException = RuntimeError
+
+    def _amdsmi_unavailable(*args, **kwargs):
+        raise RuntimeError("amdsmi is unavailable")
+
+    amdsmi_get_gpu_asic_info = _amdsmi_unavailable
+    amdsmi_get_gpu_device_uuid = _amdsmi_unavailable
+    amdsmi_get_gpu_memory_total = _amdsmi_unavailable
+    amdsmi_get_processor_handles = _amdsmi_unavailable
+    amdsmi_init = _amdsmi_unavailable
+    amdsmi_shut_down = _amdsmi_unavailable
+    amdsmi_topo_get_link_type = _amdsmi_unavailable
+    amdsmi_topo_get_numa_node_number = _amdsmi_unavailable
     logger.warning("Failed to import from amdsmi with %r", e)
 
 try:
@@ -93,7 +107,7 @@ def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     # This can be removed and simply replaced with torch.cuda.get_device_count
     # after https://github.com/pytorch/pytorch/pull/122815 is released."""
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
-    # LRU Cache purposes.
+    # LRU cache purposes.
 
     # Code below is based on
     # https://github.com/pytorch/pytorch/blob/
@@ -196,6 +210,29 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
     return amdsmi_get_gpu_memory_total(handle, AmdSmiMemoryType.VRAM)
 
 
+def _gfx_arch_from_kfd_target_version(target_version: int) -> str:
+    major = target_version // 10000
+    minor = (target_version // 100) % 100
+    stepping = target_version % 100
+    return f"gfx{major}{minor}{stepping:x}"
+
+
+def _query_gcn_arch_from_kfd_topology() -> str:
+    """Query GCN arch from KFD topology without initializing HIP/CUDA."""
+    topology_root = "/sys/class/kfd/kfd/topology/nodes"
+    for node in os.scandir(topology_root):
+        properties_path = os.path.join(node.path, "properties")
+        properties: dict[str, str] = {}
+        with open(properties_path, encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                properties[key] = value.strip()
+        target_version = int(properties.get("gfx_target_version", "0"))
+        if int(properties.get("vendor_id", "0")) == 0x1002 and target_version > 0:
+            return _gfx_arch_from_kfd_target_version(target_version)
+    raise RuntimeError("KFD topology did not return valid GCN arch")
+
+
 def _get_gcn_arch() -> str:
     """
     Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
@@ -205,6 +242,15 @@ def _get_gcn_arch() -> str:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
+        try:
+            return _query_gcn_arch_from_kfd_topology()
+        except Exception as e:
+            logger.debug("Failed to get GCN arch via KFD topology: %s", e)
+        logger.warning_once(
+            "Failed to get GCN arch via amdsmi, falling back to torch.cuda. "
+            "This will initialize CUDA and may cause "
+            "issues if CUDA_VISIBLE_DEVICES is not set yet."
+        )
     # Ultimate fallback: use torch.cuda (will initialize CUDA)
     return torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -230,6 +276,15 @@ _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 # RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
 _ON_RDNA = _ON_GFX1X and not _ON_CDNA
 _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
+_CONSUMER_RDNA_ARCHES = (
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+)
+_ON_CONSUMER_RDNA = any(arch in _GCN_ARCH for arch in _CONSUMER_RDNA_ARCHES)
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -371,6 +426,11 @@ def get_cdna_version() -> int:
     return 0
 
 
+def on_consumer_rdna() -> bool:
+    """Return True for consumer RDNA 3 / 3.5 GPUs that lack MIOpen solver DBs."""
+    return _ON_CONSUMER_RDNA
+
+
 # Enable HIP online tuning early, before hipBLASLt initializes.
 # Turn on hipBLASLt online tuning if use AITER hipBLASLt GEMM.
 if (
@@ -380,6 +440,68 @@ if (
     and get_cdna_version() > 2
 ):
     os.environ["HIP_ONLINE_TUNING"] = "1"
+
+
+@cache
+def unsupported_reason_rocm_custom_paged_attention(
+    qtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    gqa_ratio: int,
+    max_seq_len: int,
+    sliding_window: int,
+    kv_cache_dtype: str,
+    has_alibi_slopes: bool = False,
+    has_sinks: bool = False,
+) -> str | None:
+    """Why the ROCm custom paged-attention kernel cannot serve this config.
+
+    Returns a short specific reason, or ``None`` when the config is inside the
+    kernel's envelope. Kept next to :func:`use_rocm_custom_paged_attention` so
+    the two cannot drift apart, and takes booleans rather than the alibi/sink
+    tensors so the ``@cache`` key stays bounded by the config space instead of
+    growing per tensor identity.
+
+    The envelope is architecture-dependent, so the reason names the arch's
+    actual requirement rather than a generic one.
+    """
+    dtype_ok = qtype == torch.half or qtype == torch.bfloat16
+    window_ok = sliding_window == 0 or sliding_window == (-1, -1)
+
+    if not _ON_GFX9 and not _ON_GFX1X:
+        return f"unsupported architecture ({_GCN_ARCH})"
+
+    # Shared by both architectures.
+    if not window_ok:
+        return f"sliding window enabled (window={sliding_window})"
+    if not dtype_ok:
+        return f"unsupported query dtype ({qtype}); needs float16 or bfloat16"
+    if max_seq_len > 128 * 1024:
+        return f"max_seq_len {max_seq_len} exceeds 128K"
+    if has_sinks:
+        return "attention sinks enabled"
+
+    if _ON_GFX9:
+        if head_size not in (64, 128):
+            return f"unsupported head size ({head_size}); needs 64 or 128"
+        if block_size not in (16, 32):
+            return f"unsupported block size ({block_size}); needs 16 or 32"
+        if not (1 <= gqa_ratio <= 16):
+            return f"GQA ratio {gqa_ratio} outside supported range 1-16"
+        return None
+
+    # gfx11xx / gfx12xx (RDNA): a strictly narrower envelope than gfx9.
+    if head_size != 128:
+        return f"unsupported head size ({head_size}); needs 128 on this arch"
+    if block_size != 16:
+        return f"unsupported block size ({block_size}); needs 16 on this arch"
+    if not (3 <= gqa_ratio <= 16):
+        return f"GQA ratio {gqa_ratio} outside supported range 3-16 on this arch"
+    if has_alibi_slopes:
+        return "ALiBi slopes not supported on this arch"
+    if kv_cache_dtype != "auto":
+        return f"quantized KV cache ({kv_cache_dtype}) not supported on this arch"
+    return None
 
 
 @cache
@@ -820,14 +942,26 @@ class RocmPlatform(Platform):
     @classmethod
     @with_amdsmi_context
     @lru_cache(maxsize=8)
-    def get_device_name(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+    def _get_device_name_from_amdsmi(cls, physical_device_id: int) -> str:
         handle = amdsmi_get_processor_handles()[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:
             return _ROCM_DEVICE_ID_NAME_MAP[asic_info_device_id]
         return asic_info["market_name"]
+
+    @classmethod
+    @lru_cache(maxsize=8)
+    def get_device_name(cls, device_id: int = 0) -> str:
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        try:
+            return cls._get_device_name_from_amdsmi(physical_device_id)
+        except AmdSmiException as error:
+            logger.warning_once(
+                "Failed to get device name from amdsmi, falling back to torch.cuda: %s",
+                error,
+            )
+            return torch.cuda.get_device_name(device_id)
 
     @classmethod
     @with_amdsmi_context
@@ -996,6 +1130,52 @@ class RocmPlatform(Platform):
     @classmethod
     def is_navi(cls) -> bool:
         return "gfx1" in _GCN_ARCH
+
+    @classmethod
+    def is_integrated_gpu(cls, device_id: int = 0) -> bool:
+        """Detect AMD APU (integrated GPU sharing system memory)."""
+        try:
+            drm_cards = glob.glob("/sys/class/drm/card*/device/mem_info_vram_total")
+            if not drm_cards:
+                return False
+            with open(drm_cards[0]) as f:
+                sysfs_vram = int(f.read().strip())
+            _, hip_total = torch.cuda.mem_get_info(device_id)
+            return sysfs_vram > hip_total * 4
+        except Exception:
+            return False
+
+    @classmethod
+    def mem_get_info(cls, device: torch.types.Device | None = None) -> tuple[int, int]:
+        """Return (free, total) GPU memory in bytes.
+
+        On AMD APUs the HIP-reported VRAM aperture is a small carve-out of
+        shared system memory; use the sysfs GTT pool as the real budget.
+        """
+        free, total = torch.cuda.mem_get_info(device)
+        if cls.is_integrated_gpu():
+            try:
+                drm_cards = glob.glob("/sys/class/drm/card*/device/mem_info_gtt_total")
+                if drm_cards:
+                    card_dir = os.path.dirname(drm_cards[0])
+                    with open(os.path.join(card_dir, "mem_info_gtt_total")) as f:
+                        gtt_total = int(f.read().strip())
+                    with open(os.path.join(card_dir, "mem_info_gtt_used")) as f:
+                        gtt_used = int(f.read().strip())
+                    safe_total = gtt_total - (8 * 1024**3)
+                    safe_free = max(0, safe_total - gtt_used)
+                    logger.info_once(
+                        "AMD APU detected: using sysfs GTT memory "
+                        "(total=%.1f GiB, free=%.1f GiB) instead of "
+                        "HIP-reported VRAM aperture (%.1f GiB).",
+                        safe_total / (1024**3),
+                        safe_free / (1024**3),
+                        total / (1024**3),
+                    )
+                    return int(safe_free), int(safe_total)
+            except Exception:
+                pass
+        return free, total
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
