@@ -119,6 +119,8 @@ impl Env {
             "HF_HOME",
             "XDG_CACHE_HOME",
             "HOME",
+            "SETUPTOOLS_SCM_PRETEND_VERSION",
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM",
         ]
         .into_iter()
         .map(|name| (name, std::env::var_os(name)))
@@ -179,6 +181,14 @@ impl Env {
                 "-e".to_string(),
                 format!("HUGGINGFACE_HUB_CACHE={HUB_CACHE_CONTAINER}"),
             ]);
+        }
+        for name in [
+            "SETUPTOOLS_SCM_PRETEND_VERSION",
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                args.extend(["-e".to_string(), format!("{name}={}", value.to_string_lossy())]);
+            }
         }
         args.extend(
             [
