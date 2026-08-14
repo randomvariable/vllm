@@ -562,6 +562,24 @@ class VllmConfig:
         return hash_str
 
     @property
+    def is_ec_producer_only(self) -> bool:
+        ec_config = self.ec_transfer_config
+        return (
+            ec_config is not None
+            and ec_config.is_ec_producer
+            and not ec_config.is_ec_consumer
+        )
+
+    @property
+    def is_encoder_only(self) -> bool:
+        mm_config = (
+            self.model_config.multimodal_config
+            if self.model_config is not None
+            else None
+        )
+        return self.is_ec_producer_only or bool(mm_config and mm_config.mm_encoder_only)
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
@@ -599,6 +617,26 @@ class VllmConfig:
             return self.diffusion_config.canvas_length
         return 0
 
+
+    @property
+    def num_lookahead_tokens(self) -> int:
+        """KV slots to reserve past the tokens the target model is scheduled for.
+
+        The drafter writes KV for positions beyond the target model's query
+        range, so every component that reserves blocks must add this margin:
+        the scheduler through `allocate_slots`, and the worker warmup, which
+        builds its own `SchedulerOutput`s. Consumers must read this property
+        rather than re-deriving their own per-method lookahead, so the
+        scheduler and warmup cannot drift apart.
+        """
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return 0
+        if speculative_config.use_dflash():
+            return self.num_speculative_tokens + 1
+        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
+            return self.num_speculative_tokens
+        return 0
     @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
