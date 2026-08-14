@@ -1,2 +1,0 @@
-libcudacxx/CMakeLists.txt
-libcudacxx/include/cuda/__device/device_ref.h
