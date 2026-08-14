@@ -1,0 +1,16 @@
+tests/v1/attention/test_attention_backends.py
+  h_15da545fc8cfbe 360,474-484,740-743,812
+vllm/v1/attention/backends/flashinfer.py
+  h_15da545fc8cfbe 483,488-489,496,562-567,949-950,952,961-962,994-996,1062,1250-1252,1254-1255,1258-1259,1294,1311,1581-1584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "74f483d690363647a5d5e2f52c5372ba94f52ae4",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
