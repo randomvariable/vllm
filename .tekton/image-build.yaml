@@ -1,0 +1,170 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: vllm-image-build
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[homelabs-main]"
+spec:
+  params:
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    # Deployment overlay replaces redacted image path; never pass credentials as params.
+    - name: image
+      value: "<REDACTED_REGISTRY>/<REDACTED_REPOSITORY>"
+  taskRunTemplate:
+    # Deployment overlay replaces this placeholder.
+    serviceAccountName: <REDACTED_SERVICE_ACCOUNT>
+  pipelineSpec:
+    params:
+      - name: repo_url
+        type: string
+      - name: revision
+        type: string
+      - name: image
+        type: string
+    workspaces:
+      - name: source
+      - name: basic-auth
+      - name: docker-config
+    results:
+      - name: source-sha
+        value: $(tasks.source-identity.results.source-sha)
+      - name: submodule-shas
+        value: $(tasks.source-identity.results.submodule-shas)
+      - name: image-ref
+        value: $(tasks.resolve-image.results.image-ref)
+      - name: image-digest
+        value: $(tasks.resolve-image.results.image-digest)
+      - name: image-revision
+        value: $(tasks.resolve-image.results.image-revision)
+    tasks:
+      - name: clone
+        taskRef:
+          name: git-clone
+        params:
+          - name: url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+          - name: deleteExisting
+            value: "true"
+          - name: submodules
+            value: "true"
+        workspaces:
+          - name: output
+            workspace: source
+          - name: basic-auth
+            workspace: basic-auth
+      - name: source-identity
+        runAfter: [clone]
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          results:
+            - name: source-sha
+            - name: submodule-shas
+          steps:
+            - name: verify
+              image: cgr.dev/chainguard/git@sha256:REDACTED
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                test "$(params.revision)" = "$${revision#????????????????????????????????????????}" && exit 1 || true
+                test "$(git rev-parse HEAD)" = "$(params.revision)"
+                git rev-parse HEAD > "$(results.source-sha.path)"
+                git submodule status --recursive | awk '{print $1}' | paste -sd, - > "$(results.submodule-shas.path)"
+      - name: build
+        runAfter: [source-identity]
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          params:
+            - name: image
+              type: string
+          steps:
+            - name: build
+              image: moby/buildkit:v0.24.0-rootless@sha256:995077ff90af1afff56ff23018699d7511d122b2b111041f2011bd12afd5c0fe
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: BUILDKITD_FLAGS
+                  value: --oci-worker-no-process-sandbox
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl-daemonless.sh build \
+                  --frontend dockerfile.v0 \
+                  --local context=. \
+                  --local dockerfile=. \
+                  --opt filename=homelab/spark-cross.Dockerfile \
+                  --opt build-arg:VLLM_BUILD_COMMIT=$(tasks.source-identity.results.source-sha) \
+                  --opt build-arg:VLLM_BUILD_PIPELINE=$(context.pipelineRun.name) \
+                  --opt build-arg:VLLM_BUILD_URL= \
+                  --opt build-arg:VLLM_IMAGE_TAG=$(params.image):$(tasks.source-identity.results.source-sha) \
+                  --output type=image,name=$(params.image):$(tasks.source-identity.results.source-sha),push=true
+        params:
+          - name: image
+            value: $(params.image)
+      - name: resolve-image
+        runAfter: [build]
+        workspaces:
+          - name: source
+            workspace: source
+          - name: docker-config
+            workspace: docker-config
+        taskSpec:
+          workspaces:
+            - name: source
+            - name: docker-config
+          results:
+            - name: image-ref
+            - name: image-digest
+            - name: image-revision
+          steps:
+            - name: inspect
+              image: gcr.io/go-containerregistry/crane:debug@sha256:ba318977330d2a41fdd4af7536d35567a4ceb204252b7dfcd19b01dad2567793
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: DOCKER_CONFIG
+                  value: $(workspaces.docker-config.path)
+              script: |
+                #!/busybox/sh
+                set -eu
+                ref="$(params.image):$(tasks.source-identity.results.source-sha)"
+                digest=$(crane digest "$ref")
+                revision=$(crane config "$ref" | grep -o '"org.opencontainers.image.revision":"[^"]*"' | cut -d'"' -f4)
+                test "$revision" = "$(tasks.source-identity.results.source-sha)"
+                printf '%s' "$ref" > "$(results.image-ref.path)"
+                printf '%s' "$digest" > "$(results.image-digest.path)"
+                printf '%s' "$revision" > "$(results.image-revision.path)"
+                printf 'SOURCE_SHA=%s IMAGE=<REDACTED_PATH>@%s\n' "$(tasks.source-identity.results.source-sha)" "$digest"
+        params:
+          - name: image
+            value: $(params.image)
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          # Deployment overlay replaces this placeholder.
+          storageClassName: <REDACTED_STORAGE_CLASS>
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+    - name: basic-auth
+      secret:
+        # Deployment overlay supplies this secret.
+        secretName: "{{ git_auth_secret }}"
+    - name: docker-config
+      secret:
+        # Deployment overlay supplies this secret.
+        secretName: "{{ docker_config_secret }}"
