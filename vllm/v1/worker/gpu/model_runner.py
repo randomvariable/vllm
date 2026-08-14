@@ -2547,6 +2547,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.encoder_runner.clear()
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
+            if self.model_state.supports_mm_inputs:
+                self.model_state.encoder_runner.clear()
             del self.model_state
         if getattr(self, "speculator", None) is not None:
             self.speculator = None
