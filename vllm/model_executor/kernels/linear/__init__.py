@@ -107,9 +107,6 @@ from vllm.model_executor.kernels.linear.mxfp8 import (
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
-from vllm.model_executor.kernels.linear.mxfp8.b12x import (
-    B12xMxfp8LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mxfp8.emulation import (
     EmulationMxfp8LinearKernel,
 )
@@ -397,7 +394,6 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
-        B12xTensorFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -434,7 +430,6 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
-        B12xFp8BlockScaledMMKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
@@ -507,7 +502,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
-        B12xMxfp8LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
