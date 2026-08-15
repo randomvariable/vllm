@@ -1,0 +1,19 @@
+vllm/envs.py
+  s_49ec098eacd67a::t_1c84e5f2839431 295,2033-2038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "1a63f95288ffcb53b5f13c84d85bd36b90faf611",
+  "prompts": {},
+  "sessions": {
+    "s_49ec098eacd67a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_49ec098eacd67a",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
