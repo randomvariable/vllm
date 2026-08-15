@@ -119,6 +119,11 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     block_size: int
     topk_tokens: int
 
+    # [#48407] number of decode tokens in this batch; 0 => a pure prefill batch.
+    # Stage A: populated for diagnostics only. The indexer skip is dormant
+    # (binding == ""), so nothing consumes this yet.
+    num_decode_tokens: int = 0
+
     # Pre-computed C128A metadata (compress_ratio == 128 only).
     # Decode: global slot ids + valid-entry counts (fused from positions).
     c128a_global_decode_topk_indices: torch.Tensor | None = None
@@ -269,11 +274,20 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 cp_kv_cache_interleave_size,
             )
 
+        # [#48407] Number of decode tokens (0 => pure prefill batch), for the
+        # (dormant) indexer scoring-skip decision. Same split + threshold the
+        # C128A builder uses.
+        (_, _, num_decode_tokens, _) = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.reorder_batch_threshold or 1,
+        )
+
         return DeepseekV4FlashMLAMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
             num_actual_tokens=cm.num_actual_tokens,
+            num_decode_tokens=num_decode_tokens,
             query_start_loc=cm.query_start_loc,
             slot_mapping=slot_mapping,
             block_table=cm.block_table_tensor,

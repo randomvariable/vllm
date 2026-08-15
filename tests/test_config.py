@@ -16,6 +16,7 @@ import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -1906,6 +1907,30 @@ def test_dspark_capacity_config_validation():
             dspark_sps_curve=[(1, float("nan"))],
         )
 
+
+
+def test_speculative_config_requires_host_draft_token_ids():
+    assert SpeculativeConfig(
+        method="dspark", num_speculative_tokens=1
+    ).requires_host_draft_token_ids()
+    assert SpeculativeConfig(
+        method="dflash", num_speculative_tokens=1
+    ).requires_host_draft_token_ids()
+    assert not SpeculativeConfig(
+        method="ngram", num_speculative_tokens=1
+    ).requires_host_draft_token_ids()
+
+
+def test_nvfp4_mla_cache_dtype_is_normalized():
+    cache_config = CacheConfig(cache_dtype="nvfp4")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+        cache_config=cache_config,
+    )
+
+    VllmConfig.validate_nvfp4_kv_cache_with_mla(config)
+
+    assert cache_config.cache_dtype == "nvfp4_ds_mla"
 
 def test_ir_op_priority_default():
     """Test that IR op priority defaults are set correctly."""

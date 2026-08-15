@@ -200,6 +200,83 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert len(engine_core_outputs[1].outputs) == 1
 
 
+def test_partial_prefill_admission_cap_blocks_new_waiting_requests():
+    scheduler = create_scheduler(max_num_seqs=8, max_num_batched_tokens=8)
+    running = create_requests(
+        num_requests=1, num_tokens=32, req_ids=["running-partial"]
+    )[0]
+    scheduler.add_request(running)
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens[running.request_id] == 8
+
+    waiting = create_requests(
+        num_requests=1, num_tokens=4, req_ids=["waiting-partial"]
+    )[0]
+    scheduler.add_request(waiting)
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_new_reqs == []
+    assert waiting in scheduler.waiting
+
+
+def test_partial_prefill_cap_allows_admission_when_no_prefill_is_inflight():
+    scheduler = create_scheduler(max_num_seqs=32, max_num_batched_tokens=32)
+    request = create_requests(num_requests=1, num_tokens=4, req_ids=["first-request"])[
+        0
+    ]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_new_reqs) == 1
+    assert request not in scheduler.waiting
+
+
+def test_partial_prefill_cap_blocks_new_prefill_request():
+    scheduler = create_scheduler(max_num_seqs=32, max_num_batched_tokens=32)
+    running = create_requests(num_requests=1, num_tokens=64, req_ids=["running-cap"])[0]
+    scheduler.add_request(running)
+    scheduler.schedule()
+    assert running in scheduler._inflight_prefills
+
+    waiting = create_requests(num_requests=1, num_tokens=4, req_ids=["waiting-cap"])[0]
+    scheduler.add_request(waiting)
+    output = scheduler.schedule()
+
+    assert output.scheduled_new_reqs == []
+    assert waiting in scheduler.waiting
+
+
+def test_long_partial_prefill_cap_blocks_long_request_but_allows_short_request():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=16,
+        max_num_partial_prefills=2,
+        max_long_partial_prefills=1,
+        long_prefill_token_threshold=8,
+    )
+    running_long = create_requests(
+        num_requests=1, num_tokens=32, req_ids=["running-long"]
+    )[0]
+    scheduler.add_request(running_long)
+    scheduler.schedule()
+
+    waiting_long = create_requests(
+        num_requests=1, num_tokens=32, req_ids=["waiting-long"]
+    )[0]
+    waiting_short = create_requests(
+        num_requests=1, num_tokens=4, req_ids=["waiting-short"]
+    )[0]
+    scheduler.add_request(waiting_long)
+    scheduler.add_request(waiting_short)
+
+    output = scheduler.schedule()
+
+    assert waiting_long in scheduler.skipped_waiting
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["waiting-short"]
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]

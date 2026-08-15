@@ -95,6 +95,7 @@ def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
     )
 
 
+
 @dataclass
 class CompressorMetadata:
     block_table: torch.Tensor
@@ -102,6 +103,8 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    # [PORT #48957] True if any request crosses a 128-token compressed-KV
+    # boundary this step; None when unknown (dummy run). C128 layers only.
     c128_boundary: bool | None = None
     num_decode_tokens: int | None = None
 

@@ -77,6 +77,12 @@ from vllm import LLM
 llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", max_num_batched_tokens=16384)
 ```
 
+### Partial-Prefill Concurrency
+
+Chunked prefill can admit multiple requests whose prompts are still being processed across scheduler iterations. Use `--max-num-partial-prefills` to cap this concurrency and preserve decode capacity under long or bursty prompts. The default is `1`; set it to `0` to disable this admission cap. Lower values reduce decode starvation and improve inter-token latency, while higher values can improve prefill throughput when decode latency is less important.
+
+`--max-long-partial-prefills` limits how many requests classified as long by `--long-prefill-token-threshold` may prefill concurrently. It defaults to `1`. These limits apply only to admission of new prefills; they do not cancel a request already in progress. Tune both with `--max-num-batched-tokens`: the partial-prefill caps control how many requests may consume prefill chunks, while the token budget controls chunk size and total work per iteration.
+
 See related papers for more details (<https://arxiv.org/pdf/2401.08671> or <https://arxiv.org/pdf/2308.16369>).
 
 ## Parallelism Strategies

@@ -67,6 +67,11 @@ class SchedulerConfig:
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
 
+    max_num_partial_prefills: int = Field(default=1, ge=0)
+    """Maximum number of requests allowed to prefill concurrently."""
+
+    max_long_partial_prefills: int = Field(default=1, ge=0)
+    """Maximum number of long requests allowed to prefill concurrently."""
     long_prefill_token_threshold: int = Field(default=0, ge=0)
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""

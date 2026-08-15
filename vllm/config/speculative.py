@@ -1594,6 +1594,10 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
+    def requires_host_draft_token_ids(self) -> bool:
+        """Whether async scheduling needs the actual draft ids on the host."""
+        return self.method in ("dflash", "dspark")
+
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
 

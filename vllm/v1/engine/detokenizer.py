@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from abc import ABC, abstractmethod
 
@@ -60,12 +61,46 @@ class IncrementalDetokenizer:
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            detok = FastIncrementalDetokenizer(tokenizer, request)
+        else:
+            # Fall back to slow python-based incremental detokenization.
+            detok = SlowIncrementalDetokenizer(tokenizer, request)
+        cls._maybe_enable_reasoning_stop_guard(detok, tokenizer, request)
+        return detok
 
-        # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+    @staticmethod
+    def _reasoning_stop_markers() -> tuple[str, str]:
+        start, end = "<think>", "</think>"
+        try:
+            from vllm.config import get_current_vllm_config_or_none
 
+            cfg = get_current_vllm_config_or_none()
+            rc = getattr(cfg, "reasoning_config", None) if cfg else None
+            if rc is not None:
+                start = getattr(rc, "reasoning_start_str", "") or start
+                end = getattr(rc, "reasoning_end_str", "") or end
+        except Exception:
+            pass
+        return start, end
 
+    @staticmethod
+    def _maybe_enable_reasoning_stop_guard(detok, tokenizer, request) -> None:
+        if os.environ.get("VLLM_SUPPRESS_STOPS_IN_REASONING", "1") == "0":
+            return
+        try:
+            prompt_ids = getattr(request, "prompt_token_ids", None)
+            if not getattr(detok, "stop", None) or not prompt_ids:
+                return
+            start, end = IncrementalDetokenizer._reasoning_stop_markers()
+            convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+            token_id = convert(start) if callable(convert) else None
+            if not isinstance(token_id, int) or token_id < 0:
+                return
+            if prompt_ids[-1] == token_id:
+                detok._reasoning_stop_guard = True
+                detok._reasoning_end_str = end
+        except (AttributeError, TypeError):
+            return
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     def __init__(self, request: EngineCoreRequest):
         super().__init__()
@@ -89,6 +124,10 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         else:
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
+        # Client stop strings stay dormant until the reasoning section closes.
+        self._reasoning_stop_guard = False
+        self._reasoning_closed = False
+        self._reasoning_end_str = "</think>"
 
         # Generation data
         self.output_text = ""
@@ -127,8 +166,16 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.token_ids.append(skipped_stop_token_id)
 
         # 2) Evaluate stop strings.
+        if self._reasoning_stop_guard and not self._reasoning_closed:
+            idx = self.output_text.find(self._reasoning_end_str)
+            if idx != -1:
+                self._reasoning_closed = True
         stop_string = None
-        if self.stop and self.num_output_tokens() > self.min_tokens:
+        if (
+            self.stop
+            and self.num_output_tokens() > self.min_tokens
+            and (not self._reasoning_stop_guard or self._reasoning_closed)
+        ):
             stop = check_stop_strings(
                 output_text=self.output_text,
                 new_char_count=len(self.output_text) - stop_check_offset,

@@ -712,12 +712,36 @@ class Scheduler(SchedulerInterface):
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
                     break
+                # Enforce concurrent partial-prefill limits before allocating
+                # another request. Long requests are skipped so shorter work
+                # later in the queue can use available total capacity.
+                if (
+                    self.scheduler_config.max_num_partial_prefills > 0
+                    and len(self._inflight_prefills)
+                    >= self.scheduler_config.max_num_partial_prefills
+                ):
+                    break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                long_prefill_threshold = (
+                    self.scheduler_config.long_prefill_token_threshold
+                )
+                if long_prefill_threshold > 0 and (
+                    request.num_prompt_tokens > long_prefill_threshold
+                    and self.scheduler_config.max_long_partial_prefills > 0
+                    and sum(
+                        req.num_prompt_tokens > long_prefill_threshold
+                        for req in self._inflight_prefills
+                    )
+                    >= self.scheduler_config.max_long_partial_prefills
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(

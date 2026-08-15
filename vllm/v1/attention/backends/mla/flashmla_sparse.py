@@ -862,7 +862,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+        use_fp8_cache = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
 
         if not use_fp8_cache:
             attn_out = self._forward_bf16_kv(
