@@ -1,0 +1,14 @@
+vllm/platforms/__init__.py
+  h_15da545fc8cfbe 110-131,150-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ac546f9a4ffe8f2f87800a548ed3126c09b7921a",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

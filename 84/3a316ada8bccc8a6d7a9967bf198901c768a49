@@ -1,0 +1,14 @@
+third_party/deep_gemm
+  h_15da545fc8cfbe 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "843a316ada8bccc8a6d7a9967bf198901c768a49",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

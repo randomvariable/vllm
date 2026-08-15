@@ -1,0 +1,96 @@
+docs/contributing/homelab-hard-requirements.md
+  h_15da545fc8cfbe 1-154
+docs/contributing/kernel_targets/.nav.yml
+  h_15da545fc8cfbe 1-12
+docs/contributing/kernel_targets/README.md
+  h_15da545fc8cfbe 1-93
+docs/contributing/kernel_targets/execution_model.md
+  h_15da545fc8cfbe 1-342
+docs/contributing/kernel_targets/local_inference_lab_ds4_import.md
+  h_15da545fc8cfbe 1-77
+docs/contributing/kernel_targets/matrix_units.md
+  h_15da545fc8cfbe 1-326
+docs/contributing/kernel_targets/memory_model.md
+  h_15da545fc8cfbe 1-419
+docs/contributing/kernel_targets/numerics.md
+  h_15da545fc8cfbe 1-393
+docs/contributing/kernel_targets/porting_sm120_to_gfx1151.md
+  h_15da545fc8cfbe 1-415
+docs/contributing/kernel_targets/rdna35.md
+  h_15da545fc8cfbe 1-349
+docs/contributing/kernel_targets/sm120.md
+  h_15da545fc8cfbe 1-234
+docs/contributing/kernel_targets/toolchain.md
+  h_15da545fc8cfbe 1-285
+docs/contributing/kernel_targets/verification.md
+  h_15da545fc8cfbe 1-161
+homelab/atom_reference/README.md
+  h_15da545fc8cfbe 1-84
+homelab/atom_reference/attention/attention_gdn.py
+  h_15da545fc8cfbe 1-424
+homelab/atom_reference/attention/triton_fused_qkv_norm_rope_cache.py
+  h_15da545fc8cfbe 1-418
+homelab/atom_reference/fla/chunk_fused.py
+  h_15da545fc8cfbe 1-501
+homelab/atom_reference/fla/fused_cumsum_kkt.py
+  h_15da545fc8cfbe 1-147
+homelab/atom_reference/fla/fused_merge_recompute.py
+  h_15da545fc8cfbe 1-336
+homelab/atom_reference/kernels/fused_aux_rmsnorm.py
+  h_15da545fc8cfbe 1-194
+homelab/atom_reference/kernels/lm_head_argmax.py
+  h_15da545fc8cfbe 1-89
+homelab/atom_reference/kernels/swiglu_oai.py
+  h_15da545fc8cfbe 1-104
+homelab/atom_reference/moe/moe_gu_interleave.py
+  h_15da545fc8cfbe 1-120
+homelab/atom_reference/plugin/gdn_backend_compaction.py
+  h_15da545fc8cfbe 1-121
+homelab/atom_reference/spec_decode/dspark_scheduler.py
+  h_15da545fc8cfbe 1-320
+homelab/atom_reference/spec_decode/verify_scheduler.py
+  h_15da545fc8cfbe 1-154
+homelab/devloop/Cargo.lock
+  h_15da545fc8cfbe 1-325
+homelab/devloop/Cargo.toml
+  h_15da545fc8cfbe 1-21
+homelab/devloop/src/artifacts.rs
+  h_15da545fc8cfbe 1-145
+homelab/devloop/src/docker.rs
+  h_15da545fc8cfbe 1-468
+homelab/devloop/src/main.rs
+  h_15da545fc8cfbe 1-629
+homelab/devloop/src/probe.rs
+  h_15da545fc8cfbe 1-343
+homelab/rocm-dev-test.sh
+  h_15da545fc8cfbe 1-140
+homelab/spark-cross.Dockerfile
+  h_15da545fc8cfbe 1-464
+homelab/spark-toolbox.Dockerfile
+  h_15da545fc8cfbe 1-37
+homelab/spark.Dockerfile
+  h_15da545fc8cfbe 1-209
+homelab/strix-toolbox.Dockerfile
+  h_15da545fc8cfbe 1-34
+homelab/strix.Dockerfile
+  h_15da545fc8cfbe 1-359
+homelab/toolbox-entrypoint.sh
+  h_15da545fc8cfbe 1-12
+homelab/toolbox/README.md
+  h_15da545fc8cfbe 1-63
+homelab/toolbox/models.yaml.example
+  h_15da545fc8cfbe 1-35
+homelab/toolbox/vllm_toolbox.py
+  h_15da545fc8cfbe 1-611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "d60afe2058438318de292eed18f4a9370799f281",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

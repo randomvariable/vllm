@@ -1,0 +1,14 @@
+tools/flashinfer-build.sh
+  h_15da545fc8cfbe 7-9,11-14,16,26-29,31-48,61,63,67-70,76-78,97-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e6d896a01dda68216c3fdbe40efa882c2d8da9c0",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+vllm/model_executor/warmup/kernel_warmup.py
+  h_15da545fc8cfbe 266-277,332
+vllm/models/deepseek_v4/sparse_mla.py
+  h_15da545fc8cfbe 23
+vllm/v1/core/kv_cache_utils.py
+  h_15da545fc8cfbe 1915,1918
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "09284a9e040a9585108e439ea31f0ae25c64f14f",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

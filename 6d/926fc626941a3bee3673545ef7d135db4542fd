@@ -1,0 +1,46 @@
+vllm/_custom_ops.py
+  h_15da545fc8cfbe 2409,2418,2430,2440,2454,2466
+vllm/config/speculative.py
+  h_15da545fc8cfbe 5
+vllm/envs.py
+  h_15da545fc8cfbe 193-194,1618-1621
+vllm/model_executor/kernels/linear/__init__.py
+  h_15da545fc8cfbe 915-917,920-923,949
+vllm/model_executor/kernels/mhc/tilelang.py
+  h_15da545fc8cfbe 303-336,676,880,890-895,921-931
+vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+  h_15da545fc8cfbe 290
+vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+  h_15da545fc8cfbe 215
+vllm/model_executor/layers/quantization/quark/quark_moe.py
+  h_15da545fc8cfbe 1662-1663
+vllm/model_executor/warmup/kernel_warmup.py
+  h_15da545fc8cfbe 265,317-322,433-441
+vllm/models/deepseek_v4/attention.py
+  h_15da545fc8cfbe 112-117,120
+vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+  h_15da545fc8cfbe 60-65,70-72
+vllm/models/deepseek_v4/quant_config.py
+  h_15da545fc8cfbe 182-186
+vllm/models/deepseek_v4/sparse_mla.py
+  h_15da545fc8cfbe 351-362
+vllm/v1/attention/backends/mla/indexer.py
+  h_15da545fc8cfbe 522-535,1177,1369
+vllm/v1/core/kv_cache_utils.py
+  h_15da545fc8cfbe 1919,1927-1965
+vllm/v1/worker/gpu/sample/sampler.py
+  h_15da545fc8cfbe 9,28,42,56
+vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+  h_15da545fc8cfbe 323,416
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "6d926fc626941a3bee3673545ef7d135db4542fd",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

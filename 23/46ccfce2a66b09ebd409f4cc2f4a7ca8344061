@@ -1,0 +1,14 @@
+third_party/flashinfer
+  h_15da545fc8cfbe 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "2346ccfce2a66b09ebd409f4cc2f4a7ca8344061",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+homelab/spark-cross.Dockerfile
+  s_27808f6f5e352c::t_35bc6cc37f2bdc 240-241,415-417,420-421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "39b6fb262eef3f006dbae53148dff11cc465ee9d",
+  "prompts": {},
+  "sessions": {
+    "s_27808f6f5e352c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_27808f6f5e352c",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

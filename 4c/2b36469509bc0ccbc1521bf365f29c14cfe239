@@ -1,0 +1,14 @@
+vllm/v1/attention/backends/mla/indexer.py
+  h_15da545fc8cfbe 536-548,1381
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4c2b36469509bc0ccbc1521bf365f29c14cfe239",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
