@@ -194,6 +194,7 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     --mount=type=cache,target=/root/.cache/flashinfer,sharing=locked \
     --mount=type=cache,target=/src/vllm/third_party/flashinfer/build/aot,sharing=locked \
     cd /src/vllm && \
+    export FLASHINFER_CUBIN_BUILD_CACHE=/root/.cache/flashinfer/cubins && \
     uv pip install --python /opt/venv/bin/python \
       'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests numpy \
       nvidia-ml-py 'apache-tvm-ffi>=0.1,<0.2' filelock && \
@@ -239,8 +240,6 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     ./tools/flashinfer-build.sh && \
     uv build --python /opt/venv/bin/python --no-build-isolation --wheel \
       --out-dir /wheels-flashinfer ./third_party/flashinfer/flashinfer-cubin && \
-    uv pip install --python /opt/venv/bin/python --no-index --find-links /wheels-flashinfer \
-      'flashinfer-cubin==0.6.18' && \
     uv pip install --python /opt/venv/bin/python /wheels-flashinfer/flashinfer_python-*.whl && \
     uv pip install --python /opt/venv/bin/python --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
