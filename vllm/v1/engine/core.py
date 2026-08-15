@@ -1651,6 +1651,8 @@ class EngineCoreProc(EngineCore):
 
             # Register sockets with poller.
             poller = zmq.Poller()
+            parallel_config = self.vllm_config.parallel_config
+            scheduler_config = self.vllm_config.scheduler_config
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
@@ -1658,14 +1660,24 @@ class EngineCoreProc(EngineCore):
                 dp_stats_address=self.frontend_stats_publish_address,
                 dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
                 vllm_version=VLLM_VERSION,
-                world_size=self.vllm_config.parallel_config.world_size,
-                data_parallel_size=self.vllm_config.parallel_config.data_parallel_size,
+                world_size=parallel_config.world_size,
+                data_parallel_size=parallel_config.data_parallel_size,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                decode_context_parallel_size=(
+                    parallel_config.decode_context_parallel_size
+                ),
+                data_parallel_rank=self.engine_index,
+                max_num_seqs=scheduler_config.max_num_seqs,
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                instance_id=self.vllm_config.instance_id,
                 kv_cache_size_tokens=(
                     self.vllm_config.cache_config.kv_cache_size_tokens
                 ),
                 kv_cache_max_concurrency=(
                     self.vllm_config.cache_config.kv_cache_max_concurrency
                 ),
+                kv_events_config=self.scheduler.get_kv_event_publisher_config(),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:
