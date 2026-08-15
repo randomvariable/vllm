@@ -50,7 +50,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         speculative_config.attention_backend,
         vllm_config.attention_config.backend,
     )
-
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
