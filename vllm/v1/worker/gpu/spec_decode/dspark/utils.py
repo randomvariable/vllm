@@ -23,10 +23,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     # None re-runs backend auto-selection for the draft, which can pick a
     # different attention class than the target; fall back to the target's.
+    # DSpark needs a non-causal-capable backend for its drafts; falling
+    # back to the target backend (usually FLASH_ATTN) avoids downgrading
+    # the spec-decode cudagraph to PIECEWISE.
     draft_attention_backend = (
         speculative_config.attention_backend or vllm_config.attention_config.backend
     )
-
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
