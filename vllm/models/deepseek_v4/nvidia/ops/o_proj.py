@@ -8,6 +8,47 @@ from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _deepseek_v4_fp8_o_proj_einsum(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    z: torch.Tensor,
+    recipe_0: int,
+    recipe_1: int,
+    recipe_2: int,
+) -> None:
+    fp8_einsum(
+        "bhr,hdr->bhd",
+        (o_fp8, o_scale),
+        (weight, weight_scale_inv),
+        z,
+        recipe=(recipe_0, recipe_1, recipe_2),
+    )
+
+
+def _deepseek_v4_fp8_o_proj_einsum_fake(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    z: torch.Tensor,
+    recipe_0: int,
+    recipe_1: int,
+    recipe_2: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_fp8_o_proj_einsum",
+    op_func=_deepseek_v4_fp8_o_proj_einsum,
+    mutates_args=["z"],
+    fake_impl=_deepseek_v4_fp8_o_proj_einsum_fake,
+)
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -16,12 +57,19 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
 
+    The packed layout is a tcgen05/TMEM feature, so it keys off SM100
+    exactly rather than "anything newer than SM90". SM12x (GB10, RTX 50xx)
+    reports a numerically higher capability but has no TMEM, so it must use
+    the SM90 block-scale layout — the checkpoint stores wo_a scales as
+    [g, r/128, d/128], which only matches sfb_gran_mn=128.
+
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
-    tma_aligned_scales = cap.major >= 10
+    packed_tmem_scales = cap.major == 10
+    einsum_recipe = (1, 1, 128) if packed_tmem_scales else (1, 128, 128)
+    tma_aligned_scales = packed_tmem_scales
     return einsum_recipe, tma_aligned_scales
 
 
@@ -60,14 +108,14 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    weight_scale = (
-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
-    )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, weight_scale),
+    torch.ops.vllm.deepseek_v4_fp8_o_proj_einsum(
+        o_fp8,
+        o_scale,
+        wo_a.weight,
+        wo_a.weight_scale_inv,
         z,
-        recipe=einsum_recipe,
+        einsum_recipe[0],
+        einsum_recipe[1],
+        einsum_recipe[2],
     )
     return wo_b(z.flatten(1))

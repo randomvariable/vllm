@@ -35,3 +35,5 @@ See the [full list](https://github.com/llm-d/llm-d#performance-highlights) and r
 You can also deploy vLLM with llm-d via [KServe's LLMInferenceService](https://kserve.github.io/website/docs/model-serving/generative-inference/llmisvc/llmisvc-overview).
 
 Questions and contributions are welcome on [GitHub](https://github.com/llm-d/llm-d) and [Slack](https://llm-d.ai/slack).
+
+For a versioned DeepSeek V4 Flash DSpark reference, see `examples/deployment/deepseek-v4-flash-dspark-llmd.yaml`. llm-d supplies replica-pool and prefix-aware routing; DSpark capacity and online STS remain vLLM-owned opt-in features. Use only the digest-qualified image output from the provenance pipeline.

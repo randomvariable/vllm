@@ -337,6 +337,12 @@ class Step3p5MTPProposer(EagleProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
+        hidden_states = hidden_states[token_indices_to_sample]
+        if self.num_speculative_tokens == 0:
+            return torch.empty(
+                (batch_size, 0), dtype=torch.int64, device=hidden_states.device
+            )
+
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens_for_step(
                 sample_hidden_states, sampling_metadata, spec_step_idx=0
@@ -351,7 +357,6 @@ class Step3p5MTPProposer(EagleProposer):
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
 
         if self.constant_draft_positions:
             self.positions[:batch_size] = positions

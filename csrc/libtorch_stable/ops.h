@@ -183,6 +183,17 @@ torch::stable::Tensor awq_dequantize(torch::stable::Tensor _kernel,
 
 #endif
 
+using fptr_t = int64_t;
+void custom_all_gather(fptr_t, torch::stable::Tensor&, torch::stable::Tensor&,
+                       fptr_t, int64_t);
+void mnnvl_lamport_all_gather(fptr_t, torch::stable::Tensor&, torch::stable::Tensor&,
+                              fptr_t, fptr_t, fptr_t, int64_t);
+void custom_reduce_scatter(fptr_t, torch::stable::Tensor&, torch::stable::Tensor&,
+                           fptr_t, int64_t);
+void mnnvl_lamport_reduce_scatter(fptr_t, torch::stable::Tensor&,
+                                  torch::stable::Tensor&, fptr_t, fptr_t,
+                                  int64_t);
+
 // CPU tensor -> CUDA UVA view (shared CUDA/ROCm)
 torch::stable::Tensor get_cuda_view_from_cpu_tensor(
     torch::stable::Tensor& cpu_tensor);
@@ -197,6 +208,12 @@ void merge_attn_states(
     const torch::stable::Tensor& suffix_lse,
     const std::optional<int64_t> prefill_tokens_with_context,
     const std::optional<torch::stable::Tensor>& output_scale = std::nullopt);
+
+// BF16 MLA query absorption BMM that avoids cuBLAS read-ahead on tight
+// DCP/custom-allocation inputs without materializing the query operand.
+void safe_mla_query_bmm(torch::stable::Tensor const& query,
+                        torch::stable::Tensor const& weight,
+                        torch::stable::Tensor& output);
 
 torch::stable::Tensor hadacore_transform(torch::stable::Tensor& x,
                                          bool inplace);
@@ -265,14 +282,6 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
-    torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size);
-
-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
-    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
-    torch::stable::Tensor& q_out, torch::stable::Tensor& k_cache,
-    torch::stable::Tensor const& slot_mapping,
     torch::stable::Tensor const& position_ids,
     torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
     double eps, int64_t cache_block_size);
@@ -348,7 +357,6 @@ void fused_kimi_k3_mla_decode_q_concat_ds_mla_insert(
     torch::stable::Tensor const& slot_mapping, int64_t cache_block_size,
     std::optional<torch::stable::Tensor> position_ids,
     std::optional<torch::stable::Tensor> cos_sin_cache);
-
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
     torch::stable::Tensor const& q, torch::stable::Tensor const& kv,
     torch::stable::Tensor& q_fp8, torch::stable::Tensor& k_cache,
@@ -424,7 +432,6 @@ void kimi_k3_attn_res(torch::stable::Tensor& prefix,
                       torch::stable::Tensor& output, int64_t num_blocks,
                       double eps, double output_norm_eps);
 #endif
-
 // Sampler kernels (shared CUDA/ROCm)
 void apply_repetition_penalties_(
     torch::stable::Tensor& logits, const torch::stable::Tensor& prompt_mask,
@@ -482,20 +489,6 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
 void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
                 torch::stable::Tensor& out, fptr_t reg_buffer,
                 int64_t reg_buffer_sz_bytes);
-void custom_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
-                       torch::stable::Tensor& out, fptr_t reg_buffer,
-                       int64_t reg_buffer_sz_bytes);
-void mnnvl_lamport_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
-                              torch::stable::Tensor& out, fptr_t local_buffer,
-                              fptr_t multicast_buffer, fptr_t epoch_buffer,
-                              int64_t stage_sz_bytes);
-void custom_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
-                           torch::stable::Tensor& out, fptr_t reg_buffer,
-                           int64_t reg_buffer_sz_bytes);
-void mnnvl_lamport_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
-                                  torch::stable::Tensor& out,
-                                  fptr_t local_buffer, fptr_t epoch_buffer,
-                                  int64_t stage_sz_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
@@ -534,12 +527,6 @@ void fatrelu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input,
                      double threshold);
 void swigluoai_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input,
                        double alpha = 1.702, double limit = 7.0);
-void situ_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input,
-                  double beta = 1.0, double linear_beta = -1.0);
-void masked_situ_and_mul(torch::stable::Tensor& out,
-                         torch::stable::Tensor& input,
-                         const torch::stable::Tensor& expert_num_tokens,
-                         double beta = 1.0, double linear_beta = -1.0);
 void gelu_new(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void gelu_fast(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void gelu_quick(torch::stable::Tensor& out, torch::stable::Tensor& input);
@@ -616,12 +603,11 @@ void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           const std::string& kv_cache_dtype,
                           torch::stable::Tensor& scale);
 
-void concat_and_cache_mla_grouped(torch::stable::Tensor& kv_c,
-                                  torch::stable::Tensor& k_pe,
-                                  torch::stable::Tensor& kv_cache_ptrs,
-                                  torch::stable::Tensor& slot_mapping,
-                                  int64_t block_size, int64_t block_stride,
-                                  int64_t entry_stride);
+void concat_and_cache_nvfp4_mla(torch::stable::Tensor& kv_c,
+                                torch::stable::Tensor& k_pe,
+                                torch::stable::Tensor& kv_cache,
+                                torch::stable::Tensor& slot_mapping,
+                                torch::stable::Tensor& scale);
 
 // NOTE: k_pe and kv_c order is flipped compared to concat_and_cache_mla
 void concat_and_cache_mla_rope_fused(

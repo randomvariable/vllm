@@ -626,13 +626,15 @@ def fp8_fp4_paged_mqa_logits(
         q: Tuple ``(q_values, q_scale)``. FP8 path: q_values is
             [B, next_n, H, D] float8_e4m3fn and q_scale is None. FP4 path:
             q_values is packed uint8 and q_scale is the companion
-            block-scale tensor.
+            block-scale tensor. For the varlen path B is total_tokens and
+            next_n == 1.
         kv_cache: Paged KV-cache. FP8 layout is [num_blocks, block_size, 1,
             D+4], dtype `torch.uint8`, with the last 4 bytes per (block, pos)
             storing the float dequant scale.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
         context_lens: Tensor of shape [B], dtype int32; effective context length
-            for each batch element.
+            for each batch element. For the varlen path this is
+            [total_tokens, 1].
         block_tables: Tensor of shape [B, max_blocks], dtype int32; maps logical
             block indices to physical blocks in the paged cache.
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;

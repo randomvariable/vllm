@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
@@ -35,27 +35,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
-
 
 def _prefer_two_stage_compressor() -> bool:
     # Platforms that favor the triton variant of two-stage compressor split.
     # Currently only tested on ROCm
     return current_platform.is_rocm()
-
-
-def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
-    starts = metadata._num_computed_tokens_cpu
-    if starts is None:
-        return None
-
-    starts_list = starts.tolist()
-    query_start_loc = metadata.query_start_loc_cpu.tolist()
-    return any(
-        start % 128 + query_start_loc[i + 1] - query_start_loc[i] >= 128
-        for i, start in enumerate(starts_list)
-    )
 
 
 class CompressorBackend(AttentionBackend):
@@ -98,6 +82,20 @@ class CompressorBackend(AttentionBackend):
         return (0, 1, 2)
 
 
+def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
+    starts = metadata._num_computed_tokens_cpu
+    if starts is None:
+        return None
+
+    starts_list = starts.tolist()
+    query_start_loc = metadata.query_start_loc_cpu.tolist()
+    return any(
+        start % 128 + query_start_loc[index + 1] - query_start_loc[index] >= 128
+        for index, start in enumerate(starts_list)
+    )
+
+
+
 @dataclass
 class CompressorMetadata:
     block_table: torch.Tensor
@@ -105,12 +103,15 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    num_decode_tokens: int | None = None
+    # [PORT #48957] True if any request crosses a 128-token compressed-KV
+    # boundary this step; None when unknown (dummy run). C128 layers only.
     c128_boundary: bool | None = None
+    num_decode_tokens: int | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -200,6 +201,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            dcp_replicated=True,
         )
 
     def forward(self): ...
@@ -229,9 +231,9 @@ class DeepseekCompressor(nn.Module):
         prefix: str = "",
         k_cache_prefix="",
         use_fp4_cache: bool = False,
-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ):
         super().__init__()
+        self.vllm_config = vllm_config
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -239,7 +241,6 @@ class DeepseekCompressor(nn.Module):
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
         self.use_fp4_cache = use_fp4_cache
-        self.eager_scratch_pool = eager_scratch_pool
 
         config = vllm_config.model_config.hf_config
         self.rope_head_dim = config.qk_rope_head_dim
@@ -354,6 +355,8 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        parallel_config = self.vllm_config.parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -384,7 +387,6 @@ class DeepseekCompressor(nn.Module):
             pdl_kwargs=pdl_kwargs,
         )
 
-        # full graph cannot branch on per-step CPU metadata after capture
         if (
             current_platform.is_cuda()
             and self.head_dim == 512
@@ -416,41 +418,58 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # cutedsl (head=512) accepts the full-cache flags; triton accepts the
+        # DCP mapping kwargs and stores the legacy UE8M0 paged layout.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
-            from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                compress_norm_rope_store_cutedsl,
-            )
-
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
-            compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
-            extra_kwargs: dict[str, Any] = dict(
-                store_full_kv=store_full_kv,
-                store_full_fp8=store_full_fp8,
-                fp8_scale=fp8_scale,
-            )
-            if not self.overlap and self.eager_scratch_pool is not None:
-                extra_kwargs["compress_scratch"] = (
-                    self.eager_scratch_pool.compressor_scratch(num_actual)
+        extra_kwargs: dict[str, Any] = {}
+        if current_platform.is_cuda() and not torch.compiler.is_compiling():
+            # NVIDIA GPUs.
+            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            if not use_triton_compressor:
+                from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                    compress_norm_rope_store_cutedsl,
                 )
+
+                # head=512 on CUDA uses cutedsl unless DCP needs Triton's
+                # mapped state lookup. The full-cache flags are consumed only
+                # by this path.
+                compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+                extra_kwargs = dict(
+                    store_full_kv=store_full_kv,
+                    store_full_fp8=store_full_fp8,
+                    fp8_scale=fp8_scale,
+                )
+            else:
+                # Indexer path (head_dim == 128), and the DCP main-compressor
+                # path where the CuTe kernel's raw state lookup is not valid.
+                compress_norm_rope_store_fn = compress_norm_rope_store_triton
         elif self._use_two_stage_fused_compressor:
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
+            use_triton_compressor = False
             compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
             extra_kwargs = {
                 "num_decode_tokens": state_metadata.num_decode_tokens,
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.):
+            # use Triton and the legacy UE8M0 paged layout.
+            use_triton_compressor = True
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
 
+        if use_triton_compressor:
+            extra_kwargs.update(
+                {
+                    # Compressor state is replicated under DCP so every rank
+                    # can form a complete compressed window. The destination
+                    # KV slot mapping still selects the owning DCP rank.
+                    "dcp_world_size": 1,
+                    "dcp_rank": 0,
+                    "cp_kv_cache_interleave_size": 1,
+                }
+            )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
+import inspect
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, cast
@@ -39,7 +40,7 @@ def _config(
     )
 
 
-class ToyKernel(VllmJitKernel["ToyKernel.CompileKey"]):
+class ToyKernel(VllmJitKernel[Any]):
     @dataclass(frozen=True)
     class CompileKey:
         block_size: int
@@ -239,7 +240,7 @@ def test_trace_dispatch_rejects_bad_positional_groups_and_duplicates() -> None:
 
 
 def test_helper_calls_support_keywords_and_reject_star_kwargs() -> None:
-    class HelperKernel(VllmJitKernel["HelperKernel.CompileKey"]):
+    class HelperKernel(VllmJitKernel[Any]):
         @dataclass(frozen=True)
         class CompileKey:
             value: int
@@ -258,7 +259,7 @@ def test_helper_calls_support_keywords_and_reject_star_kwargs() -> None:
         def compile(self, compile_key: CompileKey) -> None:
             pass
 
-    class StarKwargsKernel(VllmJitKernel["StarKwargsKernel.CompileKey"]):
+    class StarKwargsKernel(VllmJitKernel[Any]):
         @dataclass(frozen=True)
         class CompileKey:
             value: int
@@ -288,7 +289,7 @@ def test_helper_calls_support_keywords_and_reject_star_kwargs() -> None:
 
 
 def test_dispatch_body_must_be_local_assignments_then_compile_key_return() -> None:
-    class BranchKernel(VllmJitKernel["BranchKernel.CompileKey"]):
+    class BranchKernel(VllmJitKernel[Any]):
         @dataclass(frozen=True)
         class CompileKey:
             value: int
@@ -304,7 +305,7 @@ def test_dispatch_body_must_be_local_assignments_then_compile_key_return() -> No
         def compile(self, compile_key: CompileKey) -> None:
             pass
 
-    class KwargsReturnKernel(VllmJitKernel["KwargsReturnKernel.CompileKey"]):
+    class KwargsReturnKernel(VllmJitKernel[Any]):
         @dataclass(frozen=True)
         class CompileKey:
             value: int
@@ -325,7 +326,7 @@ def test_dispatch_body_must_be_local_assignments_then_compile_key_return() -> No
 
 
 def test_dispatch_reports_unsupported_expression_with_context() -> None:
-    class UnsupportedKernel(VllmJitKernel["UnsupportedKernel.CompileKey"]):
+    class UnsupportedKernel(VllmJitKernel[Any]):
         @dataclass(frozen=True)
         class CompileKey:
             value: object
@@ -369,3 +370,131 @@ def test_get_ast_full_name_handles_names_attributes_and_other_nodes() -> None:
 
     assert get_ast_full_name(dotted_expr.value) == "foo.bar.baz"
     assert get_ast_full_name(call_expr.value) is None
+
+
+def test_eagle_prepare_inputs_dispatch_covers_single_and_multi_request() -> None:
+    from vllm.v1.spec_decode.utils import EaglePrepareInputsPaddedKernel
+
+    kernel = EaglePrepareInputsPaddedKernel()
+    keys = kernel._trace_dispatch(kernel.dispatch)(
+        num_reqs=[1, 50],
+    )
+    assert keys == [
+        EaglePrepareInputsPaddedKernel.CompileKey(num_reqs=1),
+        EaglePrepareInputsPaddedKernel.CompileKey(num_reqs=50),
+    ]
+
+
+def test_eagle_step_slot_mapping_stride_follows_n_blocks() -> None:
+    from vllm.v1.spec_decode.utils import EagleStepSlotMappingMetadataKernel
+
+    kernel = EagleStepSlotMappingMetadataKernel()
+    keys = kernel._trace_dispatch(kernel.dispatch)(
+        block_size=16,
+        max_model_len=8192,
+        n_blocks_per_req=[512, 1024],
+        PAD_ID=-1,
+        batch_size=[1, 50],
+    )
+    assert len(keys) == 4
+    for k in keys:
+        assert k.block_table_stride == k.n_blocks_per_req
+
+
+def test_eagle_prepare_next_token_stride_follows_num_sampled() -> None:
+    from vllm.v1.spec_decode.utils import EaglePrepareNextTokenPaddedKernel
+
+    kernel = EaglePrepareNextTokenPaddedKernel()
+    keys = kernel._trace_dispatch(kernel.dispatch)(
+        BLOCK_SIZE_TOKENS=16,
+        vocab_size=129280,
+        num_sampled_tokens_per_req=[1, 9],
+        num_reqs=[1, 50],
+    )
+    assert len(keys) == 4
+    for k in keys:
+        assert k.stride_sampled_token_ids == k.num_sampled_tokens_per_req
+
+
+def test_dflash_prepare_inputs_grid_enumeration() -> None:
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        PrepareDflashInputsKernel,
+    )
+
+    kernel = PrepareDflashInputsKernel()
+    keys = kernel._trace_dispatch(kernel.dispatch)(
+        SAMPLE_FROM_ANCHOR=False,
+        PAD_SLOT_ID=-1,
+        BLOCK_SIZE=[1, 256],
+        block_table_stride=128,
+        parallel_drafting_token_id=0,
+        block_size=128,
+        num_query_per_req=8,
+        num_speculative_steps=8,
+        max_num_reqs=50,
+        max_num_tokens=512,
+        max_model_len=8192,
+        grid_num_reqs=[1, 50],
+        grid_num_blocks=[1, 8],
+    )
+    assert len(keys) == 8  # 2 BLOCK_SIZE × 2 grid_reqs × 2 grid_blocks
+    block_sizes = {k.BLOCK_SIZE for k in keys}
+    assert block_sizes == {1, 256}
+
+
+# ---------------------------------------------------------------------------
+# Spec-decode wrapper: dispatch + get_warmup_keys end-to-end coverage.
+#
+# These tests build a minimal ``VllmConfig``-shaped ``SimpleNamespace`` mock
+# so ``get_warmup_keys(...)`` can run without a real model.  They verify the
+# CompileKey search space each wrapper enumerates matches the runtime
+# specializations documented in the wrapper docstring.
+# ---------------------------------------------------------------------------
+
+
+def _spec_vllm_config(
+    *,
+    num_speculative_tokens: int = 8,
+    max_num_seqs: int = 50,
+    vocab_size: int = 129280,
+    hidden_size: int = 4096,
+    block_size: int = 16,
+    max_model_len: int = 8192,
+    decode_context_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+) -> Any:
+    """Build a minimal VllmConfig-shaped mock for spec-decode warmup tests."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_vocab_size=lambda: vocab_size,
+            get_hidden_size=lambda: hidden_size,
+            hf_config=SimpleNamespace(hidden_size=hidden_size),
+            max_model_len=max_model_len,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=decode_context_parallel_size,
+            prefill_context_parallel_size=prefill_context_parallel_size,
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        cache_config=SimpleNamespace(block_size=block_size),
+    )
+
+
+def test_prepare_dflash_inputs_signature_threads_sampling_buffers() -> None:
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        prepare_dflash_inputs,
+    )
+
+    names = list(inspect.signature(prepare_dflash_inputs).parameters)
+    sampling_names = names[
+        names.index("next_prefill_tokens") + 1 : names.index("block_table")
+    ]
+    assert sampling_names == [
+        "temperature",
+        "seeds",
+        "input_temperature",
+        "input_seeds",
+    ]

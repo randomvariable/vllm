@@ -6,12 +6,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     MoveDirectionality,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
@@ -53,14 +56,20 @@ class ThinkingBudgetStateHolder:
         # No separate enable flag: a non-``None`` ``reasoning_config`` is the switch.
         self.is_enabled = reasoning_config is not None
 
+        self.think_start_token_ids: list[int]
+        self.think_end_token_ids: list[int]
+        self.reasoning_marker_token_ids: list[list[int]]
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
+            self.reasoning_marker_token_ids = []
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
+            markers = getattr(reasoning_config, "reasoning_marker_token_ids", None)
+            self.reasoning_marker_token_ids = markers if markers else []
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -72,7 +81,7 @@ class ThinkingBudgetStateHolder:
             self._mask_capacity = max_num_reqs
 
     def has_tracked_requests(self) -> bool:
-        """True when ``sync_batch`` has state for a ``thinking_token_budget`` row.
+        """True when ``sync_batch`` has state for at least one request row.
 
         Used to decide whether sampling needs output-token rows and spec combining;
         distinct from merely having a holder instance (reasoning may be on with no
@@ -89,10 +98,20 @@ class ThinkingBudgetStateHolder:
 
         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
             thinking_token_budget = params.thinking_token_budget
-            if thinking_token_budget is not None:
+            marker_penalty = params.reasoning_marker_penalty
+            answer_reserve = params.reasoning_answer_reserve
+            if (
+                thinking_token_budget is not None
+                or answer_reserve is not None
+                or marker_penalty not in (None, 0.0)
+            ):
                 self._state[index] = self._init_state_entry(
-                    prompt_tok_ids, thinking_token_budget
+                    prompt_tok_ids,
+                    thinking_token_budget,
+                    answer_reserve,
+                    params.max_tokens,
                 )
+                self._state[index]["reasoning_marker_penalty"] = marker_penalty
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
             else:
@@ -157,7 +176,69 @@ class ThinkingBudgetStateHolder:
         if not self.is_enabled or not self._state:
             return logits
         spec_lists = spec_token_ids or []
+        self._apply_marker_penalty(logits, predict_bonus_token, spec_lists)
         return self._apply_forcing_to_logits(logits, predict_bonus_token, spec_lists)
+
+    def _apply_marker_penalty(
+        self,
+        logits: torch.Tensor,
+        predict_bonus_token: bool,
+        spec_token_ids: list[list[int]],
+    ) -> None:
+        if not self.reasoning_marker_token_ids:
+            return
+        vocab_size = logits.shape[1]
+        penalised_rows: list[int] = []
+        penalised_tokens: list[int] = []
+        penalties: list[float] = []
+        cumulative_total = 0
+        for seq_idx in range(
+            max(len(spec_token_ids), max(self._state, default=-1) + 1)
+        ):
+            spec_tokens = (
+                spec_token_ids[seq_idx] if seq_idx < len(spec_token_ids) else []
+            )
+            count = 1 if predict_bonus_token else max(1, len(spec_tokens))
+            state = self._state.get(seq_idx)
+            if state is None:
+                cumulative_total += count
+                continue
+            penalty = state.get("reasoning_marker_penalty", 0.0)
+            if state.get("in_think") and penalty:
+                committed = [
+                    *(state.get("prompt_tok_ids") or []),
+                    *(state.get("output_tok_ids") or []),
+                ]
+                end = min(cumulative_total + count, logits.shape[0])
+                for row in range(cumulative_total, end):
+                    # Draft tokens ahead of this row are already decided, so
+                    # they form part of the history the marker matches against.
+                    local_pos = row - cumulative_total
+                    history = (
+                        committed
+                        if predict_bonus_token
+                        else [*committed, *spec_tokens[:local_pos]]
+                    )
+                    for marker in self.reasoning_marker_token_ids:
+                        last_token = marker[-1]
+                        if not 0 <= last_token < vocab_size:
+                            continue
+                        prefix = marker[:-1]
+                        if prefix and history[len(history) - len(prefix) :] != prefix:
+                            continue
+                        penalised_rows.append(row)
+                        penalised_tokens.append(last_token)
+                        penalties.append(penalty)
+            cumulative_total += count
+
+        if not penalised_rows:
+            return
+        rows_t = torch.tensor(penalised_rows, dtype=torch.long, device=logits.device)
+        tokens_t = torch.tensor(
+            penalised_tokens, dtype=torch.long, device=logits.device
+        )
+        penalties_t = torch.tensor(penalties, dtype=logits.dtype, device=logits.device)
+        logits.index_put_((rows_t, tokens_t), -penalties_t, accumulate=True)
 
     @staticmethod
     def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
@@ -169,7 +250,11 @@ class ThinkingBudgetStateHolder:
         return -1
 
     def _init_state_entry(
-        self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
+        self,
+        prompt_tok_ids: list[int] | None,
+        thinking_token_budget: int | None,
+        reasoning_answer_reserve: int | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         if prompt_tok_ids is None:
             last_start = -1
@@ -199,11 +284,13 @@ class ThinkingBudgetStateHolder:
                     last_start + len(self.think_start_token_ids)
                 )
                 start_thinking = len(prompt_tok_ids) - think_count - 1
-                countdown -= think_count
+                if countdown is not None:
+                    countdown -= think_count
                 continue_thinking = True
                 # check if the token is exhausted within prompt
-                token_exhausted = thinking_token_budget - think_count
-                in_end = token_exhausted <= 0
+                if thinking_token_budget is not None:
+                    token_exhausted = thinking_token_budget - think_count
+                    in_end = token_exhausted <= 0
             else:
                 think_count = 0
 
@@ -216,6 +303,9 @@ class ThinkingBudgetStateHolder:
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget": thinking_token_budget,
+            "reasoning_answer_reserve": reasoning_answer_reserve,
+            "max_tokens": max_tokens,
+            "end_force_index": [],
             "prev_output_length": 0,
             "spec_token_ids": [],
             "force_index": [],
@@ -227,7 +317,131 @@ class ThinkingBudgetStateHolder:
             "scan_offset": 0,
         }
 
+    @staticmethod
+    def _reserve_force_offset(state: dict[str, Any]) -> int | None:
+        """Offset into the current sampling rows where the answer reserve fires.
+
+        Returns ``None`` when ``reasoning_answer_reserve`` is unset or when the
+        remaining output budget still exceeds it for every row of this step.
+        """
+        reserve = state.get("reasoning_answer_reserve")
+        max_tokens = state.get("max_tokens")
+        if reserve is None or max_tokens is None:
+            return None
+        produced = len(state.get("output_tok_ids") or [])
+        offset = max_tokens - reserve - produced
+        if offset > len(state.get("spec_token_ids") or []):
+            return None
+        return max(0, offset)
+
+    def _advance_end_sequence(self, state: dict[str, Any]) -> None:
+        """Emit the next token of the (possibly multi-token) close marker.
+
+        Records the chosen position in ``end_force_index`` so that a same-step
+        revisit (the holder runs once for the bonus row and once for the target
+        rows) replays it instead of re-deriving a position from budget or
+        reserve arithmetic that has already moved past this marker token.
+        """
+        state["force_index"] = []
+        if len(state["spec_token_ids"]) > 0:
+            for i, token_id in enumerate(state["spec_token_ids"]):
+                if state["end_count"] + 1 < len(self.think_end_token_ids):
+                    if token_id == self.think_end_token_ids[state["end_count"] + 1]:
+                        state["end_count"] += 1
+                    else:
+                        state["end_count"] += 1
+                        state["force_index"] = [i]
+                        break
+                else:
+                    state["end_count"] += 1
+            if len(state["force_index"]) == 0:
+                state["end_count"] += 1
+                state["force_index"] = [len(state["spec_token_ids"])]
+        else:
+            state["end_count"] += 1
+            state["force_index"] = [0]
+        state["end_force_index"] = list(state["force_index"])
+        if state["end_count"] >= len(self.think_end_token_ids):
+            state.update(
+                {
+                    "in_end": False,
+                    "end_count": 0,
+                    "end_force_index": [],
+                    "check_count_down": state.get("thinking_token_budget"),
+                    "start_thinking": -1,
+                    "end_thinking": -1,
+                    "think_count": 0,
+                    "continue_thinking": False,
+                    "scan_offset": len(state.get("output_tok_ids", [])),
+                }
+            )
+
+    def _update_reserve_only_state(self, state: dict[str, Any]) -> None:
+        """Track think state for requests with only ``reasoning_answer_reserve``.
+
+        Mirrors the budgeted path but drives the force-close purely off the
+        remaining output budget, so no thinking-token countdown is maintained.
+        """
+        output = state.get("output_tok_ids") or []
+        prev_length = state.get("prev_output_length", 0)
+        state["force_index"] = []
+
+        if not self.think_end_token_ids:
+            sequence = [*(state.get("prompt_tok_ids") or []), *output]
+            start = self._find_last_sequence_index(sequence, self.think_start_token_ids)
+            state["in_think"] = start >= 0
+            state["in_end"] = False
+            state["prev_output_length"] = len(output)
+            return
+
+        if state.get("in_end", False):
+            if len(output) <= prev_length:
+                # Same sampling step revisited: the holder runs once for the
+                # bonus row and once for the target rows. Re-derive the first
+                # close-marker position, and replay (never re-advance) the
+                # position chosen for a multi-token marker continuation.
+                if state.get("end_count", 0) == 0:
+                    offset = self._reserve_force_offset(state)
+                    state["force_index"] = [] if offset is None else [offset]
+                else:
+                    state["force_index"] = list(state.get("end_force_index") or [])
+                return
+            if (
+                state.get("end_count", 0) == 0
+                and self.think_end_token_ids[0] not in output[prev_length:]
+            ):
+                # The rejection sampler dropped the forced token; go back to
+                # think mode and let the reserve re-trigger below.
+                state["in_end"] = False
+                state["end_count"] = 0
+                state["bonus_token_forced"] = False
+            else:
+                state["prev_output_length"] = len(output)
+                state["in_think"] = False
+                self._advance_end_sequence(state)
+                return
+
+        state["prev_output_length"] = len(output)
+        sequence = [*(state.get("prompt_tok_ids") or []), *output]
+        start = self._find_last_sequence_index(sequence, self.think_start_token_ids)
+        end = self._find_last_sequence_index(sequence, self.think_end_token_ids)
+        state["in_think"] = start >= 0 and start > end
+        if not state["in_think"]:
+            return
+
+        reserve_offset = self._reserve_force_offset(state)
+        if reserve_offset is None:
+            return
+        state["in_think"] = False
+        state["in_end"] = True
+        state["end_count"] = 0
+        state["force_index"] = [reserve_offset]
+        state["end_force_index"] = [reserve_offset]
+
     def _update_think_state(self, state: dict[str, Any]) -> None:
+        if state.get("thinking_token_budget") is None:
+            self._update_reserve_only_state(state)
+            return
         if state.get("thinking_token_budget", -1) == -1:
             return
         if len(self.think_end_token_ids) == 0:
@@ -305,6 +519,9 @@ class ThinkingBudgetStateHolder:
             and predicted_countdown >= 0
             and state["start_thinking"] > -1
             and not natural_end_with_continue
+            # The answer reserve is an independent trigger: fall through to the
+            # force-close path even while the thinking budget still has room.
+            and self._reserve_force_offset(state) is None
         ):
             state["check_count_down"] = current_step_countdown
             state["prev_output_length"] = len(state.get("output_tok_ids", []))
@@ -325,6 +542,13 @@ class ThinkingBudgetStateHolder:
 
         if current_length <= prev_length:
             if state.get("in_end", False):
+                if state.get("end_count", 0) != 0:
+                    # Mid-marker on a same-step revisit: replay the position
+                    # ``_advance_end_sequence`` chose. Re-deriving it from
+                    # budget or reserve arithmetic that has already moved past
+                    # this marker token would force at the wrong row.
+                    state["force_index"] = list(state.get("end_force_index") or [])
+                    return
                 remaining_budget = state["thinking_token_budget"] - state["think_count"]
                 spec_len = len(state["spec_token_ids"])
                 if spec_len > 0:
@@ -336,6 +560,14 @@ class ThinkingBudgetStateHolder:
                         state["force_index"] = [spec_len]
                 else:
                     state["force_index"] = [0]
+                # Both triggers are independent; the earlier position wins.
+                reserve_offset = self._reserve_force_offset(state)
+                if (
+                    reserve_offset is not None
+                    and reserve_offset < state["force_index"][0]
+                ):
+                    state["force_index"] = [reserve_offset]
+                state["end_force_index"] = list(state["force_index"])
             return
 
         state["prev_output_length"] = current_length
@@ -444,38 +676,38 @@ class ThinkingBudgetStateHolder:
                     # budget; force the bonus token position
                     state["force_index"] = [len(state["spec_token_ids"])]
 
+                # Both triggers are independent; the earlier position wins.
+                reserve_offset = self._reserve_force_offset(state)
+                if (
+                    reserve_offset is not None
+                    and reserve_offset < state["force_index"][0]
+                ):
+                    state["force_index"] = [reserve_offset]
+                state["end_force_index"] = list(state["force_index"])
+
+            elif state["in_think"]:
+                reserve_offset = self._reserve_force_offset(state)
+                if reserve_offset is not None:
+                    state["in_think"] = False
+                    state["in_end"] = True
+                    state["end_count"] = 0
+                    state["check_count_down"] = state["thinking_token_budget"]
+                    state["force_index"] = [reserve_offset]
+                    state["end_force_index"] = [reserve_offset]
+
         else:
-            state["force_index"] = []
-            if len(state["spec_token_ids"]) > 0:
-                for i, token_id in enumerate(state["spec_token_ids"]):
-                    if state["end_count"] + 1 < len(self.think_end_token_ids):
-                        if token_id == self.think_end_token_ids[state["end_count"] + 1]:
-                            state["end_count"] += 1
-                        else:
-                            state["end_count"] += 1
-                            state["force_index"] = [i]
-                            break
-                    else:
-                        state["end_count"] += 1
-                if len(state["force_index"]) == 0:
-                    state["end_count"] += 1
-                    state["force_index"] = [len(state["spec_token_ids"])]
-            else:
-                state["end_count"] += 1
-                state["force_index"] = [0]
-            if state["end_count"] >= len(self.think_end_token_ids):
-                state.update(
-                    {
-                        "in_end": False,
-                        "end_count": 0,
-                        "check_count_down": state["thinking_token_budget"],
-                        "start_thinking": -1,
-                        "end_thinking": -1,
-                        "think_count": 0,
-                        "continue_thinking": False,
-                        "scan_offset": len(state.get("output_tok_ids", [])),
-                    }
-                )
+            self._advance_end_sequence(state)
+
+    def _row_span(self, spec_tokens: list[int], predict_bonus_token: bool) -> int:
+        """Number of logits rows a single request owns in this call.
+
+        The bonus-token tensor gives every request exactly one row. The target
+        tensor gives each request one row per draft token, or one row when it
+        has no drafts. Outside spec mode there is always exactly one row.
+        """
+        if not self.in_spec_mode or predict_bonus_token:
+            return 1
+        return max(1, len(spec_tokens))
 
     def _apply_forcing_to_logits(
         self,
@@ -490,6 +722,7 @@ class ThinkingBudgetStateHolder:
         if self._state:
             n_layout = max(n_layout, max(self._state.keys()) + 1)
 
+        row_spans: dict[int, int] = {}
         for index in range(n_layout):
             self.cu_num_tokens[index] = cumulative_total
             spec_tokens = (
@@ -497,10 +730,8 @@ class ThinkingBudgetStateHolder:
                 if index < len(spec_token_ids_for_layout)
                 else []
             )
-            if self.in_spec_mode:
-                cumulative_total += len(spec_tokens) if not predict_bonus_token else 1
-            else:
-                cumulative_total += 1
+            row_spans[index] = self._row_span(spec_tokens, predict_bonus_token)
+            cumulative_total += row_spans[index]
 
         # Build the active index / forced-token lists entirely on CPU so we
         # avoid per-iteration scalar sync writes to GPU tensors.
@@ -532,10 +763,29 @@ class ThinkingBudgetStateHolder:
                     if len(force_index) == 0:
                         continue
                     end_count = state.get("end_count", 0)
+                    row_start = self.cu_num_tokens[seq_idx]
+                    row_span = row_spans.get(seq_idx, 1)
                     for force_idx in force_index:
                         if end_count < len(self.think_end_token_ids):
-                            mask_idx = self.cu_num_tokens[seq_idx] + force_idx
-                            if (
+                            mask_idx = row_start + force_idx
+                            if not 0 <= force_idx < row_span:
+                                # Outside the owning request's rows. Writing
+                                # here forces the end-of-thinking token into a
+                                # different sequence's logits, or is clipped
+                                # away on the last request. Both are bugs in
+                                # force_index selection rather than runtime
+                                # conditions, so report and skip the write.
+                                logger.warning_once(
+                                    "Thinking-budget force index %d is outside "
+                                    "request %d's row span (%d row(s) from row "
+                                    "%d); skipping the forced token. This is a "
+                                    "bug in force_index selection.",
+                                    force_idx,
+                                    seq_idx,
+                                    row_span,
+                                    row_start,
+                                )
+                            elif (
                                 mask_idx < self._mask_capacity
                                 and mask_idx < logits.shape[0]
                             ):

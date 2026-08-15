@@ -6,7 +6,7 @@
 import time
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import BeforeValidator, Field, model_validator
 
 import vllm.envs as envs
 from vllm.config import ModelConfig
@@ -27,11 +27,13 @@ from vllm.logprobs import Logprob
 from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
+    ReasoningAnswerReserve,
     RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    validate_reasoning_marker_penalty,
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
@@ -247,6 +249,21 @@ class CompletionRequest(OpenAIBaseModel):
             "-1 means unlimited (treated as unset)."
         ),
     )
+    reasoning_marker_penalty: Annotated[
+        float | None, BeforeValidator(validate_reasoning_marker_penalty)
+    ] = None
+    reasoning_answer_reserve: ReasoningAnswerReserve = Field(
+        default=None,
+        description=(
+            "Number of output tokens to reserve for the final answer. While "
+            "inside a reasoning block, the reasoning-end token is forced once "
+            "the remaining output budget drops to this value, so the model "
+            "cannot spend all of max_tokens thinking. The close marker is "
+            "emitted from the reserved tokens, so answer text gets "
+            "reserve minus the marker length. Positive integer; -1 means "
+            "unset."
+        ),
+    )
 
     stream_interval: Annotated[int, Field(ge=1)] | None = Field(
         default=None,
@@ -400,6 +417,8 @@ class CompletionRequest(OpenAIBaseModel):
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
             routed_experts_prompt_start=self.routed_experts_prompt_start,
+            reasoning_marker_penalty=self.reasoning_marker_penalty,
+            reasoning_answer_reserve=self.reasoning_answer_reserve,
         )
 
     @model_validator(mode="before")

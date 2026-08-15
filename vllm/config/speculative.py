@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -63,6 +64,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+DSparkCapacityVerificationMode = Literal["varlen", "mask"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -79,6 +81,10 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+
+
+def _requires_host_draft_token_ids(method: SpeculativeMethod | None) -> bool:
+    return method in ("dflash", "dspark")
 
 
 @config
@@ -241,6 +247,34 @@ class SpeculativeConfig:
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
+
+    dspark_confidence_threshold: float = 0.0
+    """Minimum DSpark cumulative prefix-survival probability for keeping a
+    per-request draft prefix. Set to 0.0 to use budget-based global top-k
+    allocation."""
+
+    dspark_budget_frac: float = 1.0
+    """Fraction of the full per-request draft-token budget available to the
+    DSpark global prefix allocator."""
+
+    dspark_capacity_verification_mode: DSparkCapacityVerificationMode = "varlen"
+    """How DSpark capacity-pruned target verification tokens are handled."""
+
+    dspark_confidence_temperature: float = 1.0
+    """Temperature applied to the DSpark confidence-head logits before the
+    survival-probability computation."""
+
+    dspark_online_sts: bool = True
+    """Calibrate the DSpark confidence head online with per-position
+    temperatures. Only active together with a capacity verification mode."""
+
+    dspark_sps_curve: list[tuple[int, float]] | str | None = None
+    """Profiled engine step-rate curve for the DSpark hardware-aware prefix
+    scheduler, or ``"auto"`` to profile at engine init."""
+
+    dspark_sps_overhead_ms: float = 0.0
+    """Constant per-step overhead in milliseconds added to the step times
+    measured by ``dspark_sps_curve="auto"``."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -1341,6 +1375,13 @@ class SpeculativeConfig:
             return AttentionBackendEnum[value.upper()]
         return value
 
+    @field_validator("dspark_capacity_verification_mode", mode="before")
+    @classmethod
+    def _parse_dspark_capacity_verification_mode(cls, value: Any) -> Any:
+        if value == "compact":
+            return "varlen"
+        return value
+
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:
@@ -1398,6 +1439,48 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if not math.isfinite(self.dspark_confidence_threshold) or not (
+            0.0 <= self.dspark_confidence_threshold <= 1.0
+        ):
+            raise ValueError(
+                "dspark_confidence_threshold must be in [0, 1], got "
+                f"{self.dspark_confidence_threshold}."
+            )
+        if not math.isfinite(self.dspark_budget_frac) or not (
+            0.0 < self.dspark_budget_frac <= 1.0
+        ):
+            raise ValueError(
+                f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
+            )
+        if (
+            not math.isfinite(self.dspark_confidence_temperature)
+            or self.dspark_confidence_temperature <= 0.0
+        ):
+            raise ValueError(
+                "dspark_confidence_temperature must be > 0, got "
+                f"{self.dspark_confidence_temperature}."
+            )
+        if (
+            not math.isfinite(self.dspark_sps_overhead_ms)
+            or self.dspark_sps_overhead_ms < 0.0
+        ):
+            raise ValueError(
+                "dspark_sps_overhead_ms must be >= 0, got "
+                f"{self.dspark_sps_overhead_ms}."
+            )
+        if isinstance(self.dspark_sps_curve, str):
+            if self.dspark_sps_curve != "auto":
+                raise ValueError(
+                    'dspark_sps_curve must be a list of (batch_num_tokens, '
+                    f'steps_per_sec) pairs or "auto", got '
+                    f"{self.dspark_sps_curve!r}."
+                )
+        elif self.dspark_sps_curve is not None:
+            self.dspark_sps_curve = [
+                (int(b), float(s)) for b, s in self.dspark_sps_curve
+            ]
+
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
@@ -1485,6 +1568,10 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def requires_host_draft_token_ids(self) -> bool:
+        """Whether async scheduling needs the actual draft ids on the host."""
+        return _requires_host_draft_token_ids(self.method)
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

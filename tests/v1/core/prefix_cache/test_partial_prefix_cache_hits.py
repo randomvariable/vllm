@@ -5,6 +5,7 @@
 on partial hits, and same-step deferral."""
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +14,7 @@ import torch
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
     KVCacheBlockCopy,
     get_block_hash,
     get_group_id,
@@ -42,7 +44,9 @@ def test_connector_without_divergent_hit_support_uses_common_lookup():
         kv_cache_manager=manager,
     )
 
-    result = Scheduler._get_local_prefix_cache_hit(scheduler, MagicMock())
+    result = Scheduler._get_local_prefix_cache_hit(
+        cast(Scheduler, scheduler), MagicMock()
+    )
 
     assert result == (common_blocks, 0, 0, False)
     manager.get_computed_blocks_for_connector.assert_not_called()
@@ -62,7 +66,9 @@ def test_capable_connector_uses_divergent_partial_hit_lookup():
         kv_cache_manager=manager,
     )
 
-    result = Scheduler._get_local_prefix_cache_hit(scheduler, MagicMock())
+    result = Scheduler._get_local_prefix_cache_hit(
+        cast(Scheduler, scheduler), MagicMock()
+    )
 
     assert result == (per_group_blocks, 6, 0, True)
     manager.get_computed_blocks.assert_not_called()
@@ -87,31 +93,31 @@ def test_mamba_align_split_partial_tail_schedule():
 
     req = make_request("0", [0] * 10000, hash_block_size, sha256)
     req.num_computed_tokens = 0
-    assert split(self=mock, request=req, num_new_tokens=8192) == 8192
+    assert split(self=cast(Scheduler, mock), request=req, num_new_tokens=8192) == 8192
     req.num_computed_tokens = 8192
     # Stop at the last block boundary (9728).
-    assert split(self=mock, request=req, num_new_tokens=1808) == 1536
+    assert split(self=cast(Scheduler, mock), request=req, num_new_tokens=1808) == 1536
     req.num_computed_tokens = 9728
     # Extra stop at the prompt's last hash boundary (9984).
-    assert split(self=mock, request=req, num_new_tokens=272) == 256
+    assert split(self=cast(Scheduler, mock), request=req, num_new_tokens=272) == 256
     req.num_computed_tokens = 9984
     # Final 16 tokens run unchanged (no mid-block-resume stop: the next
     # block boundary is past the last block boundary).
-    assert split(self=mock, request=req, num_new_tokens=16) == 16
+    assert split(self=cast(Scheduler, mock), request=req, num_new_tokens=16) == 16
 
     # Partial hits off: no extra stop, the tail runs in one chunk.
     mock.mamba_partial_cache_hit = False
     req.num_computed_tokens = 9728
-    assert split(self=mock, request=req, num_new_tokens=272) == 272
+    assert split(self=cast(Scheduler, mock), request=req, num_new_tokens=272) == 272
     mock.mamba_partial_cache_hit = True
 
     # A request resumed mid-block (partial hash hit at 9984): the first chunk
     # stops at the next block boundary (10240), later chunk ends re-align.
     req2 = make_request("1", [0] * 12000, hash_block_size, sha256)
     req2.num_computed_tokens = 9984
-    assert split(self=mock, request=req2, num_new_tokens=2016) == 256
+    assert split(self=cast(Scheduler, mock), request=req2, num_new_tokens=2016) == 256
     req2.num_computed_tokens = 10240
-    assert split(self=mock, request=req2, num_new_tokens=1000) == 512
+    assert split(self=cast(Scheduler, mock), request=req2, num_new_tokens=1000) == 512
 
 
 def test_mamba_align_split_when_block_exceeds_scheduling_budget():
@@ -131,14 +137,17 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     split = Scheduler._mamba_block_aligned_split
 
     mock.max_num_scheduled_tokens = block_size
-    assert split(self=mock, request=req, num_new_tokens=token_budget) == 0
+    assert (
+        split(self=cast(Scheduler, mock), request=req, num_new_tokens=token_budget)
+        == 0
+    )
     mock.max_num_scheduled_tokens = token_budget
 
     scheduled_chunks = []
     while req.num_computed_tokens < prompt_length:
         num_new_tokens = min(token_budget, prompt_length - req.num_computed_tokens)
         num_scheduled_tokens = split(
-            self=mock,
+            self=cast(Scheduler, mock),
             request=req,
             num_new_tokens=num_new_tokens,
         )
@@ -175,7 +184,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
             prompt_length - req.num_computed_tokens,
         )
         num_scheduled_tokens = split(
-            self=mock,
+            self=cast(Scheduler, mock),
             request=req,
             num_new_tokens=num_new_tokens,
         )
@@ -206,7 +215,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=mamba_block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -281,7 +290,7 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -329,8 +338,11 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     )
     assert moved is not None
     assert moved[0].block_id == cow_copy.dst_block_id
-    assert get_block_hash(moved[0].block_hash) == partial_mamba_hash
-    assert get_group_id(moved[0].block_hash) == 1
+    moved_block = moved[0]
+    moved_hash = moved_block.block_hash
+    assert moved_hash is not None
+    assert get_block_hash(moved_hash) == partial_mamba_hash
+    assert get_group_id(moved_hash) == 1
     assert moved[0].block_hash_num_tokens == 6
 
 
@@ -356,7 +368,7 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
                 ["mamba"],
                 MambaSpec(
                     block_size=mamba_block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -429,7 +441,7 @@ def test_take_partial_tail_offloads_returns_cow_target():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -509,7 +521,7 @@ def test_partial_tail_pin_survives_released_cow_retention():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -570,7 +582,7 @@ def test_partial_tail_offload_dropped_when_request_freed_before_drain():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -617,7 +629,7 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -665,7 +677,7 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
                 ["mamba"],
                 MambaSpec(
                     block_size=2 * hash_block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -720,7 +732,7 @@ def test_truncate_computed_blocks_allows_short_mamba_group_only():
                 ["mamba"],
                 MambaSpec(
                     block_size=2 * hash_block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -783,7 +795,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -863,7 +875,7 @@ def test_hybrid_mamba_moved_partial_entry_defers_same_step_hit():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -922,7 +934,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -996,7 +1008,7 @@ def test_hybrid_partial_hit_cow_target_starts_uncached():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -1079,7 +1091,7 @@ def test_hybrid_partial_hash_truncates_full_attention_hit_length():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -1153,7 +1165,7 @@ def test_cow_retained_blocks_returned_for_release():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -1189,8 +1201,8 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     been processed (or deferral is off), and defers them otherwise."""
     from collections import deque
 
-    freed: list = []
-    blocks = [SimpleNamespace(block_id=7), SimpleNamespace(block_id=9)]
+    freed: list[KVCacheBlock] = []
+    blocks = [KVCacheBlock(block_id=7), KVCacheBlock(block_id=9)]
     mock = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             block_pool=SimpleNamespace(free_blocks=freed.extend)
@@ -1202,13 +1214,13 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     free = Scheduler._free_cow_retained_blocks
 
     # Copy step still in flight: deferred with its fence.
-    free(mock, list(blocks), fence_seq=3)
+    free(cast(Scheduler, mock), blocks, fence_seq=3)
     assert not freed
     assert mock.deferred_frees == deque([(3, blocks[::-1])])
 
     # Copy step processed: freed immediately.
     mock.processed_step_seq = 3
-    free(mock, list(blocks), fence_seq=3)
+    free(cast(Scheduler, mock), blocks, fence_seq=3)
     assert freed == blocks
 
     # Deferral disabled: freed immediately regardless of the fence.
@@ -1216,7 +1228,7 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     mock.deferred_frees.clear()
     mock.defer_block_free = False
     mock.processed_step_seq = 0
-    free(mock, list(blocks), fence_seq=3)
+    free(cast(Scheduler, mock), blocks, fence_seq=3)
     assert freed == blocks
 
 
@@ -1319,7 +1331,7 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
                 ["mamba"],
                 MambaSpec(
                     block_size=block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
@@ -1377,7 +1389,7 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
                 ["mamba"],
                 MambaSpec(
                     block_size=mamba_block_size,
-                    shapes=(1, 1),
+                    shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),

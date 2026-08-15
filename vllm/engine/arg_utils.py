@@ -531,10 +531,13 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
-    gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
+    gpu_memory_utilization: float | None = CacheConfig.gpu_memory_utilization
+    gpu_memory_utilization_gb: float | None = CacheConfig.gpu_memory_utilization_gb
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
+    max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
+    max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
@@ -553,7 +556,7 @@ class EngineArgs:
     quantization: QuantizationMethods | str | None = ModelConfig.quantization
     quantization_config: "dict[str, Any] | QuantizationConfigArgs | None" = None
     """User-facing quantization configuration. Carries per-layer-kind
-    QuantSpecs (linear, moe) and ignore patterns; see
+    QuantSpecs (linear, moe, shared_experts) and ignore patterns; see
     :class:`QuantizationConfigArgs`. Auto-populated from the matching online
     shorthand when `quantization` is one of the values in
     `ONLINE_QUANT_SHORTHAND_NAMES`."""
@@ -595,7 +598,7 @@ class EngineArgs:
     )
     io_processor_plugin: str | None = None
     renderer_num_workers: int = 1
-    skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
+    skip_mm_profiling: bool = envs.VLLM_SKIP_MM_PROFILING
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     video_pruning_method: str = MultiModalConfig.video_pruning_method
     mm_tensor_ipc: MMTensorIPC = MultiModalConfig.mm_tensor_ipc
@@ -643,6 +646,7 @@ class EngineArgs:
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
+    dspark_capacity_verification_mode: Literal["varlen", "mask"] | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -657,6 +661,7 @@ class EngineArgs:
         ObservabilityConfig, "kv_cache_metrics_sample"
     )
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
+    spec_decode_telemetry: bool = ObservabilityConfig.spec_decode_telemetry
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
@@ -1204,8 +1209,15 @@ class EngineArgs:
             description=CacheConfig.__doc__,
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
-        cache_group.add_argument(
+        # The fractional and absolute GPU memory budgets are mutually
+        # exclusive; argparse rejects the combination before CacheConfig sees
+        # it, so the CLI reports the conflict at parse time.
+        gpu_memory_budget_group = cache_group.add_mutually_exclusive_group()
+        gpu_memory_budget_group.add_argument(
             "--gpu-memory-utilization", **cache_kwargs["gpu_memory_utilization"]
+        )
+        gpu_memory_budget_group.add_argument(
+            "--gpu-memory-utilization-gb", **cache_kwargs["gpu_memory_utilization_gb"]
         )
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
@@ -1477,6 +1489,10 @@ class EngineArgs:
             **observability_kwargs["cudagraph_metrics"],
         )
         observability_group.add_argument(
+            "--spec-decode-telemetry",
+            **observability_kwargs["spec_decode_telemetry"],
+        )
+        observability_group.add_argument(
             "--enable-layerwise-nvtx-tracing",
             **observability_kwargs["enable_layerwise_nvtx_tracing"],
         )
@@ -1523,6 +1539,14 @@ class EngineArgs:
                 **scheduler_kwargs["max_num_seqs"],
                 "default": None,
             },
+        )
+        scheduler_group.add_argument(
+            "--max-num-partial-prefills",
+            **scheduler_kwargs["max_num_partial_prefills"],
+        )
+        scheduler_group.add_argument(
+            "--max-long-partial-prefills",
+            **scheduler_kwargs["max_long_partial_prefills"],
         )
         scheduler_group.add_argument(
             "--long-prefill-token-threshold",
@@ -1620,6 +1644,12 @@ class EngineArgs:
         vllm_group.add_argument("--spec-model", **speculative_kwargs["model"])
         vllm_group.add_argument(
             "--spec-tokens", **speculative_kwargs["num_speculative_tokens"]
+        )
+        vllm_group.add_argument(
+            "--dspark-capacity-verification-mode",
+            choices=["varlen", "mask"],
+            default=None,
+            help=speculative_kwargs["dspark_capacity_verification_mode"]["help"],
         )
         vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
@@ -1839,6 +1869,11 @@ class EngineArgs:
             ("--spec-method", "method", self.spec_method),
             ("--spec-model", "model", self.spec_model),
             ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
+            (
+                "--dspark-capacity-verification-mode",
+                "dspark_capacity_verification_mode",
+                self.dspark_capacity_verification_mode,
+            ),
         ):
             if value is None:
                 continue
@@ -1925,6 +1960,7 @@ class EngineArgs:
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,
+            spec_decode_telemetry=self.spec_decode_telemetry,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
@@ -1994,6 +2030,7 @@ class EngineArgs:
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
+            gpu_memory_utilization_gb=self.gpu_memory_utilization_gb,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
@@ -2320,6 +2357,8 @@ class EngineArgs:
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
             scheduler_cls=self.scheduler_cls,
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
@@ -2714,10 +2753,8 @@ class EngineArgs:
             self.enable_prefix_caching = False
 
     def _set_default_reasoning_config_args(self):
-        if not self.reasoning_parser:
+        if not self.reasoning_parser or self.reasoning_config is None:
             return
-        if self.reasoning_config is None:
-            self.reasoning_config = ReasoningConfig()
         self.reasoning_config.reasoning_parser = self.reasoning_parser
 
     @staticmethod

@@ -341,6 +341,60 @@ def test_apply_ready_response_syncs_block_size():
     assert client.vllm_config.cache_config.block_size == 1056
 
 
+def test_make_ready_response_populates_every_required_field():
+    """Startup readiness must carry all fields the frontend decodes.
+
+    The handshake payload is built once per engine, so a construction site that
+    omits required fields kills the input-socket thread before the engine ever
+    serves a request.
+    """
+    from vllm.v1.engine.core import EngineCoreProc
+
+    proc = object.__new__(EngineCoreProc)
+    proc.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=8192,
+            dtype="torch.bfloat16",
+            enable_sleep_mode=False,
+        ),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks=100,
+            block_size=64,
+            kv_cache_size_tokens=6400,
+            kv_cache_max_concurrency=1.5,
+        ),
+        parallel_config=SimpleNamespace(
+            world_size=4,
+            data_parallel_size=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=256,
+            max_num_batched_tokens=8192,
+        ),
+        weight_transfer_config=None,
+        instance_id="engine-instance",
+    )
+    proc.frontend_stats_publish_address = None
+    proc.engine_index = 1
+    proc.scheduler = SimpleNamespace(get_kv_event_publisher_config=lambda: None)
+    proc.model_executor = SimpleNamespace(supports_draft_weight_updates=lambda: False)
+
+    response = proc._make_ready_response()
+
+    for field in EngineCoreReadyResponse.__annotations__:
+        assert getattr(response, field) is not Ellipsis
+    assert response.tensor_parallel_size == 2
+    assert response.decode_context_parallel_size == 1
+    assert response.data_parallel_rank == 1
+    assert response.max_num_seqs == 256
+    assert response.max_num_batched_tokens == 8192
+    assert response.instance_id == "engine-instance"
+    assert response.dtype == "bfloat16"
+
+
 def loop_until_done(client: EngineCoreClient, outputs: dict):
     while True:
         engine_core_outputs = client.get_output().outputs

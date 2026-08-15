@@ -43,7 +43,8 @@ def test_workspace_lane_count_is_dspark_only(
 
 
 def test_workspace_lanes_do_not_alias_and_restore_context(monkeypatch) -> None:
-    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    ubatch_id = 0
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: ubatch_id)
     manager = workspace.WorkspaceManager(
         torch.device("cpu"), num_ubatches=2, num_lanes=2
     )

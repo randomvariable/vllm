@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -66,6 +67,17 @@ from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
 
+
+# [issue55-hotfix] tool-call truncation safety
+def _dsml_issue55_json_ok(s: str | None) -> bool:
+    """Return whether a tool-call argument is a complete JSON value."""
+    if s is None or s == "":
+        return True
+    try:
+        json.loads(s)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
@@ -344,7 +356,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     # non-reasoning outputs.
                     reasoning_ended = True
                 elif parser is not None and parser.reasoning_parser is not None:
-                    reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])
+                    reasoning_ended = (
+                        parser.reasoning_parser.is_reasoning_end_for_prompt(
+                            prompt_token_ids or []
+                        )
+                    )
                 else:
                     reasoning_ended = None
 
@@ -737,12 +753,38 @@ class OpenAIServingChat(GenerateBaseServing):
                         # finish_reason is:
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # [issue55-hotfix] gate tool_calls on engine length and
+                        # strip non-JSON args from the trailing delta.
+                        if (
+                            tools_streamed[i]
+                            and not tool_choice_function_name
+                            and str(output.finish_reason) != "length"
+                        ):
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = (
-                                output.finish_reason if output.finish_reason else "stop"
+                                str(output.finish_reason)
+                                if output.finish_reason
+                                else "stop"
                             )
+                        if (
+                            str(output.finish_reason) == "length"
+                            and delta_message is not None
+                            and getattr(delta_message, "tool_calls", None)
+                        ):
+                            _kept = [
+                                tc
+                                for tc in delta_message.tool_calls
+                                if getattr(tc, "function", None) is not None
+                                and _dsml_issue55_json_ok(
+                                    getattr(
+                                        getattr(tc, "function", None),
+                                        "arguments",
+                                        None,
+                                    )
+                                )
+                            ]
+                            delta_message.tool_calls = _kept
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
@@ -1056,13 +1098,28 @@ class OpenAIServingChat(GenerateBaseServing):
                 else None
             )
 
+            # [issue55-hotfix] truncated tool calls must not claim completion;
+            # drop unparseable arguments as defense in depth.
+            if str(output.finish_reason) == "length":
+                is_finish_reason_tool_calls = False
+                if getattr(message, "tool_calls", None):
+                    message.tool_calls = [
+                        tc
+                        for tc in message.tool_calls
+                        if getattr(tc, "function", None) is not None
+                        and _dsml_issue55_json_ok(
+                            getattr(
+                                getattr(tc, "function", None), "arguments", None
+                            )
+                        )
+                    ]
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
                 finish_reason="tool_calls"
                 if is_finish_reason_tool_calls
-                else output.finish_reason
+                else str(output.finish_reason)
                 if output.finish_reason
                 else "stop",
                 stop_reason=output.stop_reason,

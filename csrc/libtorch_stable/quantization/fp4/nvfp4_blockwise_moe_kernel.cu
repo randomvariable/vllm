@@ -632,7 +632,7 @@ void run_fp4_blockwise_scaled_group_mm(
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
     const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(a.get_device_index());
 #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
   if (version_num >= 120 && version_num < 130) {
     run_fp4_blockwise_scaled_group_mm_sm120(
@@ -722,7 +722,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
         expert_offsets, sf_offsets, M, N, K);
   } else {
   #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
-    int32_t version_num = get_sm_version_num();
+    int32_t version_num = get_sm_version_num(a.get_device_index());
     if (version_num >= 120 && version_num < 130) {
       STD_TORCH_CHECK_NOT_IMPLEMENTED(
           false, "SM120 NVFP4 MOE only supports bfloat16 output, got: ",

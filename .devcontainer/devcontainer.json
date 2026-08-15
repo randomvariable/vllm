@@ -1,0 +1,48 @@
+{
+  "name": "vLLM Strix Halo (gfx1151) kernel development",
+  "build": {
+    "dockerfile": "../homelab/strix.Dockerfile",
+    "context": "..",
+    "target": "devtools"
+  },
+  "workspaceFolder": "/src/vllm",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/src/vllm,type=bind,consistency=cached",
+  "mounts": [
+    "source=vllm-strix-build,target=/vllm-build,type=volume",
+    "source=vllm-strix-ccache,target=/ccache,type=volume"
+  ],
+  "runArgs": [
+    "--device=/dev/kfd",
+    "--device=/dev/dri",
+    "--group-add=video",
+    "--security-opt=seccomp=unconfined",
+    "--ipc=host"
+  ],
+  "overrideCommand": true,
+  "postAttachCommand": "bash .devcontainer/postattach.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "rust-lang.rust-analyzer"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestPath": "/opt/venv/bin/pytest",
+        "clangd.arguments": [
+          "--compile-commands-dir=/src/vllm",
+          "--background-index",
+          "--header-insertion=never"
+        ],
+        "files.watcherExclude": {
+          "**/.deps/**": true,
+          "**/.slim/**": true,
+          "**/build/**": true
+        }
+      }
+    }
+  }
+}

@@ -264,9 +264,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
-            swiglu_alpha=getattr(layer, "swiglu_alpha", None),
-            swiglu_beta=getattr(layer, "swiglu_beta", None),
             layer=layer,
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
         )
 
     def apply_monolithic(

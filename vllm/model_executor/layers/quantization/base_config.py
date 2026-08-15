@@ -71,6 +71,10 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def supports_weight_reload(self) -> bool:
+        """Return whether this method supports in-place weight reloads."""
+        return True
+
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     """

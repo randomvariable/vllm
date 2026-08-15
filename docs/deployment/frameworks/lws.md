@@ -1,3 +1,5 @@
+> This page's generic example is separate from the versioned DeepSeek V4 Flash DSpark reference at `examples/deployment/deepseek-v4-flash-dspark-lws.yaml`. That example uses a digest-qualified image produced by the redacted Tekton provenance pipeline, a two-member LWS, stable leader rendezvous, readiness probes, anti-affinity, and explicit fail-closed capacity/STS opt-in. It does not use a runtime Python hotpatch.
+
 # LWS
 
 LeaderWorkerSet (LWS) is a Kubernetes API that aims to address common deployment patterns of AI/ML inference workloads.

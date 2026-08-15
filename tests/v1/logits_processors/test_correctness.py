@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import random
 from collections.abc import Callable
 from typing import NamedTuple, TypeAlias
@@ -20,7 +21,11 @@ from tests.v1.sample.utils import (
 )
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.sampling_params import SamplingParams, validate_thinking_token_budget
+from vllm.sampling_params import (
+    SamplingParams,
+    validate_reasoning_answer_reserve,
+    validate_thinking_token_budget,
+)
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.logits_processor import (
     BatchUpdate,
@@ -105,6 +110,14 @@ class MockReasoningConfig:
     reasoning_start_token_ids = [THINK_START_TOKEN_ID]
     reasoning_end_token_ids = [THINK_END_TOKEN_ID]
     enabled = True
+    reasoning_marker_token_ids = [[42]]
+
+
+class MockMultiTokenMarkerReasoningConfig(MockReasoningConfig):
+    """Reasoning config whose hesitation marker spans several tokens."""
+
+    # A "let me think" style marker alongside a single-token one.
+    reasoning_marker_token_ids = [[70, 71, 72], [42]]
 
 
 def _generate_fake_sampling_metadata(
@@ -967,6 +980,91 @@ def test_thinking_budget_holder_sync_add_without_budget_drops_row():
     assert not h.has_tracked_requests()
 
 
+def test_reasoning_marker_penalty_tracks_penalty_only_request():
+    vc = VllmConfig()
+    vc.reasoning_config = MockReasoningConfig()
+    h = ThinkingBudgetStateHolder(vc.reasoning_config, 2, 0, torch.device("cpu"), False)
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.5),
+                    [THINK_START_TOKEN_ID],
+                    [10],
+                )
+            ],
+            moved=(),
+        )
+    )
+    assert h.has_tracked_requests()
+    assert h._state[0]["thinking_token_budget"] is None
+    assert h._state[0]["in_think"]
+    assert h._state[0]["reasoning_marker_penalty"] == 2.5
+
+
+def test_reasoning_marker_penalty_only_inside_thinking_block():
+    cfg = MockReasoningConfig()
+    h = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+    h.update_state([[THINK_START_TOKEN_ID]], None)
+    logits = torch.zeros((1, 50))
+    h.apply_to_logits(logits, False, None)
+    assert logits[0, 42] == -2
+
+    h.update_state([[THINK_START_TOKEN_ID, THINK_END_TOKEN_ID]], None)
+    logits = torch.zeros((1, 50))
+    h.apply_to_logits(logits, False, None)
+    assert logits[0, 42] == 0
+
+
+def test_reasoning_marker_penalty_uses_full_speculative_batch_layout():
+    cfg = MockReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 3, 3, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=3,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    [THINK_START_TOKEN_ID],
+                    [],
+                ),
+                (1, SamplingParams(), [1], []),
+                (
+                    2,
+                    SamplingParams(reasoning_marker_penalty=3.0),
+                    [THINK_START_TOKEN_ID],
+                    [],
+                ),
+            ],
+            moved=(),
+        )
+    )
+    holder.update_state([[1], [1], [1]], [[10, 11], [20], [30, 31, 32]])
+    logits = torch.zeros((6, 50))
+    holder.apply_to_logits(logits, False, [[10, 11], [], [30, 31, 32]])
+    assert torch.equal(logits[:, 42], torch.tensor([-2, -2, 0, -3, -3, -3]))
+
+
 def test_thinking_budget_holder_swap_exchanges_state():
     vc = VllmConfig()
     vc.reasoning_config = MockReasoningConfig()
@@ -1444,6 +1542,9 @@ class TestThinkingBudgetNaturalEndReentry:
 
         params = MagicMock()
         params.thinking_token_budget = budget
+        params.reasoning_marker_penalty = None
+        params.reasoning_answer_reserve = None
+        params.max_tokens = None
         batch_update = MagicMock(
             removed=[],
             added=[(0, params, None, [])],
@@ -1745,6 +1846,9 @@ class TestThinkingBudgetNaturalEndReentry:
         prompt_tok_ids = [self.THINK_START]
         params = MagicMock()
         params.thinking_token_budget = self.BUDGET
+        params.reasoning_marker_penalty = None
+        params.reasoning_answer_reserve = None
+        params.max_tokens = None
         batch_update = MagicMock(
             removed=[],
             added=[(0, params, prompt_tok_ids, [])],
@@ -1785,3 +1889,910 @@ class TestThinkingBudgetNaturalEndReentry:
         )
 
     # --- Forced-end re-entry tests ---
+
+
+# --- reasoning_answer_reserve tests (fork issue #28) ---
+#
+# The reserve forces the reasoning-end token once the remaining output budget
+# (``max_tokens - len(output_tok_ids)``) drops to the reserve, so a reasoning
+# model can never spend all of ``max_tokens`` inside the thinking block.
+
+
+class TestReasoningAnswerReserve:
+    """Force-close driven by the remaining output budget."""
+
+    MAX_TOKENS = 20
+    RESERVE = 6
+    THINK_TOKEN = 60
+    CONTENT_TOKEN = 50
+    TOOL_CALL_TOKEN = 70
+
+    @staticmethod
+    def _make_holder(num_spec_tokens: int = 0) -> ThinkingBudgetStateHolder:
+        return ThinkingBudgetStateHolder(
+            MockReasoningConfig(),
+            8,
+            num_spec_tokens,
+            torch.device("cpu"),
+            False,
+        )
+
+    @staticmethod
+    def _sync(
+        holder: ThinkingBudgetStateHolder,
+        params: SamplingParams,
+        output_tok_ids: list[int],
+        prompt_tok_ids: list[int] | None = None,
+    ) -> None:
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=1,
+                removed=(),
+                added=[(0, params, prompt_tok_ids, output_tok_ids)],
+                moved=(),
+            )
+        )
+
+    @staticmethod
+    def _step(
+        holder: ThinkingBudgetStateHolder,
+        output_tok_ids: list[int],
+        spec_token_ids: list[list[int]] | None = None,
+    ) -> None:
+        holder.update_state(
+            output_token_ids=[list(output_tok_ids)],
+            spec_token_ids=spec_token_ids,
+            repeat_indices=None,
+        )
+
+    def _run_until_forced(
+        self,
+        holder: ThinkingBudgetStateHolder,
+        output: list[int],
+        limit: int,
+    ) -> int | None:
+        """Emit thinking tokens until the holder forces the close marker."""
+        for _ in range(limit):
+            if holder._state[0].get("in_end", False):
+                return len(output)
+            output.append(self.THINK_TOKEN)
+            self._step(holder, output)
+        return len(output) if holder._state[0].get("in_end", False) else None
+
+    def test_reserve_only_request_is_admitted(self):
+        holder = self._make_holder()
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            [],
+        )
+        assert holder.has_tracked_requests()
+        state = holder._state[0]
+        assert state["thinking_token_budget"] is None
+        assert state["reasoning_answer_reserve"] == self.RESERVE
+        assert state["max_tokens"] == self.MAX_TOKENS
+
+    def test_reserve_fires_at_expected_position(self):
+        holder = self._make_holder()
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        self._step(holder, output)
+
+        forced_at = self._run_until_forced(holder, output, self.MAX_TOKENS)
+        # The close marker is forced on the step whose sampled token would be
+        # output index ``max_tokens - reserve``, i.e. when exactly ``reserve``
+        # tokens of budget remain.
+        assert forced_at == self.MAX_TOKENS - self.RESERVE
+        assert holder._state[0]["in_end"]
+        assert holder._state[0]["force_index"] == [0]
+
+    def test_reserve_does_not_fire_when_reasoning_ends_naturally(self):
+        holder = self._make_holder()
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        self._step(holder, output)
+
+        for _ in range(3):
+            output.append(self.THINK_TOKEN)
+            self._step(holder, output)
+        output.append(THINK_END_TOKEN_ID)
+        self._step(holder, output)
+
+        assert not holder._state[0]["in_think"]
+        assert not holder._state[0].get("in_end", False)
+
+        # Answer tokens past the reserve boundary must not re-trigger.
+        for _ in range(self.MAX_TOKENS - len(output)):
+            output.append(self.CONTENT_TOKEN)
+            self._step(holder, output)
+        assert not holder._state[0].get("in_end", False)
+        assert holder._state[0]["force_index"] == []
+
+    def test_reserve_never_fires_outside_thinking_block(self):
+        holder = self._make_holder()
+        output: list[int] = []
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        for _ in range(self.MAX_TOKENS - 1):
+            output.append(self.CONTENT_TOKEN)
+            self._step(holder, output)
+        assert not holder._state[0]["in_think"]
+        assert not holder._state[0].get("in_end", False)
+
+    def test_reserve_unset_adds_no_state(self):
+        holder = self._make_holder()
+        self._sync(holder, SamplingParams(max_tokens=self.MAX_TOKENS), [])
+        assert not holder.has_tracked_requests()
+
+    # --- logits-level spec-decode checks ---
+    #
+    # Row layout in spec mode: the target-logits tensor gives each request
+    # ``max(1, len(spec_token_ids))`` rows, while the bonus row lives in a
+    # separate tensor. ``_apply_forcing_to_logits`` bounds ``mask_idx`` only by
+    # the mask capacity, so an out-of-range ``force_index`` writes into a
+    # *different* request's row. These tests therefore assert on the rows that
+    # actually receive the end-marker bump, not on ``force_index`` alone.
+
+    @staticmethod
+    def _bumped_rows(logits: torch.Tensor) -> list[tuple[int, int]]:
+        return [tuple(idx) for idx in (logits >= 1e8).nonzero().tolist()]
+
+    def _apply_step(
+        self,
+        holder: ThinkingBudgetStateHolder,
+        outputs: list[list[int]],
+        drafts: list[list[int]] | None,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """Run one sampling step: bonus call first, then the target call.
+
+        Mirrors ``RejectionSampler``, which calls the holder with
+        ``predict_bonus_token=True`` before the target-logits pass.
+        """
+        num_reqs = len(outputs)
+        holder.update_state([list(o) for o in outputs], drafts, repeat_indices=None)
+        bonus_logits = torch.zeros(num_reqs, VOCAB_SIZE)
+        holder.apply_to_logits(bonus_logits, True, drafts)
+
+        holder.update_state([list(o) for o in outputs], drafts, repeat_indices=None)
+        if drafts is None:
+            target_rows = num_reqs
+        else:
+            target_rows = sum(max(1, len(d)) for d in drafts)
+        target_logits = torch.zeros(target_rows, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+        return self._bumped_rows(bonus_logits), self._bumped_rows(target_logits)
+
+    def test_forced_row_stays_within_own_request_under_spec_decode(self):
+        """Two requests: the bump must never land in the other one's rows."""
+        num_spec = 3
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        outputs = [[THINK_START_TOKEN_ID], [THINK_START_TOKEN_ID]]
+        params = SamplingParams(
+            max_tokens=self.MAX_TOKENS,
+            reasoning_answer_reserve=self.RESERVE,
+        )
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=2,
+                removed=(),
+                added=[
+                    (0, params, None, outputs[0]),
+                    (1, params, None, outputs[1]),
+                ],
+                moved=(),
+            )
+        )
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+
+        forced_rows: list[tuple[int, int]] = []
+        for _ in range(self.MAX_TOKENS):
+            _, target_rows = self._apply_step(holder, outputs, drafts)
+            if target_rows:
+                forced_rows = target_rows
+                break
+            for out in outputs:
+                out.extend(drafts[0])
+                out.append(self.THINK_TOKEN)
+
+        assert forced_rows, "Reserve never fired under spec decode"
+        rows = sorted(row for row, _ in forced_rows)
+        # Request 0 owns rows 0..2, request 1 owns rows 3..5.
+        assert len(rows) == 2
+        assert 0 <= rows[0] <= num_spec - 1
+        assert num_spec <= rows[1] <= 2 * num_spec - 1
+        assert all(token == THINK_END_TOKEN_ID for _, token in forced_rows)
+
+    def test_reserve_position_matches_under_spec_decode(self):
+        """Forced close lands at the same output position with spec decode."""
+        num_spec = 3
+        baseline = self._make_holder()
+        baseline_out = [THINK_START_TOKEN_ID]
+        self._sync(
+            baseline,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            baseline_out,
+        )
+        self._step(baseline, baseline_out)
+        baseline_pos = self._run_until_forced(baseline, baseline_out, self.MAX_TOKENS)
+
+        spec = self._make_holder(num_spec_tokens=num_spec)
+        spec_out = [THINK_START_TOKEN_ID]
+        self._sync(
+            spec,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            spec_out,
+        )
+        drafts = [[self.THINK_TOKEN] * num_spec]
+        forced_pos: int | None = None
+        for _ in range(self.MAX_TOKENS):
+            _, target_rows = self._apply_step(spec, [spec_out], drafts)
+            if target_rows:
+                forced_pos = len(spec_out) + target_rows[0][0]
+                break
+            spec_out.extend(drafts[0])
+            spec_out.append(self.THINK_TOKEN)
+
+        assert baseline_pos is not None
+        assert forced_pos == baseline_pos
+
+    def test_forced_row_valid_on_partial_acceptance(self):
+        """Output grows by fewer than len(drafts)+1 when drafts are rejected."""
+        num_spec = 3
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        drafts = [[self.THINK_TOKEN] * num_spec]
+
+        forced_rows: list[tuple[int, int]] = []
+        for _ in range(self.MAX_TOKENS * 2):
+            _, target_rows = self._apply_step(holder, [output], drafts)
+            if target_rows:
+                forced_rows = target_rows
+                break
+            # Only one draft token accepted plus the bonus token.
+            output.extend(drafts[0][:1])
+            output.append(self.THINK_TOKEN)
+
+        assert forced_rows, "Reserve never fired under partial acceptance"
+        assert all(0 <= row < num_spec for row, _ in forced_rows)
+
+    def test_forced_row_valid_in_mixed_draft_length_batch(self):
+        """A zero-draft request alongside a drafted one keeps rows disjoint.
+
+        Row ownership here is uneven: request 0 has no drafts and so owns the
+        single row 0, while request 1 owns rows ``1..num_spec``. The assertion
+        is per request — a force index of 2 on request 0 is exactly the
+        out-of-range cross-request write this test exists to detect, and a
+        batch-wide range check would let it through.
+        """
+        num_spec = 3
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        # Seed request 0 near the reserve boundary so both requests fire
+        # within the same window and both bumps are observable.
+        outputs = [
+            [THINK_START_TOKEN_ID] + [self.THINK_TOKEN] * 10,
+            [THINK_START_TOKEN_ID],
+        ]
+        params = SamplingParams(
+            max_tokens=self.MAX_TOKENS,
+            reasoning_answer_reserve=self.RESERVE,
+        )
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=2,
+                removed=(),
+                added=[
+                    (0, params, None, outputs[0]),
+                    (1, params, None, outputs[1]),
+                ],
+                moved=(),
+            )
+        )
+        # Request 0 has no drafts this step, request 1 has a full window.
+        drafts: list[list[int]] = [[], [self.THINK_TOKEN] * num_spec]
+        # Target-tensor spans: request 0 owns row 0 alone (max(1, 0) rows),
+        # request 1 owns rows 1..num_spec. The bonus tensor gives one row per
+        # request, and a zero-draft request is forced there rather than in the
+        # target tensor, so both tensors count toward a request's single bump.
+        target_spans = {0: range(0, 1), 1: range(1, 1 + num_spec)}
+
+        seen: set[int] = set()
+        for _ in range(self.MAX_TOKENS):
+            bonus_rows, target_rows = self._apply_step(holder, outputs, drafts)
+            forced_reqs = {
+                req
+                for req, state in holder._state.items()
+                if state.get("in_end", False)
+            }
+            assert all(
+                token == THINK_END_TOKEN_ID for _, token in (*bonus_rows, *target_rows)
+            )
+            for req in forced_reqs:
+                owned = [row for row, _ in target_rows if row in target_spans[req]]
+                owned += [row for row, _ in bonus_rows if row == req]
+                # Exactly one bump, inside this request's own rows. Zero means
+                # its force index escaped into a neighbour's row span or off
+                # the end of the tensor; more than one means a stray write.
+                assert len(owned) == 1, (
+                    f"Request {req} expected exactly one forced row of its own, "
+                    f"got bonus={bonus_rows} target={target_rows}"
+                )
+                seen.add(req)
+            assert len(bonus_rows) + len(target_rows) == len(forced_reqs), (
+                "One forced row per in_end request; a surplus row means a "
+                "cross-request write"
+            )
+            outputs[0].append(self.THINK_TOKEN)
+            outputs[1].extend(drafts[1])
+            outputs[1].append(self.THINK_TOKEN)
+
+        assert 0 in seen, "Reserve never fired for the zero-draft request"
+        assert 1 in seen, "Reserve never fired for the drafted request"
+
+    def test_multi_token_marker_continuation_row_under_spec_decode(self):
+        """The continuation token must be forced at the row the marker needs.
+
+        Once the first close-marker token has landed, the remaining marker
+        tokens are placed by ``_advance_end_sequence`` relative to the accepted
+        drafts. The bonus/target double call within a single step must replay
+        that position, not re-derive it from the reserve boundary — by then the
+        reserve offset has gone negative and would force at row 0, overwriting
+        the draft that the marker is meant to follow.
+        """
+        num_spec = 2
+        marker = [THINK_END_TOKEN_ID, 997, 996]
+
+        class MultiEndConfig:
+            reasoning_start_token_ids = [THINK_START_TOKEN_ID]
+            reasoning_end_token_ids = marker
+            enabled = True
+
+        holder = ThinkingBudgetStateHolder(
+            MultiEndConfig(), 8, num_spec, torch.device("cpu"), False
+        )
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+
+        drafts = [[self.THINK_TOKEN] * num_spec]
+        forced: list[tuple[int, int]] = []
+        for _ in range(self.MAX_TOKENS):
+            _, target_rows = self._apply_step(holder, [output], drafts)
+            if target_rows:
+                forced = target_rows
+                break
+            output.extend(drafts[0])
+            output.append(self.THINK_TOKEN)
+        assert forced, "Reserve never fired"
+
+        # Accept the drafts before the forced row, then the marker token.
+        output.extend(drafts[0][: forced[0][0]])
+        output.append(forced[0][1])
+        assert forced[0][1] == marker[0]
+
+        # Next step: the drafter proposes the second marker token, so the
+        # third one must be forced immediately after it (row 1), not at row 0.
+        drafts = [[marker[1], self.THINK_TOKEN]]
+        _, target_rows = self._apply_step(holder, [output], drafts)
+        assert target_rows == [(1, marker[2])], (
+            "Marker continuation must be forced after the accepted draft"
+        )
+
+    def test_marker_continuation_row_with_budget_and_reserve(self):
+        """Same replay requirement on the budgeted path.
+
+        With ``thinking_token_budget`` also set, ``_update_think_state`` takes
+        the budgeted branch, whose same-step revisit recomputes ``force_index``
+        from budget arithmetic and then merges the reserve offset. Mid-marker
+        that merge resolves to row 0, so the branch must replay the position
+        ``_advance_end_sequence`` chose instead.
+        """
+        num_spec = 2
+        marker = [THINK_END_TOKEN_ID, 997, 996]
+
+        class MultiEndConfig:
+            reasoning_start_token_ids = [THINK_START_TOKEN_ID]
+            reasoning_end_token_ids = marker
+            enabled = True
+
+        holder = ThinkingBudgetStateHolder(
+            MultiEndConfig(), 8, num_spec, torch.device("cpu"), False
+        )
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                thinking_token_budget=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+
+        drafts = [[self.THINK_TOKEN] * num_spec]
+        forced: list[tuple[int, int]] = []
+        for _ in range(self.MAX_TOKENS):
+            _, target_rows = self._apply_step(holder, [output], drafts)
+            if target_rows:
+                forced = target_rows
+                break
+            output.extend(drafts[0])
+            output.append(self.THINK_TOKEN)
+        assert forced, "Neither trigger fired"
+        assert forced[0][1] == marker[0]
+
+        output.extend(drafts[0][: forced[0][0]])
+        output.append(forced[0][1])
+
+        drafts = [[marker[1], self.THINK_TOKEN]]
+        _, target_rows = self._apply_step(holder, [output], drafts)
+        assert target_rows == [(1, marker[2])], (
+            "Budgeted path must replay the marker continuation position"
+        )
+
+    def test_budget_and_reserve_merge_under_spec_decode(self):
+        """Reserve offset below the budget offset wins inside one step."""
+        num_spec = 4
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        output = [THINK_START_TOKEN_ID]
+        # Budget is loose enough to force late in the draft window; the reserve
+        # boundary lands earlier, so the merge must pick the reserve offset.
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                thinking_token_budget=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        drafts = [[self.THINK_TOKEN] * num_spec]
+
+        forced_rows: list[tuple[int, int]] = []
+        for _ in range(self.MAX_TOKENS):
+            _, target_rows = self._apply_step(holder, [output], drafts)
+            if target_rows:
+                forced_rows = target_rows
+                break
+            output.extend(drafts[0])
+            output.append(self.THINK_TOKEN)
+
+        assert forced_rows, "Neither trigger fired"
+        forced_pos = len(output) + forced_rows[0][0]
+        assert forced_rows[0][0] < num_spec, (
+            "Forced row must stay inside this request's target rows"
+        )
+        assert forced_pos <= self.MAX_TOKENS - self.RESERVE, (
+            "Reserve boundary must not be overshot when both triggers are set"
+        )
+
+    def test_reserve_and_thinking_budget_compose_earliest_wins(self):
+        """Both triggers active: whichever fires first closes the block."""
+        # Budget is tight, reserve is loose: the budget wins.
+        holder = self._make_holder()
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                thinking_token_budget=3,
+                reasoning_answer_reserve=1,
+            ),
+            output,
+        )
+        self._step(holder, output)
+        budget_pos = self._run_until_forced(holder, output, self.MAX_TOKENS)
+        assert budget_pos == 4  # think-start + 3 thinking tokens
+
+        # Reserve is tight, budget is loose: the reserve wins.
+        holder = self._make_holder()
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                thinking_token_budget=1000,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        self._step(holder, output)
+        reserve_pos = self._run_until_forced(holder, output, self.MAX_TOKENS)
+        assert reserve_pos == self.MAX_TOKENS - self.RESERVE
+
+    def test_reserve_forces_close_during_tool_call(self):
+        """Known hazard (upstream #44676): forcing can land mid tool call.
+
+        The holder does not treat tool-call markers as an implicit reasoning
+        end, so the reserve behaves exactly like ``thinking_token_budget``
+        here. This pins the current behaviour so a future fix for #44676 is a
+        deliberate, visible change rather than a silent one.
+        """
+        holder = self._make_holder()
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        self._step(holder, output)
+
+        while len(output) < self.MAX_TOKENS - self.RESERVE - 2:
+            output.append(self.THINK_TOKEN)
+            self._step(holder, output)
+        assert not holder._state[0].get("in_end", False)
+
+        # Enter a tool call right before the reserve boundary.
+        for _ in range(2):
+            output.append(self.TOOL_CALL_TOKEN)
+            self._step(holder, output)
+
+        assert holder._state[0]["in_end"], (
+            "Reserve must still fire inside a tool call; see upstream #44676"
+        )
+        assert len(output) == self.MAX_TOKENS - self.RESERVE
+
+    def test_multi_token_end_marker_is_emitted_fully(self):
+        class MultiEndConfig:
+            reasoning_start_token_ids = [THINK_START_TOKEN_ID]
+            reasoning_end_token_ids = [THINK_END_TOKEN_ID, 997, 996]
+            enabled = True
+
+        holder = ThinkingBudgetStateHolder(
+            MultiEndConfig(), 8, 0, torch.device("cpu"), False
+        )
+        output = [THINK_START_TOKEN_ID]
+        self._sync(
+            holder,
+            SamplingParams(
+                max_tokens=self.MAX_TOKENS,
+                reasoning_answer_reserve=self.RESERVE,
+            ),
+            output,
+        )
+        self._step(holder, output)
+        assert self._run_until_forced(holder, output, self.MAX_TOKENS) is not None
+
+        for token in MultiEndConfig.reasoning_end_token_ids:
+            assert holder._state[0]["in_end"]
+            output.append(token)
+            self._step(holder, output)
+        assert not holder._state[0]["in_end"], (
+            "State must reset once the whole close marker has been emitted"
+        )
+
+    # --- row-span guard (fork issue #34) ---
+    #
+    # ``_apply_forcing_to_logits`` bounds the write row by the owning request's
+    # row span, not by the tensor. Without that bound an out-of-span
+    # ``force_index`` writes the end-of-thinking token into the *next*
+    # request's rows, or is clipped away entirely on the last request in the
+    # batch. Both are silent. These tests drive a real out-of-span index
+    # through the guard.
+
+    def _two_request_holder(
+        self, num_spec: int
+    ) -> tuple[ThinkingBudgetStateHolder, list[list[int]]]:
+        holder = self._make_holder(num_spec_tokens=num_spec)
+        outputs = [[THINK_START_TOKEN_ID], [THINK_START_TOKEN_ID]]
+        params = SamplingParams(
+            max_tokens=self.MAX_TOKENS,
+            reasoning_answer_reserve=self.RESERVE,
+        )
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=2,
+                removed=(),
+                added=[
+                    (0, params, None, outputs[0]),
+                    (1, params, None, outputs[1]),
+                ],
+                moved=(),
+            )
+        )
+        return holder, outputs
+
+    def _drive_to_forcing(
+        self,
+        holder: ThinkingBudgetStateHolder,
+        outputs: list[list[int]],
+        drafts: list[list[int]],
+    ) -> None:
+        """Advance both requests until each one is inside the close marker."""
+        for _ in range(self.MAX_TOKENS):
+            self._apply_step(holder, outputs, drafts)
+            if all(holder._state[i].get("in_end", False) for i in range(len(outputs))):
+                return
+            for i, out in enumerate(outputs):
+                out.extend(drafts[i])
+                out.append(self.THINK_TOKEN)
+        raise AssertionError("Requests never entered the forced-close state")
+
+    def test_out_of_span_force_index_does_not_write_into_next_request(self):
+        """An index past request 0's rows must not land in request 1's rows."""
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        # Request 0 owns target rows 0..2; row 3 is the first row of request 1.
+        holder._state[0]["force_index"] = [num_spec]
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [], (
+            "Out-of-span force index must be rejected, not written into the "
+            "next request's rows"
+        )
+
+    def test_out_of_span_force_index_on_last_request_is_rejected(self, caplog):
+        """On the last request the overshoot is clipped away, not written.
+
+        Clipping is silent: the forced token simply never lands and the
+        reasoning block runs past its budget. The guard must report it, so
+        this test asserts on the log rather than only on the (unchanged)
+        logits, which the pre-existing tensor bound would also produce.
+        """
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        holder._state[0]["force_index"] = []
+        holder._state[0]["bonus_token_forced"] = True
+        holder._state[1]["force_index"] = [num_spec]
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        with caplog.at_level(logging.WARNING):
+            holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == []
+        assert any("outside request 1" in r.message for r in caplog.records), (
+            "An overshoot on the last request must be reported, not silently "
+            f"clipped; got {[r.message for r in caplog.records]}"
+        )
+
+    def test_out_of_span_force_index_with_differing_draft_lengths(self):
+        """Uneven spans: request 0 owns one row, request 1 owns num_spec rows.
+
+        A zero-draft request owns a single target row, so index 2 lands inside
+        the drafted neighbour's rows. This is the uneven-span shape the tensor
+        bound cannot catch, because the index is well inside the tensor.
+        """
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts: list[list[int]] = [[], [self.THINK_TOKEN] * num_spec]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        # Request 0 has no drafts, so it owns exactly one target row (row 0).
+        # Index 2 would land in request 1's rows, which start at row 1.
+        holder._state[0]["force_index"] = [2]
+        holder._state[0]["bonus_token_forced"] = False
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(1 + num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [], (
+            "A zero-draft request owns one row; index 2 belongs to request 1"
+        )
+
+    def test_in_span_force_index_still_writes(self):
+        """The guard must not reject legitimate indices."""
+        num_spec = 3
+        holder, outputs = self._two_request_holder(num_spec)
+        drafts = [[self.THINK_TOKEN] * num_spec for _ in outputs]
+        self._drive_to_forcing(holder, outputs, drafts)
+
+        holder._state[0]["force_index"] = [num_spec - 1]
+        holder._state[1]["force_index"] = []
+        holder._state[1]["bonus_token_forced"] = True
+
+        target_logits = torch.zeros(2 * num_spec, VOCAB_SIZE)
+        holder.apply_to_logits(target_logits, False, drafts)
+
+        assert self._bumped_rows(target_logits) == [(num_spec - 1, THINK_END_TOKEN_ID)]
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (None, None),
+        (-1, None),
+        (1, 1),
+        (128, 128),
+    ],
+)
+def test_validate_reasoning_answer_reserve(raw_value, expected):
+    assert validate_reasoning_answer_reserve(raw_value) == expected
+
+
+@pytest.mark.parametrize("invalid_value", [-2, 0, 0.6, 10.5, True])
+def test_validate_reasoning_answer_reserve_rejects_invalid(invalid_value):
+    from vllm.exceptions import VLLMValidationError
+
+    with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
+        validate_reasoning_answer_reserve(invalid_value)
+
+
+def test_reasoning_answer_reserve_rejected_when_not_below_max_tokens():
+    from vllm.exceptions import VLLMValidationError
+
+    with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
+        SamplingParams(max_tokens=64, reasoning_answer_reserve=64)
+
+
+def test_reasoning_answer_reserve_rejected_when_min_tokens_unsatisfiable():
+    from vllm.exceptions import VLLMValidationError
+
+    with pytest.raises(VLLMValidationError, match="min_tokens"):
+        SamplingParams(max_tokens=64, min_tokens=60, reasoning_answer_reserve=32)
+
+
+def test_reasoning_answer_reserve_accepts_satisfiable_min_tokens():
+    params = SamplingParams(max_tokens=64, min_tokens=32, reasoning_answer_reserve=32)
+    assert params.reasoning_answer_reserve == 32
+
+
+def test_resolve_max_tokens_fills_unset_max_tokens():
+    from vllm.v1.engine.input_processor import resolve_max_tokens
+
+    params = SamplingParams(max_tokens=None)
+    resolve_max_tokens(params, 512)
+    assert params.max_tokens == 512
+
+
+def test_resolve_max_tokens_clamps_reserve_request_to_prompt_aware_cap():
+    """An oversized max_tokens would put the reserve boundary out of reach."""
+    from vllm.v1.engine.input_processor import resolve_max_tokens
+
+    params = SamplingParams(max_tokens=8000, reasoning_answer_reserve=512)
+    resolve_max_tokens(params, 1024)
+    assert params.max_tokens == 1024
+
+
+def test_resolve_max_tokens_leaves_reserve_request_under_the_cap_alone():
+    from vllm.v1.engine.input_processor import resolve_max_tokens
+
+    params = SamplingParams(max_tokens=256, reasoning_answer_reserve=64)
+    resolve_max_tokens(params, 1024)
+    assert params.max_tokens == 256
+
+
+def test_resolve_max_tokens_does_not_clamp_without_reserve():
+    from vllm.v1.engine.input_processor import resolve_max_tokens
+
+    params = SamplingParams(max_tokens=8000)
+    resolve_max_tokens(params, 1024)
+    assert params.max_tokens == 8000
+
+
+def test_resolve_max_tokens_rejects_reserve_unreachable_after_clamp():
+    """Clamping can make a previously valid reserve unsatisfiable."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.v1.engine.input_processor import resolve_max_tokens
+
+    params = SamplingParams(max_tokens=8000, reasoning_answer_reserve=512)
+    with pytest.raises(VLLMValidationError, match="reasoning_answer_reserve"):
+        resolve_max_tokens(params, 256)
+
+
+def test_reasoning_marker_penalty_multi_token_needs_prefix_match():
+    """A multi-token marker is penalised only where it would complete.
+
+    The marker is [70, 71, 72]. After emitting [70, 71] the next token would
+    complete it, so 72 is penalised. With unrelated history 72 is a legitimate
+    continuation and must be untouched -- the distinction a flat per-token
+    penalty cannot make.
+    """
+    cfg = MockMultiTokenMarkerReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+
+    # History ends mid-marker: the next token completes it.
+    holder.update_state([[THINK_START_TOKEN_ID, 70, 71]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == -2
+    # Prefix tokens are not themselves penalised.
+    assert logits[0, 70] == 0
+    assert logits[0, 71] == 0
+    # The single-token marker still applies unconditionally inside <think>.
+    assert logits[0, 42] == -2
+
+    # Unrelated history: 72 does not complete the marker here.
+    holder.update_state([[THINK_START_TOKEN_ID, 5, 6]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == 0
+    assert logits[0, 42] == -2
+
+
+def test_reasoning_marker_penalty_multi_token_outside_thinking_block():
+    """Multi-token markers stop being penalised once reasoning has ended."""
+    cfg = MockMultiTokenMarkerReasoningConfig()
+    holder = ThinkingBudgetStateHolder(cfg, 1, 0, torch.device("cpu"), False)
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(reasoning_marker_penalty=2.0),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+
+    holder.update_state([[THINK_START_TOKEN_ID, THINK_END_TOKEN_ID, 70, 71]], None)
+    logits = torch.zeros((1, 100))
+    holder.apply_to_logits(logits, False, None)
+    assert logits[0, 72] == 0
+    assert logits[0, 42] == 0

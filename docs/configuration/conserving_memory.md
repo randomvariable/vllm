@@ -75,6 +75,54 @@ from vllm import LLM
 llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", enforce_eager=True)
 ```
 
+## GPU memory budget
+
+vLLM sizes the KV cache to fill a memory budget measured during startup profiling. Two mutually exclusive controls set that budget:
+
+- `gpu_memory_utilization` (`--gpu-memory-utilization`) is a **fraction** of total device memory, from 0 to 1. This is the default control; when neither option is set it resolves to `0.92`.
+- `gpu_memory_utilization_gb` (`--gpu-memory-utilization-gb`) is an **absolute** per-worker budget in GiB.
+
+The absolute budget is the *total engine-resident* target for the worker's device. Model weights, persistent non-KV state, the profiled activation peak, accounted CUDA graphs, the KV cache, and frontend GPU reservations all fit **inside** it. It is not extra memory taken on top of what is already allocated, and it is not a KV-cache-only figure.
+
+```python
+from vllm import LLM
+
+# Keep this worker's total device residency under 40 GiB.
+llm = LLM(model="Qwen/Qwen3-8B", gpu_memory_utilization_gb=40)
+```
+
+### When to use the absolute budget
+
+Use it on unified-memory devices -- for example NVIDIA GB10 / DGX Spark and AMD Strix Halo (gfx1151) -- where the GPU and the host share one physical memory pool. A fraction of *total device memory* is a poor control there, because the fraction says nothing about how much memory is left for the host, so a value that is safe on a discrete GPU can starve the operating system. An absolute GiB figure is device-size independent and leaves a predictable remainder for the host.
+
+On a discrete GPU with dedicated VRAM, prefer the fractional control.
+
+For the kernel-level constraints of these unified-memory targets, see [Writing Kernels for Homelab Targets](../contributing/kernel_targets/README.md).
+
+### Mutual exclusion
+
+Setting both `gpu_memory_utilization` and `gpu_memory_utilization_gb` raises an error. There is deliberately no precedence rule, so neither value is ever silently discarded.
+
+The absolute budget is also rejected together with `kv_cache_memory_bytes` (`--kv-cache-memory`). These are easy to confuse but do different jobs:
+
+| Option | Sizes | Profiling |
+| ------ | ----- | --------- |
+| `--gpu-memory-utilization-gb` | the whole engine's residency | required -- profiling is what enforces the budget |
+| `--kv-cache-memory` | the KV cache only | skipped |
+
+Because `--kv-cache-memory` skips the profiling pass, combining the two would bypass the enforcement the whole-engine budget depends on. Use `--kv-cache-memory` with the fractional `--gpu-memory-utilization` instead.
+
+### Intentional failure modes
+
+The absolute budget fails closed rather than quietly overshooting:
+
+- The CUDA-graph memory estimate is **always** subtracted, ignoring the estimator opt-out environment variable that applies in fractional mode. Captured graphs must be counted, or the "total" target would be incomplete.
+- If graph capture is active but no estimate is available, startup **fails** instead of placing captured graphs outside the budget. Either switch to the fractional control or disable capture (`--enforce-eager`, or `cudagraph_mode=NONE`).
+- [Startup plans](./optimization.md#faster-startup) are neither applied nor saved while the absolute budget is active, because applying one skips profiling.
+
+!!! note
+    This is allocation *planning*, not an allocator-enforced quota. vLLM sizes its own allocations to fit the budget; it does not intercept every allocation to cap them. Real-hardware unified-memory residency validation is still outstanding.
+
 ## Adjust cache size
 
 If you run out of CPU RAM, try the following options:

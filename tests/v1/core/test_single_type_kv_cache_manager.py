@@ -602,3 +602,47 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+def test_predictor_matches_allocator_with_admission_cap_and_partial_local_hit():
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
+        max_admission_blocks_per_request=4,
+    )
+
+    request_id = "partial-hit"
+    cached_block = block_pool.blocks[1]
+    predicted = manager.get_num_blocks_to_allocate(
+        request_id=request_id,
+        num_tokens=10,
+        new_computed_blocks=[cached_block],
+        total_computed_tokens=1,
+        num_local_computed_tokens=1,
+        num_tokens_main_model=10,
+        apply_admission_cap=True,
+    )
+    manager.add_local_computed_blocks(
+        request_id,
+        [cached_block],
+        num_local_computed_tokens=1,
+        num_external_computed_tokens=0,
+    )
+    allocated = manager.allocate_new_blocks(
+        request_id, num_tokens=10, num_tokens_main_model=10
+    )
+
+    assert predicted == len(allocated)
+    assert predicted == 5

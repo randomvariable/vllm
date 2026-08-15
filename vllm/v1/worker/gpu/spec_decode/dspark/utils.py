@@ -6,6 +6,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -22,17 +23,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.model_executor.models.utils import get_draft_quant_config
 
     # None re-runs backend auto-selection for the draft, which can pick a
-    # different attention class than the target; fall back to the target's.
-    draft_attention_backend = (
-        speculative_config.attention_backend or vllm_config.attention_config.backend
-    )
-
+    # different attention class than the target; use an explicit backend.
+    # DSpark requires a non-causal-capable backend for draft CUDA graphs.
+    backend = speculative_config.attention_backend
+    if backend is None:
+        backend = (
+            vllm_config.attention_config.backend
+            or AttentionBackendEnum.FLASH_ATTN
+        )
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
-            backend=draft_attention_backend,
+            backend=backend,
         ),
         cache_config=(
             replace(
@@ -80,5 +84,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
+
+    # Opt-in rowwise-fp8 draft head (VLLM_DSPARK_FP8_DRAFT_HEAD). Must run
+    # after the lm_head aliasing above and BEFORE CUDA graph capture: the
+    # draft step is captured whole, so the fp8 copy is materialized eagerly.
+    maybe_init_fp8_draft_head = getattr(draft_model, "maybe_init_fp8_draft_head", None)
+    if maybe_init_fp8_draft_head is not None:
+        maybe_init_fp8_draft_head()
 
     return draft_model

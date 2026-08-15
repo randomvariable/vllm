@@ -376,7 +376,7 @@ void run_mxfp4_blockwise_scaled_group_mm(
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
     const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
-  int32_t version_num = get_sm_version_num();
+  int32_t version_num = get_sm_version_num(a.get_device_index());
 #if defined ENABLE_NVFP4_SM100 && ENABLE_NVFP4_SM100
   if (version_num >= 100 && version_num < 120) {
     run_mxfp4_blockwise_scaled_group_mm_sm100<OutType>(

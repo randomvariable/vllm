@@ -259,9 +259,8 @@ class StructuredOutputManager:
                 structured_output_request = request.structured_output_request
                 if TYPE_CHECKING:
                     assert structured_output_request is not None
+                    assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
-                if TYPE_CHECKING:
-                    assert isinstance(grammar, StructuredOutputGrammar)
 
                 apply_bitmask = self.should_fill_bitmask(request)
                 batch.append((grammar, cumulative_index, apply_bitmask))
@@ -284,9 +283,8 @@ class StructuredOutputManager:
 
                 if TYPE_CHECKING:
                     assert structured_output_request is not None
+                    assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
-                if TYPE_CHECKING:
-                    assert isinstance(grammar, StructuredOutputGrammar)
                 apply_bitmask = self.should_fill_bitmask(request)
 
                 reasoner = self._get_reasoner(request)
@@ -380,15 +378,15 @@ class StructuredOutputManager:
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
                 request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end(request.prompt_token_ids or [])
+                    reasoner.is_reasoning_end_for_prompt(
+                        request.prompt_token_ids or []
+                    )
                 )
             return request.structured_output_request.reasoning_ended
         return True
 
     def should_advance(
-        self,
-        request: "Request",
-        new_token_ids: list[int] | None = None,
+        self, request: "Request", new_token_ids: Sequence[int] | None = None
     ) -> bool:
         if not request.use_structured_output:
             return False
@@ -412,20 +410,15 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return True
 
-        # Check if reasoning ends in *this* step.
-        # When the caller passes new_token_ids (the tokens that were just
-        # appended this step), use it directly as the delta window. The
-        # placeholder-derived fallback assumes num_output_placeholders ==
-        # len(new_token_ids), which breaks under async scheduling + spec
-        # decode when some drafts are rejected (#43388): the placeholder
-        # count remains > 0 after the step and the computed delta window
-        # starts past the reasoning-end marker.
+        # Check if reasoning ends in *this* step. Prefer the caller's actual
+        # new_token_ids over reconstructing the step window from scheduler
+        # counters: with speculative decoding, num_computed_tokens is already
+        # advanced past the accepted draft tokens when this runs, so the
+        # counter-derived window can miss the reasoning-end marker.
         all_token_ids = request.all_token_ids
-        if new_token_ids:
-            # The tokens were already appended this step, so the step window
-            # starts exactly len(new_token_ids) from the end.
-            start = len(all_token_ids) - len(new_token_ids)
-            delta_ids: Iterable[int] = new_token_ids
+        if new_token_ids is not None:
+            start = max(len(all_token_ids) - len(new_token_ids), 0)
+            delta: Iterable[int] = new_token_ids
         else:
             delta_from = request.num_computed_tokens - request.num_output_placeholders
             start = (
@@ -433,15 +426,26 @@ class StructuredOutputManager:
                 if delta_from >= 0
                 else max(len(all_token_ids) + delta_from, 0)
             )
-            delta_ids = itertools.islice(all_token_ids, start, None)
-        if reasoner.is_reasoning_end_streaming(all_token_ids, delta_ids):
+            delta = itertools.islice(all_token_ids, start, None)
+        if reasoner.is_reasoning_end_streaming(all_token_ids, delta):
             structured_req.reasoning_ended = True
 
-            # Record the boundary so the scheduler can exclude reasoning tokens.
-            end_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)
-
-            structured_req.reasoning_end_token_index = end_index
-            return True
+            # Reasoning just ended this step. Without speculative decoding the
+            # boundary step ends at the marker, so deferring the FSM advance to
+            # the next pass (see reasoning_ended check above) is safe. With
+            # speculative decoding the same step can already contain accepted
+            # post-marker content (e.g. a drafted "{" verified right after the
+            # end marker); deferring would leave the grammar permanently one
+            # token behind the sampled stream, and the next bitmask would then
+            # force a duplicate of a token the model already emitted. Advance
+            # same-step for every structured type: trim_reasoning_for_advance()
+            # drops everything up to and including the marker, so the grammar
+            # never sees reasoning content.
+            if self.vllm_config.speculative_config is not None:
+                structured_req.reasoning_end_token_index = (
+                    self._find_reasoning_end_index(reasoner, all_token_ids, start)
+                )
+                return True
 
         return False
 

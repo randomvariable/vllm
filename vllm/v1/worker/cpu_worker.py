@@ -4,7 +4,6 @@
 # Must be imported firstly
 import vllm.v1.worker.cpu.shm  # noqa # isort: skip
 
-import math
 import os
 import sys
 from typing import Any
@@ -25,6 +24,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.utils import describe_memory_budget, effective_memory_budget
 from vllm.v1.worker.worker_base import CompilationTimes
 
 logger = init_logger(__name__)
@@ -71,9 +71,11 @@ class CPUWorker(Worker):
         torch.ops._C.init_cpu_memory_env([memory_node])
 
         memory_status = get_memory_node_info(memory_node)
-        memory_fraction = vllm_config.cache_config.gpu_memory_utilization
-        self.requested_cpu_memory = math.ceil(
-            memory_status.total_memory * memory_fraction
+        # The CPU backend reuses the GPU memory budget controls (despite
+        # their names), including the absolute GiB target, so resolve them
+        # through the same helper the GPU workers use.
+        self.requested_cpu_memory = effective_memory_budget(
+            memory_status.total_memory, vllm_config.cache_config
         )
         available_memory = memory_status.available_memory
 
@@ -85,14 +87,14 @@ class CPUWorker(Worker):
                 f"Available memory on node {cpu_core.numa_node} "
                 f"({format_gib(available_memory)}/"
                 f"{format_gib(memory_status.total_memory)} GiB) on startup "
-                f"is less than desired CPU memory utilization "
-                f"({vllm_config.cache_config.gpu_memory_utilization}, "
+                f"is less than the desired CPU memory budget "
+                f"({describe_memory_budget(vllm_config.cache_config)}, "
                 f"{format_gib(self.requested_cpu_memory)} GiB). "
-                "On the CPU backend, the `--gpu-memory-utilization` flag "
-                "controls the fraction of CPU memory reserved (despite its "
-                "name). To resolve: decrease `--gpu-memory-utilization` "
-                "(e.g. `--gpu-memory-utilization 0.5`) "
-                "or reduce CPU memory used by other processes."
+                "On the CPU backend, the `--gpu-memory-utilization` and "
+                "`--gpu-memory-utilization-gb` flags control the CPU memory "
+                "reserved (despite their names). To resolve: lower the GPU "
+                "memory budget (e.g. `--gpu-memory-utilization 0.5`) or "
+                "reduce CPU memory used by other processes."
             )
 
         super().__init__(

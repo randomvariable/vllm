@@ -146,10 +146,20 @@ def kernel_paged_attention_2d(
 
     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
 
+    # Sliding-window decode: tokens below (seq_len - SLIDING_WINDOW) are fully
+    # masked out below, so their blocks cannot influence the output. Start the
+    # loop at the window edge so their K/V is never read; the score mask still
+    # trims the partial first block. Decode is bandwidth-bound, so this makes
+    # windowed-layer latency independent of context length.
+    if SLIDING_WINDOW > 0:
+        start_block = tl.maximum(seq_len - SLIDING_WINDOW, 0) // BLOCK_SIZE
+    else:
+        start_block = 0
+
     offs_n = tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     # iterate through tiles
-    for j in range(0, num_blocks):
+    for j in range(start_block, num_blocks):
         start_n = j * BLOCK_SIZE
         # Calculate the logical location within a non-standard physical block,
         # such as 544 in Qwen/Qwen3-Next-80B-A3B-Thinking.
@@ -368,7 +378,10 @@ def chunked_prefill_paged_decode(
 
     num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
-    from vllm.platforms.rocm import use_rocm_custom_paged_attention
+    from vllm.platforms.rocm import (
+        unsupported_reason_rocm_custom_paged_attention,
+        use_rocm_custom_paged_attention,
+    )
 
     use_custom = use_rocm_custom_paged_attention(
         query.dtype,
@@ -381,12 +394,33 @@ def chunked_prefill_paged_decode(
         alibi_slopes,
         sinks,
     )
+    fallback_reason = (
+        None
+        if use_custom
+        else unsupported_reason_rocm_custom_paged_attention(
+            query.dtype,
+            head_size,
+            block_size,
+            num_queries_per_kv,
+            max_seq_len,
+            sliding_window,
+            kv_cache_dtype,
+            alibi_slopes is not None,
+            sinks is not None,
+        )
+    )
     has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
     # Force Triton for non-standard blocks like Qwen3's 544 and for
     # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
     # during cache update, so keep decode on the matching stride-aware path.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2 or not has_native_layout:
+        # These two overrides are decided here rather than in the envelope
+        # check, so name them here or the reason would be reported as None.
+        if not is_pow2:
+            fallback_reason = f"non-power-of-2 block size ({block_size})"
+        else:
+            fallback_reason = "stride-padded (non-native) KV cache layout"
         use_custom = False
 
     if use_custom:
@@ -430,9 +464,16 @@ def chunked_prefill_paged_decode(
             fp8_out_scale=output_scale,
         )
     else:
-        logger.warning_once(
-            "Cannot use ROCm custom paged attention kernel,"
-            " falling back to Triton implementation."
+        # INFO, not WARNING: for many valid configurations (quantized KV,
+        # sliding-window layers, non-128 head sizes) the Triton path is the
+        # correct and expected choice, so this must not look like an error.
+        # The specific reason is passed as an arg so info_once's lru_cache key
+        # includes it -- each distinct reason logs once, and repeat calls on
+        # the decode hot path are dropped.
+        logger.info_once(
+            "ROCm custom paged attention kernel unavailable (%s); "
+            "using Triton attention instead.",
+            fallback_reason or "reason unavailable",
         )
         real_block_size = value_cache.shape[3]
         # The standard model directly uses the original block_size.

@@ -1,0 +1,12 @@
+nav:
+  - README.md
+  - rdna35.md
+  - sm120.md
+  - Cross-target reference:
+    - execution_model.md
+    - matrix_units.md
+    - memory_model.md
+    - numerics.md
+    - toolchain.md
+  - porting_sm120_to_gfx1151.md
+  - verification.md

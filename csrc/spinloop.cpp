@@ -7,6 +7,12 @@ extern "C" {
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
+  // Use the <x86intrin.h> umbrella rather than <mwaitxintrin.h> directly:
+  // ROCm/LLVM clang (the gfx1151 host compiler) enforces include discipline and
+  // hard-errors on a direct <mwaitxintrin.h> include, while still exposing
+  // _mm_monitorx/_mm_mwaitx via <x86intrin.h>. GCC accepts both, so this is a
+  // no-op for GCC hosts; arm64 never compiles this block. The required -mmwaitx
+  // target feature is supplied by CMakeLists.txt for x86_64.
   #include <x86intrin.h>
 #endif
 

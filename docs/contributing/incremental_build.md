@@ -1,6 +1,8 @@
 # Incremental Compilation Workflow
 
-When working on vLLM's C++/CUDA kernels located in the `csrc/` directory, recompiling the entire project with `uv pip install -e .` for every change can be time-consuming. An incremental compilation workflow using CMake allows for faster iteration by only recompiling the necessary components after an initial setup. This guide details how to set up and use such a workflow, which complements your editable Python installation.
+When working on vLLM's C++/CUDA/HIP kernels located in the `csrc/` directory, recompiling the entire project with `uv pip install -e .` for every change can be time-consuming. An incremental compilation workflow using CMake allows for faster iteration by only recompiling the necessary components after an initial setup. This guide details how to set up and use such a workflow, which complements your editable Python installation.
+
+The workflow is the same for NVIDIA (CUDA) and AMD (ROCm) GPUs; where the two differ, this guide calls out the CUDA and ROCm variants side by side.
 
 ## Prerequisites
 
@@ -14,13 +16,104 @@ Before setting up the incremental build:
     VLLM_USE_PRECOMPILED=1 uv pip install -U -e . --torch-backend=auto
     ```
 
-2. **CUDA Toolkit:** Verify that the NVIDIA CUDA Toolkit is correctly installed and `nvcc` is accessible in your `PATH`. CMake relies on `nvcc` to compile CUDA code. You can typically find `nvcc` in `$CUDA_HOME/bin/nvcc` or by running `which nvcc`. If you encounter issues, refer to the [official CUDA Toolkit installation guides](https://developer.nvidia.com/cuda-toolkit-archive) and vLLM's main [GPU installation documentation](../getting_started/installation/gpu.md#troubleshooting) for troubleshooting. The `CMAKE_CUDA_COMPILER` variable in your `CMakeUserPresets.json` should also point to your `nvcc` binary.
+2. **GPU Toolchain:** Install and expose the toolchain matching your GPU vendor.
 
-3. **Build Tools:** It is highly recommended to install `ccache` for fast rebuilds by caching compilation results (e.g., `sudo apt install ccache` or `conda install ccache`). Also, ensure the core build dependencies like `cmake` and `ninja` are installed. These are installable through `requirements/build/cuda.txt` or your system's package manager.
+    **CUDA:** Verify that the NVIDIA CUDA Toolkit is correctly installed and `nvcc` is accessible in your `PATH`. CMake relies on `nvcc` to compile CUDA code. You can typically find `nvcc` in `$CUDA_HOME/bin/nvcc` or by running `which nvcc`. If you encounter issues, refer to the [official CUDA Toolkit installation guides](https://developer.nvidia.com/cuda-toolkit-archive) and vLLM's main [GPU installation documentation](../getting_started/installation/gpu.md#troubleshooting) for troubleshooting. The `CMAKE_CUDA_COMPILER` variable in your `CMakeUserPresets.json` should also point to your `nvcc` binary.
+
+    **ROCm:** Verify that ROCm is installed and that `amdclang` is available under `$ROCM_PATH/lib/llvm/bin`. vLLM's extensions **must** be compiled with `amdclang`/`amdclang++` rather than the system `gcc`: the PyTorch ROCm wheels are themselves built with that toolchain, and mixing C++ ABIs across the extension boundary produces crashes at import or inference time rather than a build error. The generator pins `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER` and `CMAKE_HIP_COMPILER` accordingly, so do not override them with `gcc`.
+
+    When ROCm is installed as Python wheels rather than under `/opt/rocm`, the installation prefix is reported by `rocm-sdk path --root`; the generator queries that automatically and falls back to `ROCM_PATH`, `HIP_PATH`, `ROCM_HOME` and then `/opt/rocm`.
+
+    A wheel-based ROCm install only provides a toolchain if the development package is present. Runtime wheels alone give you `libamdhip64` but no `amdclang`, no HIP CMake config packages and no device bitcode, so CMake cannot configure a HIP build at all. Install the development extra alongside the runtime wheels:
 
     ```console
-    uv pip install -r requirements/build/cuda.txt --torch-backend=auto
+    uv pip install "rocm[libraries,devel]"
     ```
+
+    Note that `rocm-sdk path --root` exits successfully and prints nothing when the development package is missing, reporting the problem only on stderr, so checking its exit status alone will not detect this. If the generator reports that it could not find a ROCm installation, check that the command prints a real directory.
+
+3. **Build Tools:** It is highly recommended to install `ccache` for fast rebuilds by caching compilation results (e.g., `sudo apt install ccache` or `conda install ccache`). It caches CUDA and HIP compilations alike, and both `setup.py` and the preset generator wire it up automatically when it is on your `PATH`. Also, ensure the core build dependencies like `cmake` and `ninja` are installed. These are installable through `requirements/build/cuda.txt` (or `requirements/build/rocm.txt` for ROCm) or your system's package manager.
+
+    ```console
+    # CUDA
+    uv pip install -r requirements/build/cuda.txt --torch-backend=auto
+
+    # ROCm
+    uv pip install -r requirements/build/rocm.txt
+    ```
+
+## Strix Halo cargo-make devloop
+
+For AMD Strix Halo (`gfx1151`) kernel development, repository also provides
+a containerized incremental loop driven by `cargo-make`. This path is scoped to
+ROCm on Strix Halo; CMake workflow below remains supported for general CUDA and
+ROCm development.
+
+### Prerequisites
+
+- Docker must access GPU (`/dev/kfd` and `/dev/dri`); invoking user must have
+  permission to use those devices.
+- Install `cargo-make` (`cargo install cargo-make`) and run from repository root.
+
+Devloop optionally mounts a caller-selected Hugging Face Hub cache read-only. Resolution priority is `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `$HF_HOME/hub`, `$XDG_CACHE_HOME/huggingface/hub`, then `$HOME/.cache/huggingface/hub`. Explicit cache variables must resolve to absolute existing directories; they identify directories selected by the caller and are not a claim that arbitrary selected paths contain no credentials. The derived `$HF_HOME` and `$XDG_CACHE_HOME` locations select only the Hub cache subdirectory, not `HF_HOME` credential files. An unavailable default under `HOME` is informational and does not block setup. Only the selected Hub cache directory mounts at `/root/.cache/huggingface/hub`. The read-only cache cannot be populated during a run, so deterministic/offline model tests require a complete cached model closure. Core non-model build, doctor, setup, and kernel-test commands work without a cache; networking is not disabled.
+
+Devloop builds its harness before each `cargo make` task. It refuses to run when Docker, GPU devices, devtools image, or either named
+volume is unavailable. It prints image and checkout provenance before
+build/test actions, and test lane probes that mounted checkout Python and
+compiled extensions are the ones being tested. This fail-closed behavior avoids
+treating stale installed package as passing test.
+
+### Commands
+
+```console
+# Build harness, then check prerequisites and in-container provenance
+cargo make doctor
+
+# Build devtools image and create persistent volumes if needed
+cargo make setup
+
+# Incrementally build HIP/C++ extensions
+cargo make build
+
+# Pass targeted pytest paths and flags through unchanged; cargo-make's separator
+# is removed before pytest runs
+cargo make test -- tests/kernels/attention/test_prefix_prefill.py -k sliding_window
+```
+
+The devloop invokes Python with `-P` and pytest with
+`--import-mode=importlib`. This prevents the mounted checkout and its temporary
+`vllm.egg-info` directory from shadowing the installed distribution metadata.
+Pytest still requires an explicit path or node ID; option values such as
+`--basetemp /tmp/run`, `-k tests/foo`, and `--junitxml report.xml` are not
+targets.
+
+`cargo make` does not forward global harness options. Invoke the compiled
+harness directly, placing `--image <name>` before the subcommand:
+
+```console
+cargo build --quiet --manifest-path homelab/devloop/Cargo.toml && \
+  homelab/devloop/target/debug/vllm-devloop --image vllm-strix-devtools test \
+  tests/kernels/attention
+```
+
+Build artifacts and compiler cache persist in deterministic checkout-scoped Docker
+volumes (names start with `vllm-strix-build-` and `vllm-strix-ccache-`); containers
+remain disposable. This prevents CMake state containing absolute paths from being
+shared across clones. The test lane runs `vllm-hip-build` first, letting Ninja
+rebuild changed sources while keeping current trees as no-ops, then runs pytest
+only after that build succeeds. Use `cargo make build -- -j 8` to pass build
+arguments. Do not run bare `cargo make test`: devloop requires explicit pytest
+target paths or node IDs, and rejects empty or option-only invocations (such as
+`cargo make test -- -k foo`) to prevent an accidental whole-suite run.
+After the incremental build succeeds, the test lane uses the container's
+hard-coded `/opt/venv/bin/python`. Before pytest starts, it verifies that the
+checkout package and `vllm._C`, `vllm._rocm_C`, and
+`vllm._C_stable_libtorch` all resolve under `/src/vllm`; any provenance failure
+exits 125, so stale installed extensions cannot produce a passing result.
+
+Compatibility wrapper `homelab/rocm-dev-test.sh` remains available for existing
+scripts, but is deprecated and prints a warning directing new commands to
+`cargo make test`.
 
 ## Setting up the CMake Build Environment
 
@@ -28,7 +121,9 @@ The incremental build process is managed through CMake. You can configure your b
 
 ### Generate `CMakeUserPresets.json` using the helper script
 
-To simplify the setup, vLLM provides a helper script that attempts to auto-detect your system's configuration (like CUDA path, Python environment, and CPU cores) and generates the `CMakeUserPresets.json` file for you.
+To simplify the setup, vLLM provides a helper script that attempts to auto-detect your system's configuration (the GPU toolchain, Python environment, and CPU cores) and generates the `CMakeUserPresets.json` file for you.
+
+The script picks the backend the same way `setup.py` does: an explicit `VLLM_TARGET_DEVICE` wins, otherwise a ROCm PyTorch build selects ROCm and anything else defaults to CUDA. Set `VLLM_TARGET_DEVICE=rocm` to force ROCm presets on a host where detection is ambiguous.
 
 **Run the script:**
 
@@ -38,7 +133,9 @@ Navigate to the root of your vLLM clone and execute the following command:
 python tools/generate_cmake_presets.py
 ```
 
-The script will prompt you if it cannot automatically determine certain paths (e.g., `nvcc` or a specific Python executable for your vLLM development environment). Follow the on-screen prompts. If an existing `CMakeUserPresets.json` is found, the script will ask for confirmation before overwriting it.
+The script will prompt you if it cannot automatically determine certain paths (e.g., `nvcc`, the ROCm root, the AMD GPU architecture, or a specific Python executable for your vLLM development environment). Follow the on-screen prompts. If an existing `CMakeUserPresets.json` is found, the script will ask for confirmation before overwriting it.
+
+On ROCm you can skip the architecture prompt by exporting `PYTORCH_ROCM_ARCH` for the GPU you are targeting (for example `gfx1151`) before running the script.
 
 **Force overwrite existing file:**
 
@@ -52,9 +149,9 @@ This is particularly useful in automated scripts or CI/CD environments where int
 
 After running the script, a `CMakeUserPresets.json` file will be created in the root of your vLLM repository.
 
-### Example `CMakeUserPresets.json`
+### Example `CMakeUserPresets.json` (CUDA)
 
-Below is an example of what the generated `CMakeUserPresets.json` might look like. The script will tailor these values based on your system and any input you provide.
+Below is an example of what the generated `CMakeUserPresets.json` might look like on a CUDA host. The script will tailor these values based on your system and any input you provide.
 
 ```json
 {
@@ -93,10 +190,69 @@ Below is an example of what the generated `CMakeUserPresets.json` might look lik
 }
 ```
 
+### Example `CMakeUserPresets.json` (ROCm)
+
+On a ROCm host the generator emits HIP compilers and the ROCm cache variables instead, plus an `environment` block so the ROCm SDK is on `PATH` for the configure and build steps:
+
+```json
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 26,
+        "patch": 1
+    },
+    "configurePresets": [
+        {
+            "name": "release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/cmake-build-release",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "/opt/rocm/lib/llvm/bin/amdclang",
+                "CMAKE_CXX_COMPILER": "/opt/rocm/lib/llvm/bin/amdclang++",
+                "CMAKE_HIP_COMPILER": "/opt/rocm/lib/llvm/bin/amdclang++",
+                "CMAKE_BUILD_TYPE": "Release",
+                "VLLM_PYTHON_EXECUTABLE": "/home/user/venvs/vllm/bin/python",
+                "VLLM_TARGET_DEVICE": "rocm",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}",
+                "CMAKE_PREFIX_PATH": "/opt/rocm/lib/cmake",
+                "CMAKE_HIP_FLAGS": "",
+                "ROCM_PATH": "/opt/rocm",
+                "HIP_PATH": "/opt/rocm",
+                "AMDGPU_TARGETS": "gfx1151",
+                "HIP_ARCHITECTURES": "gfx1151",
+                "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_HIP_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_JOB_POOLS": "compile=32"
+            },
+            "environment": {
+                "ROCM_PATH": "/opt/rocm",
+                "HIP_PATH": "/opt/rocm",
+                "ROCM_HOME": "/opt/rocm",
+                "PATH": "/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$penv{PATH}",
+                "HIP_DEVICE_LIB_PATH": "/opt/rocm/lib/llvm/amdgcn/bitcode"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release",
+            "configurePreset": "release",
+            "jobs": 32
+        }
+    ]
+}
+```
+
 **What do the various configurations mean?**
 
-- `CMAKE_CUDA_COMPILER`: Path to your `nvcc` binary. The script attempts to find this automatically.
-- `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, `CMAKE_CUDA_COMPILER_LAUNCHER`: Setting these to `ccache` (or `sccache`) significantly speeds up rebuilds by caching compilation results. Ensure `ccache` is installed (e.g., `sudo apt install ccache` or `conda install ccache`). The script sets these by default.
+- `CMAKE_CUDA_COMPILER` (CUDA): Path to your `nvcc` binary. The script attempts to find this automatically.
+- `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER`, `CMAKE_HIP_COMPILER` (ROCm): Paths to `amdclang`/`amdclang++` inside the ROCm installation. These are pinned deliberately -- see the ROCm note under [Prerequisites](#prerequisites).
+- `ROCM_PATH`, `HIP_PATH`, `CMAKE_PREFIX_PATH` (ROCm): Locate the ROCm installation and its CMake config packages. They are also exported in the preset `environment` (along with `ROCM_HOME`, `PATH` and `HIP_DEVICE_LIB_PATH`) so the toolchain resolves the same way it does for a full `pip install`.
+- `AMDGPU_TARGETS`, `HIP_ARCHITECTURES` (ROCm): The gfx targets to compile kernels for, defaulting to `PYTORCH_ROCM_ARCH` or the detected GPU.
+- `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, `CMAKE_CUDA_COMPILER_LAUNCHER`, `CMAKE_HIP_COMPILER_LAUNCHER`: Setting these to `ccache` (or `sccache`) significantly speeds up rebuilds by caching compilation results, on both CUDA and ROCm. Ensure `ccache` is installed (e.g., `sudo apt install ccache` or `conda install ccache`). The script sets these by default, matching what `setup.py` does for a full build.
 - `VLLM_PYTHON_EXECUTABLE`: Path to the Python executable in your vLLM development environment. The script will prompt for this, defaulting to the current Python environment if suitable.
 - `CMAKE_INSTALL_PREFIX: "${sourceDir}"`: Specifies that the compiled components should be installed back into your vLLM source directory. This is crucial for the editable install, as it makes the newly built kernels immediately available to your Python environment.
 - `CMAKE_JOB_POOLS` and `jobs` in build presets: Control the parallelism of the build. The script sets these based on the number of CPU cores detected on your system.

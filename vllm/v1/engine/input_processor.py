@@ -35,6 +35,31 @@ from vllm.v1.engine import EngineCoreRequest
 logger = init_logger(__name__)
 
 
+def resolve_max_tokens(sampling_params: SamplingParams, prompt_aware_cap: int) -> None:
+    """Resolve ``max_tokens`` against what the prompt leaves under the model len.
+
+    Args:
+        sampling_params: Params to update in place.
+        prompt_aware_cap: ``max_model_len`` minus the prompt length, i.e. the
+            largest number of output tokens this request can actually produce.
+
+    An unset ``max_tokens`` is filled in from the cap. A request carrying
+    ``reasoning_answer_reserve`` is additionally clamped to the cap, because the
+    reserve boundary is expressed relative to ``max_tokens`` while the request
+    is length-capped at ``max_model_len``; an oversized ``max_tokens`` would put
+    the boundary at an output position the request never reaches and silently
+    disable the reserve. The reserve is then re-validated against the resolved
+    value.
+    """
+    if sampling_params.max_tokens is None:
+        sampling_params.max_tokens = prompt_aware_cap
+    elif sampling_params.reasoning_answer_reserve is not None and prompt_aware_cap > 0:
+        sampling_params.max_tokens = min(sampling_params.max_tokens, prompt_aware_cap)
+    if sampling_params.reasoning_answer_reserve is not None:
+        # max_tokens may have changed since the reserve was validated.
+        sampling_params._verify_args()
+
+
 class InputProcessor:
     def __init__(
         self,
@@ -121,13 +146,17 @@ class InputProcessor:
                     )
             if params.thinking_token_budget is not None and (
                 self.vllm_config.reasoning_config is None
-                or not self.vllm_config.reasoning_config.enabled
+                or not self.vllm_config.reasoning_config._enabled
             ):
-                raise VLLMValidationError(
-                    "thinking_token_budget is set but reasoning_config is "
-                    "not configured. Please set --reasoning-parser "
-                    "and/or --reasoning-config to use thinking_token_budget."
-                )
+                if (
+                    self.vllm_config.reasoning_config is None
+                    or not self.vllm_config.reasoning_config.enabled
+                ):
+                    raise VLLMValidationError(
+                        "reasoning controls are set but reasoning_config is "
+                        "not configured. Please set --reasoning-parser "
+                        "and/or --reasoning-config to use thinking_token_budget."
+                    )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS
@@ -328,11 +357,16 @@ class InputProcessor:
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
             # If unset max tokens, then generate up to the max_model_len.
-            if sampling_params.max_tokens is None:
+            if (
+                sampling_params.max_tokens is None
+                or sampling_params.reasoning_answer_reserve is not None
+            ):
                 seq_len = length_from_prompt_token_ids_or_embeds(
                     prompt_token_ids, prompt_embeds
                 )
-                sampling_params.max_tokens = self.model_config.max_model_len - seq_len
+                resolve_max_tokens(
+                    sampling_params, self.model_config.max_model_len - seq_len
+                )
 
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,

@@ -34,7 +34,11 @@ _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
 
 @contextmanager
 def use_workspace_lane(lane: int) -> Iterator[None]:
-    """Select an independent workspace owner for this execution context."""
+    """Select the workspace owner for this execution context.
+
+    Target execution uses lane 0; speculative execution uses lane 1 so a
+    captured graph cannot retain views into the target graph's buffer.
+    """
     if lane < 0:
         raise ValueError(f"Workspace lane must be non-negative, got {lane}.")
     token = _workspace_lane.set(lane)
@@ -47,8 +51,9 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
 class WorkspaceManager:
     """Manager for workspace allocation.
 
-    Manages one workspace buffer per active ``(ubatch, lane)`` slot.
-    Can be locked to prevent further growth during execution.
+    Owns one reusable buffer per ``(ubatch, lane)``. Separate lanes prevent
+    target and draft graphs from retaining views into the same allocation.
+    The manager can be locked to prevent growth during execution.
     """
 
     def __init__(

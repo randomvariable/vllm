@@ -199,7 +199,7 @@ def reserve_mm_ipc_gpu_memory(
     raw_frame_reserved_bytes = int(mm_config.mm_ipc_gpu_memory_gb * GiB_bytes)
     # Each API server process runs its own decoder surfaces and NVDEC/CUVID CUDA
     # context on the GPU, outside the worker memory pool. Reserve that footprint
-    # per process so gpu_memory_utilization bounds total GPU usage across them.
+    # per process so the GPU memory budget bounds total usage across them.
     num_api_servers = max(1, api_process_count)
     video_kwargs = mm_config.media_io_kwargs.get("video", {})
     video_loader_backend = (
@@ -239,8 +239,9 @@ def reserve_mm_ipc_gpu_memory(
             f"{format_gib(decoder_reserved_bytes)} GiB decoder cache budget), "
             f"but only {format_gib(available_kv_cache_memory_bytes)} GiB is "
             "available for the KV cache. Reduce mm_ipc_gpu_memory_gb or "
-            "hw_decoders, use a different video backend, or increase "
-            "gpu_memory_utilization."
+            "hw_decoders, use a different video backend, or increase the "
+            "GPU memory budget via --gpu-memory-utilization or "
+            "--gpu-memory-utilization-gb."
         )
     logger.info_once(
         "Reserving %s GiB of GPU memory for frontend multimodal decoding "

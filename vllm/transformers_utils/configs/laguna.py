@@ -69,14 +69,61 @@ class LagunaConfig(PretrainedConfig):
 
         # Accept either v4-style (rope_theta + rope_scaling) or v5-style
         # (rope_parameters). Translate v5 → v4 so downstream code has one path.
-        if rope_parameters is not None:
-            rp = dict(rope_parameters)
-            rope_theta = float(rp.pop("rope_theta", rope_theta))
-            rt = rp.pop("rope_type", None)
-            if rt is not None and rt != "default":
-                rope_scaling = {"rope_type": rt, **rp}
-            elif rp and rope_scaling is None:
-                rope_scaling = {"rope_type": "default", **rp}
+        #
+        # ``rope_parameters`` comes in two shapes:
+        #   * FLAT (legacy v5): a single rope dict, e.g.
+        #     ``{"rope_type": "yarn", "rope_theta": 5e5, "factor": 4.0}``.
+        #     Translate this into ``rope_scaling`` as before.
+        #   * NESTED (v5 Laguna-XS / --hf-overrides): a per-layer-type mapping,
+        #     e.g. ``{"full_attention": {...}, "sliding_attention": {...}}``.
+        #     The model code (``vllm/model_executor/models/laguna.py``) reads
+        #     ``config.rope_parameters`` directly and unpacks the layer's
+        #     sub-dict, so we must PRESERVE the nested dict untouched and must
+        #     NOT flatten it into a bogus ``rope_scaling`` (Transformers rejects
+        #     unrecognized keys like ``full_attention`` under a "default" type).
+        #
+        # ``self.rope_parameters`` is assigned in every branch so the model's
+        # ``getattr(config, "rope_parameters", None)`` is always meaningful.
+        nested_rope = rope_parameters is not None and any(
+            isinstance(v, dict) for v in rope_parameters.values()
+        )
+        if nested_rope:
+            # NESTED per-layer-type form (e.g. from --hf-overrides:
+            # ``{"full_attention": {...}, "sliding_attention": {...}}``).
+            # Preserve it untouched: the model code
+            # (``vllm/model_executor/models/laguna.py``) reads
+            # ``config.rope_parameters`` and unpacks the layer's sub-dict, and
+            # Transformers' own ``standardize_rope_params`` keeps the nested
+            # form intact when its keys are a subset of ``layer_types``.
+            #
+            # Do NOT flatten it into ``rope_scaling`` — that produced
+            # ``{"rope_type": "default", "full_attention": {...}, ...}`` whose
+            # extra keys Transformers rejects
+            # ("Unrecognized keys ... for 'rope_type'='default'").
+            #
+            # NOTE: on transformers>=5 ``rope_scaling`` is a property alias for
+            # ``rope_parameters``, so the ``self.rope_scaling = rope_scaling``
+            # assignment below must also carry the nested dict (not None) or it
+            # would clobber ``rope_parameters``. Route the nested dict through
+            # the local ``rope_scaling`` variable so that single canonical
+            # write preserves it on both old (distinct attrs) and new (aliased)
+            # transformers.
+            self.rope_parameters = rope_parameters
+            rope_scaling = rope_parameters
+        else:
+            # FLAT legacy v5 form (or absent): translate into ``rope_scaling``
+            # exactly as before. Leave ``rope_parameters`` as ``None`` so the
+            # model's ``getattr(config, "rope_parameters", None)`` falls through
+            # to the ``rope_scaling`` path (unchanged legacy behavior).
+            if rope_parameters is not None:
+                rp = dict(rope_parameters)
+                rope_theta = float(rp.pop("rope_theta", rope_theta))
+                rt = rp.pop("rope_type", None)
+                if rt is not None and rt != "default":
+                    rope_scaling = {"rope_type": rt, **rp}
+                elif rp and rope_scaling is None:
+                    rope_scaling = {"rope_type": "default", **rp}
+            self.rope_parameters = None
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size

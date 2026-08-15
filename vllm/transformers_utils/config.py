@@ -684,6 +684,51 @@ def maybe_override_with_speculators(
     return model, tokenizer, speculative_config
 
 
+def _apply_flat_hf_overrides(
+    config: PretrainedConfig,
+    hf_overrides_kw: dict[str, Any],
+) -> None:
+    """Apply flat ``hf_overrides`` keys to the config that actually owns them.
+
+    Multimodal configs wrap the language model in a sub-config (e.g.
+    ``text_config``), and the model reads its hyperparameters from there. A flat
+    key set only on the wrapper is therefore silently ignored by the model, so
+    keys are routed by where they resolve rather than by their value type:
+
+    1. Keys already present on the top-level config are applied there. Top level
+       wins so that attributes living on both the wrapper and the text config
+       (``torch_dtype``, ``architectures``) and all single-level configs keep
+       their existing behaviour.
+    2. Otherwise, keys present on ``get_text_config()`` are applied to that
+       sub-config, which is what the language model actually reads.
+    3. Keys resolving nowhere are still applied at the top level, preserving the
+       previous permissive behaviour for integrations that inject their own
+       keys, but are named in a warning so typos stop failing silently.
+
+    Args:
+        config: The HF config to update in place.
+        hf_overrides_kw: Flat (non-dict-valued) overrides to apply.
+    """
+    text_config = config.get_text_config()
+    unresolved_keys: list[str] = []
+
+    for key, value in hf_overrides_kw.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+        elif text_config is not config and hasattr(text_config, key):
+            setattr(text_config, key, value)
+        else:
+            unresolved_keys.append(key)
+            setattr(config, key, value)
+
+    if unresolved_keys:
+        logger.warning(
+            "The following hf_overrides keys were not found on the model config "
+            "or its text config and may have no effect: %s",
+            ", ".join(unresolved_keys),
+        )
+
+
 def get_config(
     model: str | Path,
     trust_remote_code: bool,
@@ -796,7 +841,7 @@ def get_config(
 
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)
-        config.update(hf_overrides_kw)
+        _apply_flat_hf_overrides(config, hf_overrides_kw)
     if hf_overrides_fn:
         logger.debug("Overriding HF config with %s", hf_overrides_fn)
         config = hf_overrides_fn(config)

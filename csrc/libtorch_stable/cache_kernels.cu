@@ -7,6 +7,12 @@
 #include "quantization/vectorization_utils.cuh"
 #include "concat_mla_q.cuh"
 
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+  #define NVFP4_ENABLE_ELTS16 1
+  #include "quantization/fp4/nvfp4_utils.cuh"
+  #include "nvfp4_kv_cache.h"
+#endif
+
 #ifdef USE_ROCM
   #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
 #else
@@ -183,6 +189,57 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     }
   }
 }
+
+namespace vllm {
+
+// Grid: (num_layers, num_pairs)
+template <typename scalar_t>
+__global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
+                                   int64_t* value_cache_ptrs,
+                                   const int64_t* __restrict__ block_mapping,
+                                   const int numel_per_block) {
+  const int layer_idx = blockIdx.x;
+  const int pair_idx = blockIdx.y;
+
+  scalar_t* key_cache = reinterpret_cast<scalar_t*>(key_cache_ptrs[layer_idx]);
+  scalar_t* value_cache =
+      reinterpret_cast<scalar_t*>(value_cache_ptrs[layer_idx]);
+  int64_t src_block_number = block_mapping[2 * pair_idx];
+  int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
+
+  const int64_t src_block_offset = src_block_number * numel_per_block;
+  const int64_t dst_block_offset = dst_block_number * numel_per_block;
+  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+    int64_t src_offset = src_block_offset + i;
+    int64_t dst_offset = dst_block_offset + i;
+    key_cache[dst_offset] = key_cache[src_offset];
+  }
+  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+    int64_t src_offset = src_block_offset + i;
+    int64_t dst_offset = dst_block_offset + i;
+    value_cache[dst_offset] = value_cache[src_offset];
+  }
+}
+
+// Kernel for MLA, which works on a single joint kv_cache
+// Grid: (num_layers, num_pairs)
+template <typename scalar_t>
+__global__ void copy_blocks_mla_kernel(
+    int64_t* cache_ptrs, const int64_t* __restrict__ block_mapping,
+    const int mem_footprint_per_block) {
+  const int layer_idx = blockIdx.x;
+  const int pair_idx = blockIdx.y;
+  scalar_t* cache = reinterpret_cast<scalar_t*>(cache_ptrs[layer_idx]);
+  int64_t src_block = block_mapping[2 * pair_idx];
+  int64_t dst_block = block_mapping[2 * pair_idx + 1];
+  int64_t src_offset = src_block * mem_footprint_per_block;
+  int64_t dst_offset = dst_block * mem_footprint_per_block;
+  for (int i = threadIdx.x; i < mem_footprint_per_block; i += blockDim.x) {
+    cache[dst_offset + i] = cache[src_offset + i];
+  }
+}
+
+}  // namespace vllm
 
 namespace vllm {
 
@@ -392,55 +449,6 @@ __global__ void concat_and_cache_mla_kernel(
   copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
 }
 
-// Grouped variant of concat_and_cache_mla: inserts the context K/V for every
-// draft layer in a single launch. Grid is (num_tokens, num_layers); each layer
-// reads its own cache base pointer from kv_cache_ptrs (same pointer-array
-// pattern as copy_blocks_kernel). bf16 only, so it is a raw 16-bit copy with no
-// scaling or quantization; scalar_t is uint16_t for portability.
-template <typename scalar_t>
-__global__ void concat_and_cache_mla_grouped_kernel(
-    const scalar_t* __restrict__ kv_c,  // [num_layers, num_tokens,
-                                        // kv_lora_rank]
-    const scalar_t* __restrict__ k_pe,  // [num_layers, num_tokens, pe_dim]
-    const int64_t* __restrict__ kv_cache_ptrs,  // [num_layers]
-    const int64_t* __restrict__ slot_mapping,   // [num_layers, num_tokens]
-    const int64_t kv_c_layer_stride, const int64_t kv_c_token_stride,
-    const int64_t k_pe_layer_stride, const int64_t k_pe_token_stride,
-    const int64_t slot_layer_stride, const int64_t block_stride,
-    const int64_t entry_stride, const int kv_lora_rank, const int pe_dim,
-    const int block_size) {
-  const int64_t token_idx = blockIdx.x;
-  const int64_t layer_idx = blockIdx.y;
-  const int64_t slot_idx =
-      slot_mapping[layer_idx * slot_layer_stride + token_idx];
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
-    return;
-  }
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
-
-  scalar_t* __restrict__ kv_cache =
-      reinterpret_cast<scalar_t*>(kv_cache_ptrs[layer_idx]);
-  const scalar_t* __restrict__ kv_c_layer =
-      kv_c + layer_idx * kv_c_layer_stride;
-  const scalar_t* __restrict__ k_pe_layer =
-      k_pe + layer_idx * k_pe_layer_stride;
-
-  auto copy = [&](const scalar_t* __restrict__ src, int64_t src_token_stride,
-                  int size, int offset) {
-    for (int i = threadIdx.x; i < size; i += blockDim.x) {
-      const int64_t src_idx = token_idx * src_token_stride + i;
-      const int64_t dst_idx =
-          block_idx * block_stride + block_offset * entry_stride + i + offset;
-      kv_cache[dst_idx] = src[src_idx];
-    }
-  };
-
-  copy(kv_c_layer, kv_c_token_stride, kv_lora_rank, 0);
-  copy(k_pe_layer, k_pe_token_stride, pe_dim, kv_lora_rank);
-}
-
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_ds_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
@@ -543,6 +551,97 @@ __global__ void concat_and_cache_ds_mla_kernel(
   *reinterpret_cast<uint64_t*>(&kv_cache[dst_idx_base]) =
       *reinterpret_cast<const uint64_t*>(result);
 }
+
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+template <typename scalar_t>
+__global__ void concat_and_cache_nvfp4_mla_kernel(
+    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
+    uint8_t* __restrict__ kv_cache,     // [num_blocks, block_size, 432]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int block_stride,                    //
+    const int entry_stride,                    //
+    const int kv_c_stride,                     //
+    const int k_pe_stride,                     //
+    const int kv_lora_rank,                    //
+    const int pe_dim,                          //
+    const int block_size                       //
+) {
+  using CudaType = typename CUDATypeConverter<scalar_t>::Type;
+  using PVec = PackedVec<CudaType, CVT_FP4_PACK16>;
+
+  static constexpr int kNopeBytes = 256;
+  static constexpr int kScaleBytes = 32;
+  static constexpr int kPadBytes = 16;
+  static constexpr int kRopeOffset = kNopeBytes + kScaleBytes + kPadBytes;
+  static constexpr int kFp4GroupSize = CVT_FP4_SF_VEC_SIZE;
+  static constexpr int kEltsPerThread = CVT_FP4_ELTS_PER_THREAD;
+  static constexpr int kThreadsPerScale = kFp4GroupSize / kEltsPerThread;
+
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  uint8_t* __restrict__ token_dst =
+      kv_cache + block_idx * block_stride + block_offset * entry_stride;
+
+  const CudaType* __restrict__ token_src =
+      reinterpret_cast<const CudaType*>(kv_c) + token_idx * kv_c_stride;
+
+  const int group_count = kv_lora_rank / kFp4GroupSize;
+  const int thread_group_count = blockDim.x / kThreadsPerScale;
+  const int thread_group = threadIdx.x / kThreadsPerScale;
+  const int thread_group_lane = threadIdx.x % kThreadsPerScale;
+
+  for (int group = thread_group; group < group_count;
+       group += thread_group_count) {
+    PVec in_vec;
+    const CudaType* __restrict__ src =
+        token_src + group * kFp4GroupSize + thread_group_lane * kEltsPerThread;
+
+#pragma unroll
+    for (int i = 0; i < kEltsPerThread / 2; ++i) {
+      in_vec.elts[i] =
+          reinterpret_cast<const typename PackedTypeConverter<CudaType>::Type*>(
+              src)[i];
+    }
+
+    uint8_t scale_byte;
+    uint8_t* scale_out = (thread_group_lane == 0) ? &scale_byte : nullptr;
+    fp4_packed_t packed =
+        cvt_warp_fp16_to_fp4<CudaType, kThreadsPerScale>(in_vec, 1.0f,
+                                                         scale_out);
+
+#if CVT_FP4_PACK16
+    uint8_t* data_dst = token_dst + group * 8;
+    reinterpret_cast<uint64_t*>(data_dst)[0] =
+        (uint64_t(packed.hi) << 32) | uint64_t(packed.lo);
+#else
+    uint8_t* data_dst = token_dst + group * 8 + thread_group_lane * 4;
+    reinterpret_cast<uint32_t*>(data_dst)[0] = packed;
+#endif
+
+    if (scale_out != nullptr) {
+      token_dst[kNopeBytes + group] = scale_byte;
+    }
+  }
+
+  for (int i = threadIdx.x; i < kPadBytes; i += blockDim.x) {
+    token_dst[kNopeBytes + kScaleBytes + i] = 0;
+  }
+
+  scalar_t* __restrict__ rope_dst =
+      reinterpret_cast<scalar_t*>(token_dst + kRopeOffset);
+  const scalar_t* __restrict__ rope_src = k_pe + token_idx * k_pe_stride;
+  for (int i = threadIdx.x; i < pe_dim; i += blockDim.x) {
+    rope_dst[i] = rope_src[i];
+  }
+}
+#endif
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void indexer_k_quant_and_cache_kernel(
@@ -772,12 +871,8 @@ void reshape_and_cache_flash(
 
   if (kv_cache_dtype == "nvfp4" || kv_cache_dtype == "nvfp4_4over6") {
 #if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
-    // NVFP4 dispatch is compiled separately for SM100+.
-    extern void reshape_and_cache_nvfp4_dispatch(
-        torch::stable::Tensor & key, torch::stable::Tensor & value,
-        torch::stable::Tensor & key_cache, torch::stable::Tensor & value_cache,
-        torch::stable::Tensor & slot_mapping, torch::stable::Tensor & k_scale,
-        torch::stable::Tensor & v_scale, const std::string& kv_cache_dtype);
+    // NVFP4 dispatch is compiled separately for SM100+; it reads
+    // kv_cache_dtype to pick the store-time scale search.
     reshape_and_cache_nvfp4_dispatch(key, value, key_cache, value_cache,
                                      slot_mapping, k_scale, v_scale,
                                      kv_cache_dtype);
@@ -838,6 +933,11 @@ void reshape_and_cache_flash(
           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
           reinterpret_cast<const float*>(scale.data_ptr()));
 
+void concat_and_cache_nvfp4_mla(
+    torch::stable::Tensor& kv_c, torch::stable::Tensor& k_pe,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& scale);
+
 void concat_and_cache_mla(
     torch::stable::Tensor& kv_c,      // [num_tokens, kv_lora_rank]
     torch::stable::Tensor& k_pe,      // [num_tokens, pe_dim]
@@ -845,6 +945,11 @@ void concat_and_cache_mla(
                                       // + pe_dim)]
     torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     const std::string& kv_cache_dtype, torch::stable::Tensor& scale) {
+  if (kv_cache_dtype == "nvfp4_ds_mla") {
+    concat_and_cache_nvfp4_mla(kv_c, k_pe, kv_cache, slot_mapping, scale);
+    return;
+  }
+
   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
@@ -881,6 +986,13 @@ void concat_and_cache_mla(
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       kv_c.get_device_index());
+  const cudaDeviceProp* device_prop = get_device_prop();
+  STD_TORCH_CHECK(
+      device_prop->major >= 10,
+      "nvfp4_ds_mla KV cache requires SM100+ (Blackwell); active device has "
+      "compute capability " +
+          std::to_string(device_prop->major) + "." +
+          std::to_string(device_prop->minor));
   const cudaStream_t stream = get_current_cuda_stream();
 
   if (kv_cache_dtype == "fp8_ds_mla") {
@@ -901,51 +1013,60 @@ void concat_and_cache_mla(
   }
 }
 
-void concat_and_cache_mla_grouped(
-    torch::stable::Tensor& kv_c,  // [num_layers, num_tokens, kv_lora_rank]
-    torch::stable::Tensor& k_pe,  // [num_layers, num_tokens, pe_dim]
-    torch::stable::Tensor& kv_cache_ptrs,  // [num_layers] int64, on device
-    torch::stable::Tensor& slot_mapping,   // [num_layers, num_tokens] int64
-    int64_t block_size, int64_t block_stride, int64_t entry_stride) {
-  int num_layers = kv_c.size(0);
-  int num_tokens = kv_c.size(1);
-  int kv_lora_rank = kv_c.size(2);
-  int pe_dim = k_pe.size(2);
+void concat_and_cache_nvfp4_mla(
+    torch::stable::Tensor& kv_c,      // [num_tokens, kv_lora_rank]
+    torch::stable::Tensor& k_pe,      // [num_tokens, pe_dim]
+    torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, 432]
+    torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    torch::stable::Tensor& scale) {
+  (void)scale;
+  int num_tokens = slot_mapping.size(0);
+  int kv_lora_rank = kv_c.size(1);
+  int pe_dim = k_pe.size(1);
 
-  STD_TORCH_CHECK(
-      kv_c.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
-          k_pe.scalar_type() == torch::headeronly::ScalarType::BFloat16,
-      "concat_and_cache_mla_grouped only supports a bf16 KV cache; got kv_c=",
-      kv_c.scalar_type(), ", k_pe=", k_pe.scalar_type());
-  STD_TORCH_CHECK(
-      kv_cache_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
-      "kv_cache_ptrs must be int64");
+  STD_TORCH_CHECK(kv_lora_rank == 512,
+                  "kv_lora_rank must be 512 for nvfp4_ds_mla");
+  STD_TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for nvfp4_ds_mla");
+  STD_TORCH_CHECK(kv_cache.element_size() == 1,
+                  "kv_cache must be uint8 for nvfp4_ds_mla");
+  STD_TORCH_CHECK(kv_cache.size(2) == 432,
+                  "kv_cache.size(2) must be 432 bytes for nvfp4_ds_mla");
+  STD_TORCH_CHECK(kv_c.element_size() == 2,
+                  "kv_c.element_size() must be 2 for nvfp4_ds_mla");
+  STD_TORCH_CHECK(k_pe.element_size() == 2,
+                  "k_pe.element_size() must be 2 for nvfp4_ds_mla");
 
-  if (num_tokens == 0 || num_layers == 0) {
-    return;
-  }
-
-  const int64_t kv_c_layer_stride = kv_c.stride(0);
-  const int64_t kv_c_token_stride = kv_c.stride(1);
-  const int64_t k_pe_layer_stride = k_pe.stride(0);
-  const int64_t k_pe_token_stride = k_pe.stride(1);
-  const int64_t slot_layer_stride = slot_mapping.stride(0);
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+  int block_size = kv_cache.size(1);
+  int kv_c_stride = kv_c.stride(0);
+  int k_pe_stride = k_pe.stride(0);
+  int block_stride = kv_cache.stride(0);
+  int entry_stride = kv_cache.stride(1);
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       kv_c.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
-  dim3 grid(num_tokens, num_layers);
-  dim3 block(std::min(kv_lora_rank, 512));
-  vllm::concat_and_cache_mla_grouped_kernel<uint16_t>
-      <<<grid, block, 0, stream>>>(
-          reinterpret_cast<const uint16_t*>(kv_c.data_ptr()),
-          reinterpret_cast<const uint16_t*>(k_pe.data_ptr()),
-          kv_cache_ptrs.const_data_ptr<int64_t>(),
-          slot_mapping.const_data_ptr<int64_t>(), kv_c_layer_stride,
-          kv_c_token_stride, k_pe_layer_stride, k_pe_token_stride,
-          slot_layer_stride, block_stride, entry_stride, kv_lora_rank, pe_dim,
-          block_size);
+  dim3 grid(num_tokens);
+  dim3 block(128);
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      kv_c.scalar_type(), "concat_and_cache_nvfp4_mla", [&] {
+        vllm::concat_and_cache_nvfp4_mla_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(
+                reinterpret_cast<scalar_t*>(kv_c.data_ptr()),
+                reinterpret_cast<scalar_t*>(k_pe.data_ptr()),
+                reinterpret_cast<uint8_t*>(kv_cache.data_ptr()),
+                slot_mapping.const_data_ptr<int64_t>(), block_stride,
+                entry_stride, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim,
+                block_size);
+      });
+#else
+  (void)num_tokens;
+  STD_TORCH_CHECK(
+      false,
+      "nvfp4_ds_mla KV cache requires SM100+ (Blackwell). "
+      "Please rebuild vllm with a Blackwell-compatible CUDA target.");
+#endif
 }
 
 namespace vllm {

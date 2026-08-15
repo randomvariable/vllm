@@ -26,6 +26,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        group_cp_sizes: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -36,6 +37,14 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
+        # Per-group CP size: dcp_replicated groups keep their cache full on
+        # every rank (effective cp 1) while the rest shard by cp_size.
+        if group_cp_sizes is None:
+            group_cp_sizes = [cp_size] * len(block_sizes)
+        assert len(group_cp_sizes) == len(block_sizes)
+        self.group_cp_sizes = torch.tensor(
+            group_cp_sizes, dtype=torch.int32, device=device
+        )
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
@@ -120,12 +129,10 @@ class BlockTables:
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
     def apply_staged_writes(self) -> None:
-        if self.num_kv_cache_groups == 0:
-            return
         if self.num_kv_cache_groups == 1:
             # Single group: write directly, skipping the per-write group lookup.
             self.block_tables[0].apply_write()
-        elif self.num_kv_cache_groups > 1:
+        else:
             # Multiple groups: apply all block tables with one fused kernel.
             assert self.fused_writer is not None
             self.fused_writer.apply(
@@ -137,43 +144,27 @@ class BlockTables:
         self,
         idx_mapping: torch.Tensor,
         num_reqs_padded: int,
-        out: tuple[torch.Tensor, ...] | None = None,
-        out_ptrs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        if self.num_kv_cache_groups == 0:
-            return ()
-        if out is None:
-            out = tuple(self.input_block_tables)
-            out_ptrs = self.input_block_table_ptrs
-        else:
-            assert out_ptrs is not None
-            assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
             self.block_table_ptrs,
-            out_ptrs,
+            self.input_block_table_ptrs,
             self.block_table_strides,
             self.num_blocks.gpu,
             self.num_blocks.gpu.stride(0),
             num_reqs,
             BLOCK_SIZE=1024,  # type: ignore
         )
-        return tuple(bt[:num_reqs_padded] for bt in out)
+        return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
-        #
-        # Zero the rows so dummy runs write mamba state to the reserved null
-        # block rather than through the previous real step's (stale) block
-        # ids, which may point at blocks since freed and reallocated.
-        return tuple(
-            block_table[:num_reqs].zero_() for block_table in self.input_block_tables
-        )
+        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
 
     def compute_slot_mappings(
         self,
@@ -181,30 +172,35 @@ class BlockTables:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         num_tokens_padded: int,
-        out: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.num_kv_cache_groups == 0:
-            return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
-        slot_mappings = self.slot_mappings if out is None else out
+        apply_padding_mask = is_padding is not None
+        if is_padding is None:
+            is_padding = self.slot_mappings
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
-            slot_mappings.shape[1],
+            self.max_num_batched_tokens,
             idx_mapping,
             query_start_loc,
             positions,
+            is_padding,
             self.block_table_ptrs,
             self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
             self.block_sizes_tensor,
-            slot_mappings,
-            slot_mappings.stride(0),
+            self.group_cp_sizes,
+            self.slot_mappings,
+            self.slot_mappings.stride(0),
             self.cp_rank,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
+            APPLY_PADDING_MASK=apply_padding_mask,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
-        return slot_mappings[:, :num_tokens_padded]
+        return self.slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.
@@ -257,6 +253,13 @@ def _gather_block_tables_kernel(
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 
+    # Active rows can shrink when sliding-window / replicated draft groups
+    # recycle old blocks or replay a cached prefix tail. Clear the unused tail
+    # so consumers never read stale block IDs past num_blocks.
+    for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
+
 
 @triton.jit
 def _compute_slot_mappings_kernel(
@@ -264,15 +267,20 @@ def _compute_slot_mappings_kernel(
     idx_mapping,  # [num_reqs]
     query_start_loc,  # [num_reqs + 1]
     pos,  # [num_tokens]
+    is_padding,  # [num_tokens]
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
+    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
+    num_blocks_stride,
     block_sizes,  # [num_kv_cache_groups]
+    group_cp_sizes,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
+    APPLY_PADDING_MASK: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -293,31 +301,49 @@ def _compute_slot_mappings_kernel(
 
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
+    group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     block_size = tl.load(block_sizes + group_id)
+    group_cp_size = tl.load(group_cp_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
+    num_blocks = tl.load(group_num_blocks_ptr + req_state_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-        positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        token_mask = offset < end_idx
+        positions = tl.load(pos + offset, mask=token_mask, other=0)
 
-        block_indices = positions // (block_size * CP_SIZE)
-        block_offsets = positions % (block_size * CP_SIZE)
+        block_indices = positions // (block_size * group_cp_size)
+        block_offsets = positions % (block_size * group_cp_size)
+        valid_block = token_mask & (block_indices < num_blocks)
         block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            mask=valid_block,
+            other=0,
         )
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
             slot_ids = block_numbers * block_size + block_offsets
         else:
-            # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = block_offsets % CP_INTERLEAVE
-            local_offsets = rounds * CP_INTERLEAVE + remainder
-            slot_ids = block_numbers * block_size + local_offsets
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+            # Context parallelism is used. dcp_replicated groups carry
+            # group_cp_size == 1 and store every token locally.
+            if group_cp_size == 1:
+                slot_ids = block_numbers * block_size + block_offsets
+            else:
+                group_cp_rank = cp_rank % group_cp_size
+                is_local = (
+                    block_offsets // CP_INTERLEAVE % group_cp_size == group_cp_rank
+                )
+                rounds = block_offsets // (CP_INTERLEAVE * group_cp_size)
+                remainder = block_offsets % CP_INTERLEAVE
+                local_offsets = rounds * CP_INTERLEAVE + remainder
+                slot_ids = block_numbers * block_size + local_offsets
+                slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        if APPLY_PADDING_MASK:
+            padding = tl.load(is_padding + offset, mask=offset < end_idx, other=True)
+            slot_ids = tl.where(padding, PAD_ID, slot_ids)
 
+        slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)

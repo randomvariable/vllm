@@ -277,7 +277,18 @@ exposes the same data through `LLM.get_metrics()` when logging is on.
 Looking at lifetime and idle time on one chart makes it easy to spot
 stranded cache or workloads that pin prompts for a long decode.
 
-### Metrics Publishing - Logging
+#### Speculative Decoding Telemetry
+
+`--spec-decode-telemetry` is an observability flag that does not publish
+Prometheus metrics. It records per-batch-size acceptance and forward cost
+estimates inside the scheduler for a future dynamic speculative decoding depth
+governor to read. Unlike the metrics above, it is deliberately independent of
+`--disable-log-stats`, because it feeds control rather than reporting. See
+[Dynamic Speculative Decoding](../features/speculative_decoding/dynamic_speculative_decoding.md#telemetry)
+for what it measures and what it costs. For the Prometheus-facing speculative
+decoding counters, see `SpecDecodingStats`, which is separate and unaffected.
+
+## Metrics Publishing - Logging
 
 The `LoggingStatLogger` metrics publisher outputs a log `INFO` message
 every 5 seconds with some key metrics:

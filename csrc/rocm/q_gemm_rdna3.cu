@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -44,7 +45,7 @@
 
 #include "qdq_4_rdna3.cuh"
 
-#if defined(__HIPCC__) && defined(__gfx1100__)
+#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1151__))
   #define __HIP__RDNA3__
 #endif
 
@@ -707,22 +708,27 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
 // Output:
 //   c         [M, N]            same dtype as a
 
+#ifdef VLLM_ROCM_RDNA3_WMMA
 torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
                                    torch::Tensor b_qzeros,
                                    torch::Tensor b_scales,
                                    torch::Tensor b_g_idx, bool use_v2_format);
 
+namespace {
+// The WMMA prefill TU is compiled for gfx1100 only. On a multi-arch build the
+// scalar TU may also run on gfx1151, where this symbol is unavailable, so guard
+// the forward at runtime by the executing device's arch.
+bool current_device_supports_rdna3_wmma() {
+  const auto* dprops = at::cuda::getCurrentDeviceProperties();
+  const std::string device_arch = dprops->gcnArchName;
+  return device_arch.rfind("gfx1100", 0) == 0;
+}
+}  // namespace
+#endif
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format) {
-  if (a.dim() == 2 && b_q_weight.dim() == 2 && a.size(1) % 16 == 0 &&
-      b_q_weight.size(1) % 16 == 0 &&
-      ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
-       (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
-    return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
-                                use_v2_format);
-  }
-
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA/HIP tensor");
   TORCH_CHECK(b_q_weight.is_cuda(), "b_q_weight must be a CUDA/HIP tensor");
   TORCH_CHECK(b_qzeros.is_cuda(), "b_qzeros must be a CUDA/HIP tensor");
@@ -749,6 +755,18 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
               "b_scales must have same group count as qzeros");
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");
   TORCH_CHECK(size_n % 8 == 0, "N must be a multiple of 8 (64-bit atomic CAS)");
+
+#ifdef VLLM_ROCM_RDNA3_WMMA
+  // On gfx1100 the WMMA prefill kernel wins for larger-M bf16 (>=16) and
+  // fp16 (>=64). gfx1151 lacks the WMMA TU and stays on the scalar path.
+  if (current_device_supports_rdna3_wmma() && size_k % 16 == 0 &&
+      size_n % 16 == 0 &&
+      ((a.scalar_type() == torch::kBFloat16 && size_m >= 16) ||
+       (a.scalar_type() == torch::kHalf && size_m >= 64))) {
+    return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                use_v2_format);
+  }
+#endif
 
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::zeros({size_m, size_n}, opts);

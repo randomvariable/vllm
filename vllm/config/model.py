@@ -228,9 +228,10 @@ class ModelConfig:
     determine the data type of the weights."""
     quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None
     """User-facing quantization configuration. Carries per-layer-kind specs
-    (linear, moe) and ignore patterns; see :class:`QuantizationConfigArgs`.
-    Auto-populated from the matching online shorthand when `quantization` is
-    one of the values in `ONLINE_QUANT_SHORTHAND_NAMES`."""
+    (linear, moe, shared_experts) and ignore patterns; see
+    :class:`QuantizationConfigArgs`. Auto-populated from the matching online
+    shorthand when `quantization` is one of the values in
+    `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = False
     """Whether to allow deprecated quantization methods."""
     enforce_eager: bool = False
@@ -304,7 +305,14 @@ class ModelConfig:
     (stored in `~/.cache/huggingface/token`)."""
     hf_overrides: HfOverrides = field(default_factory=dict)
     """If a dictionary, contains arguments to be forwarded to the Hugging Face
-    config. If a callable, it is called to update the HuggingFace config."""
+    config. If a callable, it is called to update the HuggingFace config.
+
+    Dict-valued keys (e.g. `{"text_config": {...}}`) target the matching
+    sub-config. Flat keys are applied to the config that already defines them,
+    preferring the top-level config and falling back to the text config of a
+    multimodal wrapper, so that a key such as `num_experts_per_tok` reaches the
+    language model instead of being set on an object it never reads. Keys that
+    match neither are still applied at the top level but logged as a warning."""
     model_class_overrides: dict[str, str] = field(default_factory=dict)
     """Override the model class used for one or more architectures, mapping the
     architecture name to a `"module:class"` target (the same format accepted by
@@ -1218,6 +1226,13 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                # Rank-sliced EXL3 checkpoints retain a ModelOpt dispatch tag
+                # for backward compatibility, so EXL3 must inspect metadata
+                # before the ModelOpt overrides claim them.
+                "exl3",
+                # Must precede modelopt_fp4: hybrid checkpoints are
+                # modelopt-tagged NVFP4 plus a hybrid_bit_map.
+                "nvfp4_nf3_hybrid",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",

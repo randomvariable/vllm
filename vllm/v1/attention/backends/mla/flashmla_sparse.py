@@ -220,13 +220,18 @@ class FlashMLASparseMetadata(AttentionMetadata):
 
 
 def get_prefill_workspace_size(max_model_len: int):
-    # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
+    is_sm120_cuda = current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(120)
+    )
+    multiplier = 2 if is_sm120_cuda else 5
+    # NOTE(Lucas): The multiplier is a magic number for controlling the
+    # prefill buffer size.
     # May be tuned later.
-    # Memory usage: 5 * max_model_len * 576 * 2 bytes
-    #   Example: DeepSeek-V3.2 with max_model_len=163840 ->
-    #            5 * 163840 * 576 * 2 = ~900 MB
+    # Memory usage: multiplier * max_model_len * 576 * 2 bytes.
+    # SM120 uses 2 for its FlashInfer workspace; SM100 uses 5 for FlashMLA.
+    #   Example on SM100: 5 * 163840 * 576 * 2 = ~900 MB
     # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
-    return max_model_len * 5
+    return max_model_len * multiplier
 
 
 class FlashMLASparseMetadataBuilder(
@@ -857,7 +862,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+        use_fp8_cache = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
 
         if not use_fp8_cache:
             attn_out = self._forward_bf16_kv(

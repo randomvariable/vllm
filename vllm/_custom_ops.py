@@ -1022,7 +1022,7 @@ def cutlass_fp4_moe_mm(
     An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
     the gemms for each combination based on the specified problem sizes.
 
-    This is used as the MoE gemm during NVFP4 Quantized MoERunner forward.
+    This is used as the MoE gemm during NVFP4 Quantized FusedMoE forward.
     - a/b_tensors: the NVFP4 a_ptrs and b_ptrs tensors which are quantized
                      input and expert weights.
     - a_/b_scales: The blockscales in FP8-E4M3 precision
@@ -2087,93 +2087,6 @@ def selective_scan_fwd(
     )
 
 
-def causal_conv1d_update_cpu_vec(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    activation: str | None = None,
-    conv_state_indices: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
-    pad_slot_id: int = 0,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_update_cpu_vec(
-        x,
-        conv_state,
-        weight,
-        bias,
-        activation,
-        conv_state_indices,
-        query_start_loc,
-        pad_slot_id,
-    )
-
-
-def selective_state_update_cpu(
-    state: torch.Tensor,
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor | None,
-    z: torch.Tensor | None,
-    dt_bias: torch.Tensor | None,
-    dt_softplus: bool,
-    state_batch_indices: torch.Tensor | None,
-    dst_state_batch_indices: torch.Tensor | None,
-    null_block_id: int,
-    out: torch.Tensor,
-    num_accepted_tokens: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-):
-    torch.ops._C.selective_state_update_cpu(
-        state,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D,
-        z,
-        dt_bias,
-        dt_softplus,
-        state_batch_indices,
-        dst_state_batch_indices,
-        null_block_id,
-        out,
-        num_accepted_tokens,
-        cu_seqlens,
-    )
-
-
-def mamba_chunk_scan_fwd_cpu(
-    out: torch.Tensor,
-    final_states: torch.Tensor,
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor | None,
-    z: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-) -> None:
-    """Prefill SSM scan kernel. out and final_states are written in-place."""
-    torch.ops._C.mamba_chunk_scan_fwd_cpu(
-        out,
-        final_states,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D,
-        z,
-        cu_seqlens,
-    )
-
-
 # ROCm skinny gemms
 def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor:
     return torch.ops._rocm_C.LLMM1(a, b, rows_per_block)
@@ -2672,8 +2585,6 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     index_q_out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     skip_index_branch: bool = False,
-    q_fp8_out: torch.Tensor | None = None,
-    q_fp8_scale: float = 1.0,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -2695,9 +2606,6 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     instead of in place — folding the de-interleave into this kernel's store so
     callers skip a separate ``.contiguous()`` copy before the SM100 sparse
     attention's flat TMA descriptor.
-
-    If ``q_fp8_out`` is given, the same normalized q is also written in FP8
-    E4M3 using ``q_fp8_scale`` as its dequantization scale.
 
     When ``skip_index_branch`` is true, sparse rows still keep their packed
     ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
@@ -2726,8 +2634,6 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         index_q_out,
         kv_cache_dtype,
         skip_index_branch,
-        q_fp8_out,
-        q_fp8_scale,
     )
 
 
@@ -2813,7 +2719,6 @@ def fused_gdn_decode_post_conv_mtp(
     )
     return out
 
-
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
@@ -2822,56 +2727,43 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        concat_and_cache_nvfp4_mla(kv_c, k_pe, kv_cache, slot_mapping, scale)
+        return
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
 
 
-def concat_and_cache_mla_grouped(
+_NVFP4_MLA_CACHE_EXT_LOADED = False
+
+
+def _ensure_nvfp4_mla_cache_ext() -> None:
+    """Load the companion _C_cache_ops fragment that registers
+    ``concat_and_cache_nvfp4_mla`` when the main ``_C_stable_libtorch``
+    build does not carry it (out-of-tree companion extension build)."""
+    global _NVFP4_MLA_CACHE_EXT_LOADED
+    if _NVFP4_MLA_CACHE_EXT_LOADED:
+        return
+    if not hasattr(torch.ops._C_cache_ops, "concat_and_cache_nvfp4_mla"):
+        import os as _os
+
+        _ext = _os.path.join(_os.path.dirname(__file__), "_nvfp4_mla_cache_C.so")
+        torch.ops.load_library(_ext)
+    _NVFP4_MLA_CACHE_EXT_LOADED = True
+
+
+def concat_and_cache_nvfp4_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
-    kv_cache_ptrs: torch.Tensor,
+    kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    block_size: int,
-    block_stride: int,
-    entry_stride: int,
+    scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla_grouped(
-        kv_c,
-        k_pe,
-        kv_cache_ptrs,
-        slot_mapping,
-        block_size,
-        block_stride,
-        entry_stride,
+    _ensure_nvfp4_mla_cache_ext()
+    torch.ops._C_cache_ops.concat_and_cache_nvfp4_mla(
+        kv_c, k_pe, kv_cache, slot_mapping, scale
     )
-
-
-def kimi_k3_attn_res(
-    prefix: torch.Tensor,
-    delta: torch.Tensor,
-    blocks: torch.Tensor,
-    norm_weight: torch.Tensor,
-    qk_weight: torch.Tensor,
-    output_norm_weight: torch.Tensor,
-    num_blocks: int,
-    eps: float,
-    output_norm_eps: float,
-) -> torch.Tensor:
-    output = torch.empty_like(prefix)
-    torch.ops._C.kimi_k3_attn_res(
-        prefix,
-        delta,
-        blocks,
-        norm_weight,
-        qk_weight,
-        output_norm_weight,
-        output,
-        num_blocks,
-        eps,
-        output_norm_eps,
-    )
-    return output
 
 
 def concat_and_cache_mla_rope_fused(
@@ -3141,63 +3033,6 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
-def custom_all_gather(
-    fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    reg_buffer: int,
-    reg_buffer_sz_bytes: int,
-) -> None:
-    torch.ops._C_custom_ar.custom_all_gather(
-        fa, inp, out, reg_buffer, reg_buffer_sz_bytes
-    )
-
-
-def mnnvl_lamport_all_gather(
-    fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    local_buffer: int,
-    multicast_buffer: int,
-    epoch_buffer: int,
-    stage_sz_bytes: int,
-) -> None:
-    torch.ops._C_custom_ar.mnnvl_lamport_all_gather(
-        fa,
-        inp,
-        out,
-        local_buffer,
-        multicast_buffer,
-        epoch_buffer,
-        stage_sz_bytes,
-    )
-
-
-def custom_reduce_scatter(
-    fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    reg_buffer: int,
-    reg_buffer_sz_bytes: int,
-) -> None:
-    torch.ops._C_custom_ar.custom_reduce_scatter(
-        fa, inp, out, reg_buffer, reg_buffer_sz_bytes
-    )
-
-
-def mnnvl_lamport_reduce_scatter(
-    fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    local_buffer: int,
-    epoch_buffer: int,
-    stage_sz_bytes: int,
-) -> None:
-    torch.ops._C_custom_ar.mnnvl_lamport_reduce_scatter(
-        fa, inp, out, local_buffer, epoch_buffer, stage_sz_bytes
-    )
-
-
 def dispose(fa: int) -> None:
     torch.ops._C_custom_ar.dispose(fa)
 
@@ -3302,18 +3137,18 @@ def dsv3_fused_a_gemm(
     output: torch.Tensor,
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
-    enable_pdl: bool = False,
 ) -> None:
-    """Low-latency fused-A-style GEMM (SM 9.0+, BF16, 1-16 tokens).
+    """DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
 
-    Computes ``output = mat_a @ mat_b`` for the compiled Kimi K3 and
-    DeepSeek V3 projection shapes. ``mat_a`` and ``output`` are row-major;
-    ``mat_b`` is the column-major transposed weight. ``enable_pdl`` permits
-    programmatic dependent launch for callers that have validated it.
+    Computes output = mat_a @ mat_b.T where:
+      mat_a: [num_tokens, 7168] row-major bf16 (hidden states)
+      mat_b: [7168, 2112] column-major bf16 (weight transposed)
+      output: [num_tokens, 2112] row-major bf16
 
-    Requires SM 9.0+.
+    Optimized for the DeepSeek V2/V3 QKV A-projection at small batch sizes.
+    Requires SM 9.0+ (Hopper).
     """
-    torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b, enable_pdl)
+    torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b)
 
 
 if hasattr(torch.ops._C, "weight_packed_linear"):
@@ -3552,7 +3387,6 @@ def chunk_gated_delta_rule_cpu(
     cu_seqlens: torch.Tensor,
     head_first: bool,
     use_qk_l2norm_in_kernel: bool,
-    initial_state_indices: torch.Tensor,
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops._C.chunk_gated_delta_rule_cpu(
@@ -3566,7 +3400,6 @@ def chunk_gated_delta_rule_cpu(
         cu_seqlens,
         head_first,
         use_qk_l2norm_in_kernel,
-        initial_state_indices,
         eps,
     )
 
@@ -3692,7 +3525,6 @@ def causal_conv1d_update_cpu(
     silu_activation: bool,
     conv_state_indices: torch.Tensor | None,
     is_vnni: bool,
-    num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._C.causal_conv1d_update_cpu(
         x,
@@ -3700,7 +3532,7 @@ def causal_conv1d_update_cpu(
         weight,
         bias,
         silu_activation,
-        num_accepted_tokens,
+        None,
         conv_state_indices,
         -1,
         is_vnni,
@@ -3851,7 +3683,6 @@ def cpu_attn_get_scheduler_metadata(
     isa: str,
     enable_kv_split: bool,
     dynamic_causal: torch.Tensor | None = None,
-    kv_cache_dtype: str = "auto",
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3866,7 +3697,6 @@ def cpu_attn_get_scheduler_metadata(
         isa,
         enable_kv_split,
         dynamic_causal,
-        kv_cache_dtype,
     )
     return scheduler_metadata
 
@@ -3977,15 +3807,6 @@ def cpu_prepack_moe_weight(
     return output
 
 
-def cpu_prepack_moe_weight_int8(
-    weight: torch.Tensor,
-    isa: str,
-) -> torch.Tensor:
-    output = torch.empty_like(weight)
-    torch.ops._C.prepack_moe_weight_int8(weight, output, isa)
-    return output
-
-
 def cpu_fused_moe(
     input: torch.Tensor,
     w13: torch.Tensor,
@@ -4004,39 +3825,6 @@ def cpu_fused_moe(
         input,
         w13,
         w2,
-        w13_bias,
-        w2_bias,
-        topk_weights,
-        topk_ids,
-        skip_weighted,
-        act,
-        isa,
-    )
-    return output
-
-
-def cpu_fused_moe_int8(
-    input: torch.Tensor,
-    w13: torch.Tensor,
-    w2: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w13_bias: torch.Tensor | None,
-    w2_bias: torch.Tensor | None,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    act: str,
-    isa: str,
-    skip_weighted: bool = False,
-) -> torch.Tensor:
-    output = torch.empty_like(input)
-    torch.ops._C.cpu_fused_moe_int8(
-        output,
-        input,
-        w13,
-        w2,
-        w13_scale,
-        w2_scale,
         w13_bias,
         w2_bias,
         topk_weights,
@@ -4127,10 +3915,10 @@ def fusedQuantizeMx(
         raise ValueError(f"invalid method {method!r}, must be 'quest' or 'abs_max'")
 
 
-if hasattr(torch.ops._qutlass_C, "fusedQuantizeNvAbsMax"):
+if hasattr(torch.ops._qutlass_C, "fusedQuantizeNv"):
 
-    @register_fake("_qutlass_C::fusedQuantizeNvAbsMax")
-    def _fake_fused_quantize_nv_absmax(
+    @register_fake("_qutlass_C::fusedQuantizeNv")
+    def _fake_fused_quantize_nv(
         a: torch.Tensor,
         b: torch.Tensor,
         xh_e2m1: torch.Tensor,
@@ -4156,40 +3944,7 @@ def fusedQuantizeNv(
         padded_rows, padded_cols, dtype=torch.float8_e4m3fn, device=a.device
     )
 
-    safeFusedQuantizeNv(a, b, xh_e2m1, xh_e4m3, global_scale)
-    return xh_e2m1, xh_e4m3
-
-
-@torch.library.custom_op(
-    "vllm::safeFusedQuantizeNv", mutates_args=("xh_e2m1", "xh_e4m3")
-)
-def safeFusedQuantizeNv(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    xh_e2m1: torch.Tensor,
-    xh_e4m3: torch.Tensor,
-    global_scale: torch.Tensor,
-) -> None:
-    """
-    Wrapper for QUTLASS fusedQuantizeNv method that operates on tensors in-place
-    rather than returning them, to prevent torch 2.12+ errors that outputs of custom
-    operators may not alias any inputs to the custom operator.
-    """
-    torch.ops._qutlass_C.fusedQuantizeNvAbsMax(a, b, xh_e2m1, xh_e4m3, global_scale)
-    return
-
-
-if hasattr(torch.ops._qutlass_C, "fusedQuantizeNv"):
-
-    @register_fake("vllm::safeFusedQuantizeNv")
-    def _fake_fused_quantize_nv(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        xh_e2m1: torch.Tensor,
-        xh_e4m3: torch.Tensor,
-        global_scale: torch.Tensor,
-    ) -> None:
-        return
+    return torch.ops._qutlass_C.fusedQuantizeNv(a, b, xh_e2m1, xh_e4m3, global_scale)
 
 
 def hadacore_transform(x: torch.Tensor, inplace: bool = True) -> torch.Tensor:

@@ -88,23 +88,38 @@ def prewarm_hf_cache(assets: list[tuple[str, str]]) -> None:
 
 
 if current_platform.is_rocm():
-    from amdsmi import (
-        amdsmi_get_gpu_vram_usage,
-        amdsmi_get_processor_handles,
-        amdsmi_init,
-        amdsmi_shut_down,
-    )
+    _amdsmi_get_gpu_vram_usage: Callable[..., Any] | None = None
+    _amdsmi_get_processor_handles: Callable[..., Any] | None = None
+    _amdsmi_init: Callable[..., Any] | None = None
+    _amdsmi_shut_down: Callable[..., Any] | None = None
+    try:
+        from amdsmi import (  # pyright: ignore[reportMissingImports]
+            amdsmi_get_gpu_vram_usage,
+            amdsmi_get_processor_handles,
+            amdsmi_init,
+            amdsmi_shut_down,
+        )
+    except ImportError:
+        pass
+    else:
+        _amdsmi_get_gpu_vram_usage = amdsmi_get_gpu_vram_usage
+        _amdsmi_get_processor_handles = amdsmi_get_processor_handles
+        _amdsmi_init = amdsmi_init
+        _amdsmi_shut_down = amdsmi_shut_down
 
     _amdsmi_lock = threading.Lock()
 
     @contextmanager
     def _nvml():
         with _amdsmi_lock:
+            if _amdsmi_init is None or _amdsmi_shut_down is None:
+                yield
+                return
             try:
-                amdsmi_init()
+                _amdsmi_init()
                 yield
             finally:
-                amdsmi_shut_down()
+                _amdsmi_shut_down()
 elif current_platform.is_cuda():
     from vllm.third_party.pynvml import (
         nvmlDeviceGetHandleByIndex,
@@ -572,15 +587,27 @@ class RemoteVLLMServer:
         """Get total GPU memory used across all visible devices in bytes."""
         try:
             if current_platform.is_rocm():
+                if (
+                    _amdsmi_get_gpu_vram_usage is None
+                    or _amdsmi_get_processor_handles is None
+                ):
+                    free, total = torch.cuda.mem_get_info()
+                    return total - free
+                get_vram_usage = cast(
+                    Callable[..., Any], _amdsmi_get_gpu_vram_usage
+                )
+                get_processor_handles = cast(
+                    Callable[..., Any], _amdsmi_get_processor_handles
+                )
                 with _nvml():
-                    handles = amdsmi_get_processor_handles()
+                    handles = get_processor_handles()
                     devices = get_physical_device_indices(
                         list(range(current_platform.device_count()))
                     )
                     total_used_mib = 0
                     for device in devices:
                         handle = handles[device]
-                        vram_info = amdsmi_get_gpu_vram_usage(handle)
+                        vram_info = get_vram_usage(handle)
                         total_used_mib += vram_info["vram_used"]
                     # amdsmi reports VRAM in MiB; convert to bytes so this
                     # matches the CUDA/nvml branch (already bytes) and the
@@ -1536,10 +1563,24 @@ def record_gpu_memory_usage_stats(
     output: dict[int, tuple[float, float]] = {}
     for device in devices:
         if current_platform.is_rocm():
-            dev_handle = amdsmi_get_processor_handles()[device]
-            mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
-            gb_used = mem_info["vram_used"] / 2**10
-            gb_total = mem_info["vram_total"] / 2**10
+            if (
+                _amdsmi_get_gpu_vram_usage is None
+                or _amdsmi_get_processor_handles is None
+            ):
+                free, total = torch.cuda.mem_get_info(device)
+                gb_used = (total - free) / 2**30
+                gb_total = total / 2**30
+            else:
+                get_vram_usage = cast(
+                    Callable[..., Any], _amdsmi_get_gpu_vram_usage
+                )
+                get_processor_handles = cast(
+                    Callable[..., Any], _amdsmi_get_processor_handles
+                )
+                dev_handle = get_processor_handles()[device]
+                mem_info = get_vram_usage(dev_handle)
+                gb_used = mem_info["vram_used"] / 2**10
+                gb_total = mem_info["vram_total"] / 2**10
         else:
             dev_handle = get_nvml_device_handle(device)
             mem_info = nvmlDeviceGetMemoryInfo(dev_handle)

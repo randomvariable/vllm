@@ -28,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    get_kv_cache_cp_shard_count,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -75,8 +77,16 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+        # Under (D)CP a request's cache is sharded across ranks, so one local
+        # block of `block_size` slots covers `block_size * cp` tokens of the
+        # global sequence -- scale the scheduler-visible block size to match.
+        # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
+        # cache on every rank, so one block covers exactly `block_size` global
+        # tokens and must not be scaled.
+        if dcp_world_size * pcp_world_size > 1:
+            self.block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
@@ -112,12 +122,8 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        # Partial-tail offload hand-off for external KV connectors: when a
-        # producer registers its last-prompt-boundary partial tail and the
-        # durable boundary block is not on the append-only request block table
-        # (mamba "align" CoW target), record the request, group, block, and
-        # exact token boundary so a connector can offload it under the right
-        # hash. Populated only by mamba "align".
+        # Partial-tail offload hand-offs are produced only by Mamba align
+        # managers; all managers share the coordinator's drain interface.
         self._pending_partial_tail_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
@@ -383,21 +389,38 @@ class SingleTypeKVCacheManager(ABC):
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
         return pending_copies
-
     def take_pending_partial_tail_offloads(
         self,
     ) -> list[tuple[str, int, KVCacheBlock, int]]:
-        """Drain producer partial-tail hand-offs.
-
-        Entries are ``(req_id, group_id, block, boundary_tokens)``.
-
-        Only mamba "align" populates this. The block lives off the request
-        block table, so the caller must pin it until the connector has read
-        it — nothing else keeps it alive once the CoW retention is released.
-        """
+        """Drain producer partial-tail hand-offs."""
         pending = self._pending_partial_tail_offloads
         self._pending_partial_tail_offloads = []
         return pending
+
+    def pending_cow_block_index(self, request_id: str) -> int | None:
+        """Return the pending partial-hit CoW index without consuming it."""
+        partial_hit = self._partial_hit_reqs.get(request_id)
+        return partial_hit[0] if partial_hit is not None else None
+
+    def apply_lockstep_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        """Mirror a peer manager's CoW substitution using the same block ID.
+
+        The primary manager owns the physical copy operation. A lockstep peer
+        only transfers its request reference from the shared source block to
+        the already allocated destination block.
+        """
+        pending_idx, source_block = self._partial_hit_reqs.pop(request_id)
+        assert pending_idx == block_idx
+        req_blocks = self.req_to_blocks[request_id]
+        assert req_blocks[block_idx] is source_block
+        self.block_pool.touch([cow_block])
+        req_blocks[block_idx] = cow_block
+        self.block_pool.free_blocks([source_block])
 
     def _apply_cow(
         self,
@@ -492,6 +515,15 @@ class SingleTypeKVCacheManager(ABC):
         ``reachable_boundaries`` are token positions whose reachable tail must be
         retained; the base (dense) policy ignores them.
         """
+        del (
+            start_block,
+            end_block,
+            alignment_tokens,
+            kv_cache_spec,
+            use_eagle,
+            retention_interval,
+            reachable_boundaries,
+        )
         return None
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
@@ -661,6 +693,7 @@ class SingleTypeKVCacheManager(ABC):
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        del num_computed_tokens
         """
         Get the number of tokens that will be skipped for attention computation.
 
@@ -700,10 +733,13 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1:
-            # DCP shards each block's KV across ranks; hashes must be viewed at
-            # the sharded block size.
-            block_size *= dcp_world_size
+        if dcp_world_size * pcp_world_size > 1:
+            # DCP/PCP shard each block's KV across ranks; hashes must be
+            # viewed at the sharded (scaled) block size. Replicated groups
+            # keep the model block size on every rank.
+            block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -719,8 +755,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             alignment_tokens < block_size and block_size % alignment_tokens == 0
         )
         if fine_grained:
-            # list or lazy BlobBlockHashes view
-            assert isinstance(block_hashes, Sequence)
+            assert isinstance(block_hashes, list)
             full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
                 block_hashes, alignment_tokens, block_size
             )
@@ -743,8 +778,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         # Phase 2 (fine-grained only): extend into the first non-full block by
         # probing its interior hash boundaries high-to-low (longest hit first).
         if fine_grained:
-            # list or lazy BlobBlockHashes view
-            assert isinstance(block_hashes, Sequence)
+            assert isinstance(block_hashes, list)
             scale_factor = block_size // alignment_tokens
             first_partial_idx = len(computed_blocks[0]) * scale_factor
             max_partial_idx = min(
@@ -915,8 +949,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        assert dcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "DCP only supports sliding-window KV when it is dcp_replicated."
+        )
+        assert pcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "PCP only supports sliding-window KV when it is dcp_replicated."
+        )
         # Fine-grained partial hits are not supported for sliding window now
         assert alignment_tokens % kv_cache_spec.block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
@@ -1098,6 +1136,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
         So it's not correct to count ref_cnt like FullAttentionManager. Return
@@ -1259,6 +1298,7 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         return num_skipped_tokens
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         cascade attention is not supported by chunked local attention.
         """
@@ -1287,8 +1327,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs: set[str] = set()
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). On the next step's CoW the boundary state moves
-            # into a private cow_block; we record that block for connector
-            # offload (see _pending_partial_tail_offloads).
+            # into a private cow_block for connector offload.
             self._producer_partial_tail_reqs: dict[str, int] = {}
 
     @classmethod
@@ -1304,6 +1343,7 @@ class MambaManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del drop_eagle_block
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
@@ -1323,8 +1363,7 @@ class MambaManager(SingleTypeKVCacheManager):
 
         block_size = kv_cache_spec.block_size
         if alignment_tokens < block_size and block_size % alignment_tokens == 0:
-            # list or lazy BlobBlockHashes view
-            assert isinstance(block_hashes, Sequence)
+            assert isinstance(block_hashes, list)
             hash_block_size = alignment_tokens
             scale_factor = block_size // hash_block_size
             max_num_partial_units = min(
@@ -1393,6 +1432,7 @@ class MambaManager(SingleTypeKVCacheManager):
         any cross-request shared-prefix junction, Marconi-style APC); their
         boundary state is always kept so sparse retention does not defeat reuse.
         """
+        del use_eagle
         if retention_interval is None or alignment_tokens is None:
             # Dense caching (default) or no alignment constraint imposed.
             return None
@@ -1459,6 +1499,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         cascade attention is not supported by mamba
         """
@@ -1642,9 +1683,6 @@ class MambaManager(SingleTypeKVCacheManager):
                             request_id, None
                         )
                         if boundary_tokens is not None:
-                            # This CoW preserved a producer's own boundary
-                            # state in cow_block; hand it to the connector for
-                            # partial-tail offload once the copy has run.
                             self._pending_partial_tail_offloads.append(
                                 (
                                     request_id,
@@ -1671,8 +1709,6 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
-            # A hand-off whose request died in this same scheduling pass must
-            # not reach the connector: its unpin hook (free) has already run.
             self._pending_partial_tail_offloads = [
                 entry
                 for entry in self._pending_partial_tail_offloads
@@ -1752,10 +1788,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
-            # Producer of this partial tail: the boundary state currently lives
-            # in ``source_block`` but the next step's forward overwrites it. The
-            # upcoming CoW copies it into a durable cow_block; record the req so
-            # allocate_new_blocks hands that block to the connector for offload.
             self._producer_partial_tail_reqs[request.request_id] = num_tokens
         return partial_hash
 
@@ -1770,6 +1802,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
+        del request_id, num_local_computed_tokens, num_external_computed_tokens
         # We do not cache blocks for cross-attention to be shared between
         # requests, so  `new_computed_blocks` should always be empty.
         assert len(new_computed_blocks) == 0
@@ -1780,6 +1813,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
+        del request_id, num_local_computed_tokens, num_external_computed_tokens
         # Cross-attention does not use prefix caching / external KV loads.
         return
 
@@ -1789,11 +1823,13 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        del request, num_tokens, retention_interval
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
         raise ValueError("Should not be called as prefix caching is disabled.")
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         # Cross-attention blocks contain request-specific encoder states
         # and are not shared between different requests
         return 0
@@ -1811,6 +1847,16 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del (
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            drop_eagle_block,
+            alignment_tokens,
+            dcp_world_size,
+            pcp_world_size,
+        )
         assert isinstance(kv_cache_spec, CrossAttentionSpec), (
             "CrossAttentionManager can only be used for cross-attention groups"
         )
@@ -1874,22 +1920,34 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
-    # SlidingWindow / ChunkedLocalAttention managers recycle blocks;
-    # the runtime admission cap must match the recycling-aware bound the
-    # startup pool sizer uses (single source of truth: the spec method).
+    # SlidingWindow / ChunkedLocalAttention managers recycle blocks across
+    # chunks; the runtime admission cap must match the recycling-aware bound
+    # the startup pool sizer uses (single source of truth: the spec method).
     # R-SWA also recycles gap blocks but peak physical KV still fits the
     # full-attention bound (prefix + window <= max_model_len), so it inherits
     # FullAttentionSpec sizing without a separate admission cap.
-    if isinstance(
-        kv_cache_spec,
-        (SlidingWindowSpec, ChunkedLocalAttentionSpec),
-    ):
-        kwargs["max_admission_blocks_per_request"] = (
-            kv_cache_spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=max_in_flight_tokens,
-                max_model_len=max_model_len,
+    if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+        if (
+            isinstance(kv_cache_spec, SlidingWindowMLASpec)
+            and kv_cache_spec.dcp_sharded
+        ):
+            dcp_world_size = kwargs.get("dcp_world_size", 1)
+            pcp_world_size = kwargs.get("pcp_world_size", 1)
+            block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
+            num_tokens = min(
+                kv_cache_spec.sliding_window - 1 + max_in_flight_tokens,
+                max_model_len,
             )
-        )
+            kwargs["max_admission_blocks_per_request"] = (
+                cdiv(num_tokens, block_size) + 1
+            )
+        else:
+            kwargs["max_admission_blocks_per_request"] = (
+                kv_cache_spec.max_admission_blocks_per_request(
+                    max_in_flight_tokens=max_in_flight_tokens,
+                    max_model_len=max_model_len,
+                )
+            )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
 
@@ -1928,6 +1986,11 @@ def register_all_kvcache_specs(vllm_config):
     )
 
     # FullAttentionSpec subclasses — grouped with FullAttentionSpec
+    KVCacheSpecRegistry.register(
+        TQFullAttentionSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
     KVCacheSpecRegistry.register(
         MLAAttentionSpec, FullAttentionManager, uniform_type_base_spec=FullAttentionSpec
     )

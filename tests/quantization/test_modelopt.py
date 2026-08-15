@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_modelopt.py`.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,21 +14,15 @@ import pytest
 import torch
 
 from tests.quantization.utils import is_quant_method_supported
-from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.model import ModelConfig
-from vllm.model_executor.kernels.linear import (
-    HummingNvFp4LinearKernel,
-    MarlinNvFp4LinearKernel,
-)
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
-    ModelOptFp8LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptMxFp8Config,
     ModelOptNvFp4Config,
     ModelOptNvFp4LinearMethod,
-    ModelOptNvFp4W4A16LinearMethod,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -49,12 +44,12 @@ def _skip(msg: str) -> NoReturn:
 
 def _snapshot_download_or_skip(model_id: str) -> str:
     try:
-        from vllm.transformers_utils.repo_utils import hf_api
+        from huggingface_hub import snapshot_download
     except Exception as e:  # pragma: no cover
         _skip(f"huggingface_hub is required to download {model_id}: {e}")
 
     try:
-        return hf_api().snapshot_download(
+        return snapshot_download(
             repo_id=model_id,
             repo_type="model",
             # These checkpoints are already small; download full repo for simplicity.
@@ -68,6 +63,10 @@ def _mock_lm_head() -> Mock:
     lm_head = Mock(spec=ParallelLMHead)
     lm_head.__class__ = ParallelLMHead
     return lm_head
+
+
+def _mock_linear() -> Mock:
+    return Mock(spec=LinearBase)
 
 
 def _mixed_precision_config(quantized_layers: dict) -> ModelOptMixedPrecisionConfig:
@@ -115,26 +114,184 @@ def test_modelopt_nvfp4_quantizes_parallel_lm_head():
     assert isinstance(method, ModelOptNvFp4LinearMethod)
 
 
-def test_modelopt_fp8_updates_weight_dims_after_transpose():
-    layer = torch.nn.Module()
-    layer.register_parameter(
-        "weight", torch.nn.Parameter(torch.empty(3, 2), requires_grad=False)
+def test_modelopt_nvfp4_online_quantizes_bf16_dense_linears():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[
+            "model.layers.*.self_attn*",
+            "*shared_experts*",
+            "lm_head",
+        ],
     )
-    layer.register_parameter(
-        "weight_scale", torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(linear="mxfp8")
+        )
     )
-    layer.register_parameter(
-        "input_scale", torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        attn_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        indexer_method = config.get_quant_method(
+            _mock_linear(), "model.layers.0.self_attn.indexer.wq_b"
+        )
+        # shared experts are governed solely by the shared_experts spec
+        shared_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+        )
+        lm_head_method = config.get_quant_method(_mock_lm_head(), "lm_head")
+
+    assert attn_method is sentinel
+    assert indexer_method is sentinel
+    assert isinstance(shared_method, UnquantizedLinearMethod)
+    assert isinstance(lm_head_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_dense_overlay_honors_ignore():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["model.layers.*.self_attn*"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(
+                linear="mxfp8",
+                ignore=["re:.*o_proj"],
+            )
+        )
+    )
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        kv_b_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        o_proj_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.o_proj"
+        )
+
+    assert kv_b_method is sentinel
+    assert isinstance(o_proj_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_dense_overlay_composes_with_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["model.layers.*.self_attn*", "*shared_experts*"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(
+                linear="mxfp8",
+                shared_experts="mxfp8",
+            )
+        )
+    )
+    dense_sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=dense_sentinel,
+        ),
+    ):
+        attn_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        shared_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+
+    assert attn_method is dense_sentinel
+    assert shared_method is dense_sentinel
+
+
+def test_modelopt_nvfp4_online_quantizes_bf16_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["*shared_experts*", "lm_head"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(shared_experts="mxfp8")
+        )
+    )
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        gate_up_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+        down_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+        )
+        router_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.router"
+        )
+        lm_head_method = config.get_quant_method(_mock_lm_head(), "lm_head")
+
+    assert gate_up_method is sentinel
+    assert down_method is sentinel
+    assert isinstance(router_method, UnquantizedLinearMethod)
+    assert isinstance(lm_head_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_preserves_serialized_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
     )
 
-    method = ModelOptFp8LinearMethod.__new__(ModelOptFp8LinearMethod)
-    method.fp8_linear = Mock()
-    method.process_weights_after_loading(layer)
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel"
+    ):
+        method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
 
-    assert layer.weight.shape == (2, 3)
-    assert layer.weight.input_dim == 0
-    assert layer.weight.output_dim == 1
-    method.fp8_linear.process_weights_after_loading.assert_called_once_with(layer)
+    assert isinstance(method, ModelOptNvFp4LinearMethod)
 
 
 def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
@@ -192,38 +349,6 @@ def test_modelopt_mixed_precision_does_not_quantize_unlisted_fused_sibling():
         config._resolve_quant_algo("model.layers.0.linear_attn.in_proj_qkvz") == "FP8"
     )
     assert config._resolve_quant_algo("model.layers.0.linear_attn.in_proj_ba") is None
-
-
-def test_modelopt_mixed_precision_composes_gemma4_mappers():
-    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
-    from vllm.model_executor.models.gemma4_mm import (
-        Gemma4ForConditionalGeneration,
-    )
-
-    config = _mixed_precision_config(
-        {
-            "model.language_model.layers.0.experts": {
-                "quant_algo": "NVFP4",
-                "group_size": 16,
-            },
-            "model.language_model.layers.1.moe.experts.gate_up_proj": {
-                "quant_algo": "NVFP4",
-                "group_size": 16,
-            },
-        }
-    )
-
-    config.apply_vllm_mapper(
-        Gemma4ForConditionalGeneration.hf_to_vllm_mapper.get_unstacked_mapper()
-    )
-    config.apply_vllm_mapper(Gemma4ForCausalLM.hf_to_vllm_mapper.get_unstacked_mapper())
-
-    expected_prefix = "language_model.model.layers.0.moe.experts"
-    assert set(config.quantized_layers) == {
-        expected_prefix,
-        "language_model.model.layers.1.moe.gate_up_proj",
-    }
-    assert config._resolve_quant_algo(expected_prefix) == "NVFP4"
 
 
 def test_modelopt_mixed_precision_infers_fused_gate_up_projection():
@@ -497,13 +622,15 @@ def test_modelopt_nvfp4_config_dispatches_w4a4_method():
 
 
 def test_modelopt_nvfp4_config_dispatches_w4a16_method():
-    """``quant_method="W4A16_NVFP4"`` routes to
+    """``quant_method="W4A16_NVFP4"`` routes to the new
     ``ModelOptNvFp4W4A16LinearMethod`` instead of the W4A4 sibling.
 
     Mirrors the FP8 dispatch precedent (``ModelOptFp8Config`` selects
     one of three FP8 LinearMethods on ``quant_method``); a regression
     here would mean a W4A16 NVFP4 checkpoint silently loaded under the
-    W4A4 activation-quantization path.
+    W4A4 method, which would try to register an ``input_scale`` runtime
+    parameter and (more importantly) call the cutlass W4A4 NVFP4 GEMM
+    instead of FP4 Marlin.
     """
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
@@ -520,21 +647,6 @@ def test_modelopt_nvfp4_config_dispatches_w4a16_method():
     assert config.LinearMethodCls is ModelOptNvFp4W4A16LinearMethod
     assert config.LinearMethodCls is not ModelOptNvFp4LinearMethod
     assert config.quant_method == "W4A16_NVFP4"
-
-
-@pytest.mark.parametrize(
-    ("linear_backend", "kernel_cls"),
-    [("auto", MarlinNvFp4LinearKernel), ("humming", HummingNvFp4LinearKernel)],
-)
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
-def test_modelopt_w4a16_respects_linear_backend(linear_backend, kernel_cls):
-    vllm_config = VllmConfig()
-    vllm_config.kernel_config.linear_backend = linear_backend
-    with set_current_vllm_config(vllm_config):
-        method = ModelOptNvFp4W4A16LinearMethod(
-            ModelOptNvFp4Config(quant_method="W4A16_NVFP4")
-        )
-    assert isinstance(method.kernel, kernel_cls)
 
 
 @pytest.mark.parametrize(
@@ -600,19 +712,20 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
     [
         ("NVFP4", "ModelOptNvFp4LinearMethod"),
         ("W4A16_NVFP4", "ModelOptNvFp4W4A16LinearMethod"),
+        ("MXFP8", "ModelOptMxFp8LinearMethod"),
     ],
 )
-def test_modelopt_mixed_precision_dispatches_w4a16_layer(
+def test_modelopt_mixed_precision_dispatches_layer_quant_algo(
     per_layer_algo, expected_linear_cls_name
 ):
     """``ModelOptMixedPrecisionConfig.get_quant_method`` must route a Linear
     layer to the right LinearMethod based on its per-layer ``quant_algo``
-    entry in ``quantized_layers``. Verifies the new ``W4A16_NVFP4`` branch
-    coexists with the existing ``NVFP4`` branch without regression. A
-    regression here would mean a W4A16 layer in a mixed-precision ckpt
+    entry in ``quantized_layers``. Verifies W4A16 and MXFP8 branches coexist
+    with the existing ``NVFP4`` branch without regression. A regression here
+    would mean a quantized layer in a mixed-precision ckpt
     silently fell through to ``UnquantizedLinearMethod``.
 
-    NOTE: FP8 dispatch (the third branch of get_quant_method) is not
+    NOTE: FP8 dispatch is not
     covered here because ``ModelOptFp8LinearMethod.__init__`` reads
     ``get_current_vllm_config().model_config.dtype``, which requires a
     fully constructed ``ModelConfig`` (real model path). FP8 routing in
@@ -650,6 +763,199 @@ def test_modelopt_mixed_precision_dispatches_w4a16_layer(
     assert isinstance(method, expected_cls), (
         f"Expected {expected_linear_cls_name}, got {type(method).__name__}"
     )
+
+
+def test_modelopt_mixed_precision_prefers_explicit_w4a4_scheme() -> None:
+    """Static FP4 activation metadata overrides a coarse W4A16 layer label."""
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    w4a4_targets = [
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp.shared_expert.gate_proj",
+        "model.layers.0.mlp.shared_expert.up_proj",
+        "model.layers.0.mlp.shared_expert.down_proj",
+    ]
+    quantized_layers = {
+        target: {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+        for target in [*w4a4_targets, "model.layers.1.fake_proj"]
+    }
+    hf_quant_config: dict[str, Any] = {
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "config_groups": {
+            "group_0": {
+                "input_activations": {
+                    "dynamic": False,
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                },
+                "weights": {
+                    "dynamic": False,
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                },
+                "targets": w4a4_targets,
+            }
+        },
+        "quantized_layers": quantized_layers,
+    }
+
+    config = m.ModelOptMixedPrecisionConfig.from_config(hf_quant_config)
+
+    assert config._resolve_quant_algo("model.layers.0.mlp.experts") == "NVFP4"
+    assert (
+        config._resolve_quant_algo("model.layers.0.mlp.shared_expert.gate_up_proj")
+        == "NVFP4"
+    )
+    assert (
+        config._resolve_quant_algo("model.layers.0.mlp.shared_expert.down_proj")
+        == "NVFP4"
+    )
+    assert config._resolve_quant_algo("model.layers.1.fake_proj") == "W4A16_NVFP4"
+
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel",
+        return_value=MagicMock(),
+    ):
+        method = config.get_quant_method(
+            MagicMock(spec=LinearBase),
+            "model.layers.0.mlp.shared_expert.down_proj",
+        )
+    assert isinstance(method, m.ModelOptNvFp4LinearMethod)
+
+    fake_experts = MagicMock(spec=RoutedExperts)
+    fake_experts.moe_config = MagicMock()
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
+            return_value=(MagicMock(), MagicMock()),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "is_global_sf_supported_for_nvfp4_backend",
+            return_value=False,
+        ),
+    ):
+        moe_method = config.get_quant_method(fake_experts, "model.layers.0.mlp.experts")
+    assert isinstance(moe_method, m.ModelOptNvFp4FusedMoE)
+    assert not moe_method.use_a16
+
+
+def test_modelopt_mixed_precision_resolves_minimax_qkv_from_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.k_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.v_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo("language_model.model.layers.3.self_attn.qkv_proj")
+        == "MXFP8"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.indexer.q_proj"
+        )
+        is None
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.indexer.k_proj"
+        )
+        is None
+    )
+
+
+def test_modelopt_mixed_precision_drives_minimax_indexer_split() -> None:
+    from vllm.models.minimax_m3.nvidia.model import (
+        _should_split_mxfp8_indexer_projection,
+    )
+
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.k_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.v_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    assert _should_split_mxfp8_indexer_projection(
+        config, "language_model.model.layers.3.self_attn"
+    )
+
+
+def test_modelopt_mixed_precision_resolves_minimax_dense_gate_up_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.0.mlp.gate_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.0.mlp.up_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo("language_model.model.layers.0.mlp.gate_up_proj")
+        == "MXFP8"
+    )
+
+
+def test_modelopt_mixed_precision_resolves_minimax_block_sparse_mlp_alias() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.10.mlp.experts.0.gate_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.experts.0.up_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.experts.0.down_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.shared_experts.gate_up_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.10.mlp.shared_experts.down_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10.block_sparse_moe.experts"
+        )
+        == "NVFP4"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10."
+            "block_sparse_moe.shared_experts.gate_up_proj"
+        )
+        == "MXFP8"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10.block_sparse_moe.shared_experts.down_proj"
+        )
+        == "MXFP8"
+    )
+
+
+def test_modelopt_mixed_precision_rejects_mixed_fused_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.k_proj": {"quant_algo": "NVFP4"},
+            "model.language_model.layers.3.self_attn.v_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="Mixed quant_algo within fused layer"):
+        config._resolve_quant_algo("language_model.model.layers.3.self_attn.qkv_proj")
 
 
 def test_modelopt_mixed_precision_builds_w4a16_sibling_config():

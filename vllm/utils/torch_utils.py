@@ -45,12 +45,12 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_per_token_head": torch.uint8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
+    "nvfp4_ds_mla": torch.uint8,
     "turboquant_k8v4": torch.uint8,
     "turboquant_4bit_nc": torch.uint8,
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
-    "nvfp4_4over6": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -78,7 +78,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
-        or kv_cache_dtype.startswith("nvfp4")
+        or kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
     )
 
 
@@ -609,7 +609,7 @@ def create_kv_caches_with_random_flash(
     value_caches: list[torch.Tensor] = []
 
     for _ in range(num_layers):
-        if isinstance(cache_dtype, str) and cache_dtype.startswith("nvfp4"):
+        if cache_dtype == "nvfp4":
             # Full page dim: fp4 data + fp8 block scales per head.
             # Per page layout: [K_data | K_scale | V_data | V_scale]
             # Returns [:, 0] and [:, 1] like all other dtypes.

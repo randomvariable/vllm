@@ -7,6 +7,12 @@ dist
 vllm/*.so
 vllm/vllm-rs
 
+# Local scratch trees. Never part of an image, and both can contain
+# root-owned files from earlier container runs, which fails the context
+# upload for every build with "error from sender: permission denied".
+/.deps
+/.slim
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -36,3 +42,19 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Build-context stability. CI clones this fork fresh for every run, so the
+# root .git tree (FETCH_HEAD, reflogs, pack checksums) differs byte-for-byte
+# even when the commit is identical. With it in the context the
+# `COPY . /src/vllm` layer digest changed every build and invalidated the
+# ~3h of CUDA compile layers underneath it. The commit and the
+# setuptools-scm version are passed as build args instead
+# (VLLM_SOURCE_COMMIT / VLLM_SCM_VERSION).
+.git
+.github
+
+# Never read by the wheel build (packages are vllm* only), but large enough
+# to slow the context upload and to invalidate layers on doc-only commits.
+docs
+examples
+benchmarks
