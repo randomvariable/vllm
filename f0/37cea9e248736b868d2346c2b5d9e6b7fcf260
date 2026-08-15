@@ -1,0 +1,14 @@
+homelab/spark-cross.Dockerfile
+  h_15da545fc8cfbe 421-427
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f037cea9e248736b868d2346c2b5d9e6b7fcf260",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
