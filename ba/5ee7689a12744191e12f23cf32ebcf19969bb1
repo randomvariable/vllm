@@ -1,0 +1,48 @@
+docs/configuration/optimization.md
+  h_15da545fc8cfbe 80-85
+docs/contributing/mia-dspark-patch-manifest.md
+  h_15da545fc8cfbe 1-52
+homelab/spark-cross.Dockerfile
+  h_15da545fc8cfbe 240-246,373-374,420-422
+tests/test_config.py
+  h_15da545fc8cfbe 19,1911-1934
+tests/v1/core/test_scheduler.py
+  h_15da545fc8cfbe 203-279
+tests/v1/core/utils.py
+  h_15da545fc8cfbe 55-56,103-104
+vllm/config/scheduler.py
+  h_15da545fc8cfbe 70-74
+vllm/config/speculative.py
+  h_15da545fc8cfbe 1597-1600
+vllm/config/vllm.py
+  h_15da545fc8cfbe 2430,2433
+vllm/engine/arg_utils.py
+  h_15da545fc8cfbe 538-539,1542-1549,2357-2358
+vllm/entrypoints/openai/chat_completion/serving.py
+  h_15da545fc8cfbe 6,72-82,732-738,742-744,746-763,1062-1076,1083
+vllm/model_executor/layers/sparse_attn_indexer.py
+  h_15da545fc8cfbe 1672,1711-1714,1808-1816,1880-1900,2443,2511-2512,2598
+vllm/models/deepseek_v4/compressor.py
+  h_15da545fc8cfbe 98,106-107
+vllm/models/deepseek_v4/sparse_mla.py
+  h_15da545fc8cfbe 122-126,277-284,290
+vllm/v1/attention/backends/mla/flashmla_sparse.py
+  h_15da545fc8cfbe 865
+vllm/v1/core/sched/scheduler.py
+  h_15da545fc8cfbe 715-723,730-744
+vllm/v1/engine/detokenizer.py
+  h_15da545fc8cfbe 3,64-103,127-130,169-172,174-178
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 733-734,1791-1792
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ba5ee7689a12744191e12f23cf32ebcf19969bb1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
