@@ -239,10 +239,10 @@ RUN --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.ccache-cross,sha
     ./tools/flashinfer-build.sh && \
     uv build --python /opt/venv/bin/python --no-build-isolation --wheel \
       --out-dir /wheels-flashinfer ./third_party/flashinfer/flashinfer-cubin && \
-    uv pip install --system --no-index --find-links /wheels-flashinfer \
+    uv pip install --python /opt/venv/bin/python --no-index --find-links /wheels-flashinfer \
       'flashinfer-cubin==0.6.18' && \
-    uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl && \
-    uv pip install --system --no-deps \
+    uv pip install --python /opt/venv/bin/python /wheels-flashinfer/flashinfer_python-*.whl && \
+    uv pip install --python /opt/venv/bin/python --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
     { ccache -sv | tee /src/ccache-stats-flashinfer.txt; \
       ccache --print-stats | tee -a /src/ccache-stats-flashinfer.txt; \
