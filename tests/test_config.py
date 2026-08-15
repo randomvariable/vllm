@@ -31,6 +31,7 @@ from vllm.config import (
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.config.load import LoadConfig
+from vllm.config.speculative import _requires_host_draft_token_ids
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
 from vllm.platforms import current_platform
@@ -1908,17 +1909,14 @@ def test_dspark_capacity_config_validation():
         )
 
 
-
-def test_speculative_config_requires_host_draft_token_ids():
-    assert SpeculativeConfig(
-        method="dspark", num_speculative_tokens=1
-    ).requires_host_draft_token_ids()
-    assert SpeculativeConfig(
-        method="dflash", num_speculative_tokens=1
-    ).requires_host_draft_token_ids()
-    assert not SpeculativeConfig(
-        method="ngram", num_speculative_tokens=1
-    ).requires_host_draft_token_ids()
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [("dspark", True), ("dflash", True), ("ngram", False)],
+)
+def test_speculative_config_requires_host_draft_token_ids(method, expected):
+    config = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    assert _requires_host_draft_token_ids(method) is expected
+    assert config.requires_host_draft_token_ids() is False
 
 
 def test_nvfp4_mla_cache_dtype_is_normalized():

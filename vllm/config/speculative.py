@@ -83,6 +83,10 @@ RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
+def _requires_host_draft_token_ids(method: SpeculativeMethod | None) -> bool:
+    return method in ("dflash", "dspark")
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -1596,7 +1600,7 @@ class SpeculativeConfig:
 
     def requires_host_draft_token_ids(self) -> bool:
         """Whether async scheduling needs the actual draft ids on the host."""
-        return self.method in ("dflash", "dspark")
+        return _requires_host_draft_token_ids(self.method)
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
