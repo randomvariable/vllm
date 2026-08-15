@@ -1,0 +1,1102 @@
+docs/contributing/kernel_targets/execution_model.md
+  s_944cef61b41816::t_8ec52361a20b5e 1-342
+homelab/spark.Dockerfile
+  s_944cef61b41816::t_c53fd3d55fddc5 1-209
+vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+  s_944cef61b41816::t_9dfd48c8b13bda 17,66-147,189,191-192,195-196,198-200,202-204,206,208-218,220-228,242-264,266-289,291-314,499-500,539-548
+vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py
+  s_944cef61b41816::t_97b71b5da38282 1-163
+tests/config/test_virtual_tp.py
+  s_944cef61b41816::t_0573d3178570a0 1-959
+vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+  s_944cef61b41816::t_15ea5c1c285261 4-5,7,12,34-79,100,120-126,137-194,300,327,371,373-374
+csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_helper.hpp
+  s_944cef61b41816::t_1435798375350a 33,42
+vllm/v1/attention/backends/registry.py
+  s_944cef61b41816::t_aa0c4ad1af9c60 97-103
+tests/v1/spec_decode/test_dflash_prefix_cache_masking.py
+  s_944cef61b41816::t_eba467d4379b6c 1-170
+vllm/v1/spec_decode/forward_timer.py
+  s_944cef61b41816::t_2fed326fdf41f0 1-169
+vllm/config/compilation.py
+  s_944cef61b41816::t_0ed1f71a1e6a0e 777,1187,1231-1235,1300,1519-1521,1531-1545,1547-1548,1559-1561,1564-1573,1577,1579,1582-1592,1594,1596-1598
+vllm/v1/attention/backends/mla/indexer.py
+  s_944cef61b41816::t_0f94de3a8f82a1 3,10,27,41-45,50-57,136,193-198,232,429,437-451,462-466,468,548,554,558-577,646,660-677,679-682,693-699,706-708,714-717,757,812-824,828-829,832-835,904,942,957,966-968,992-1019,1064,1119-1122,1132-1140,1143-1150,1152,1163-1206,1212-1221,1231,1317,1330,1357-1433
+  h_15da545fc8cfbe 504-517,941,1113
+vllm/parser/abstract_parser.py
+  s_944cef61b41816::t_160cf7218758dd 40,57-59,530-545,567-575,578,591-607,776-780,854-867,870-996,1011,1067-1082
+tests/quantization/test_quantization_config_args.py
+  s_944cef61b41816::t_10e71339677100 73-77,114-189
+vllm/model_executor/models/qwen3_next.py
+  s_944cef61b41816::t_e23b15aca15a00 51,181-185,268-277,287-288,477-481
+homelab/atom_reference/README.md
+  s_944cef61b41816::t_2476a92f56dd8d 1-84
+tests/entrypoints/openai/chat_completion/test_thinking_token_budget_validation.py
+  s_944cef61b41816::t_528c95ae9fd698 45-67,100-179
+tests/v1/core/test_kv_cache_utils.py
+  s_944cef61b41816::t_0617f6580f68ea 198-229,1667-2229,2562-2564,2735,2756,2766,3547-3591
+tests/models/test_deepseek_v2_index_topk.py
+  s_944cef61b41816::t_486be7ea5c8773 1-32
+csrc/libtorch_stable/cache_kernels.cu
+  s_944cef61b41816::t_100e5922921411 10-15,195-245,555-645,874-875,936-940,948-952,989-995,1016-1025,1027-1037,1039-1044,1050-1069
+homelab/devloop/src/artifacts.rs
+  s_944cef61b41816::t_547f9c07498b78 1-145
+vllm/models/minimax_m3/common/ops/index_topk.py
+  s_944cef61b41816::t_76fa3bfca97dc6 92,106,151,293-294,307,324,351-352,397-399,544-546,650-652,668,701,781,850
+vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+  h_15da545fc8cfbe 147-148
+tests/distributed/test_indexer_parallel_groups.py
+  s_944cef61b41816::t_3e698a51b11a14 1-131
+docs/design/attention_backends.md
+  s_944cef61b41816::t_33e4008a14951e 3-12,101-119,123-134,160-178,192-194,207-212,216,223-239,250-254
+vllm/v1/core/kv_cache_coordinator.py
+  s_944cef61b41816::t_c17efa7f6dd733 15-16,152-156,202,207-216,219-228,230-232,273-293,298-315,341-350,352-389,391,691-707,711-723,727-729,731-735,737,826-842,844-846,914-918
+vllm/model_executor/models/utils.py
+  s_944cef61b41816::t_fde67eb05c0c93 898-902,905-930
+vllm/models/deepseek_v4/nvidia/dspark.py
+  s_944cef61b41816::t_186a7a1a46d7db 29-34,147-158,200-203,318-321,359-387,390-400,525-528,539
+vllm/third_party/flash_linear_attention/ops/utils.py
+  s_944cef61b41816::t_d4ff7895c91799 108-109,111
+vllm/v1/attention/ops/chunked_prefill_paged_decode.py
+  s_944cef61b41816::t_6c8d48372deb3f 149-158,162,381-384,397-411,418-423,467-476
+docs/contributing/homelab-hard-requirements.md
+  s_944cef61b41816::t_d6af8cc95a0746 1-154
+cmake/utils.cmake
+  s_944cef61b41816::t_0c5d5bed3eb5c7 8-24,26-30
+vllm/v1/structured_output/__init__.py
+  s_944cef61b41816::t_65693c83d28a4c 262,286,381-383,389,413-417,419-421,429-430,433-448
+vllm/model_executor/layers/quantization/online_int8_moe.py
+  s_944cef61b41816::t_8f01bc8c7c5dfb 1-386
+vllm/models/minimax_m3/common/ops/sparse_attn.py
+  s_944cef61b41816::t_79faa37b6066aa 411-413,466-468
+vllm/v1/worker/gpu/spec_decode/dflash/__init__.py
+  s_944cef61b41816::t_5d1bbff4b857c3 1-2
+vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+  s_944cef61b41816::t_edf344c1851451 14,22-23,25,27,280-295,316-323,338,364-375,382-383,388,400-454,489-490,493-494,499-502,525-536,540,557
+vllm/model_executor/parameter.py
+  s_944cef61b41816::t_589d1daa0c11d1 17,151-152,173-174,197-198,223-224
+docs/contributing/kernel_targets/local_inference_lab_ds4_import.md
+  s_944cef61b41816::t_e587e259b5040f 1-77
+docs/configuration/model_resolution.md
+  s_944cef61b41816::t_b49991ac37f94d 24-54
+vllm/model_executor/models/hy_v3.py
+  s_944cef61b41816::t_7abeb818a42367 551
+tests/distributed/test_b12x_fused_all_reduce.py
+  s_944cef61b41816::t_d8671a6d8076a9 1-397
+vllm/v1/worker/startup_plan.py
+  s_944cef61b41816::t_e89384b356d52b 134-155,159-160,162,192-195
+vllm/v1/attention/backends/mla/compressor_utils.py
+  s_944cef61b41816::t_644830e0f33afb 34-36,56-75,78-80,83,95-97,121-123
+homelab/devloop/src/probe.rs
+  s_944cef61b41816::t_8699ff152a6280 1-343
+tests/kernels/test_fla_layernorm_guard.py
+  s_944cef61b41816::t_714447f9f2abb1 7,107-117
+vllm/entrypoints/openai/api_server.py
+  s_944cef61b41816::t_5c549eb2409600 55-59,112-124,284
+vllm/config/kernel.py
+  s_944cef61b41816::t_c4ed94cc94c4e1 128,134,146,204,211-216,231
+vllm/model_executor/models/qwen3_5_mtp.py
+  s_944cef61b41816::t_6fe12922535ca5 32,97-101,104,161
+vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+  h_15da545fc8cfbe 60-65,70-72
+  s_944cef61b41816::t_c0995c5c33e726 11-51,111-115,117-119
+vllm/model_executor/kernels/mhc/triton.py
+  s_944cef61b41816::t_3f909aeeda9644 152-159,161,172-212,218-219
+tests/v1/metrics/test_loggers.py
+  s_944cef61b41816::t_2ceae01f265e58 1-72
+vllm/v1/engine/detokenizer.py
+  h_15da545fc8cfbe 3,64-103,127-130,169-172,174-178
+tests/v1/worker/test_gpu_sampling_states_seed.py
+  s_944cef61b41816::t_d721d27c881b81 1-35
+tests/models/test_dcp_shard_draft_defaults.py
+  s_944cef61b41816::t_d838f6a1144ab5 1-239
+vllm/v1/worker/gpu/buffer_utils.py
+  s_944cef61b41816::t_b3344830bb352d 167
+csrc/rocm/moe_q_gemm_rdna3.cu
+  s_944cef61b41816::t_cbf0cbccf3fbe0 30
+tests/model_executor/test_minimax_m3_msa_warmup.py
+  s_944cef61b41816::t_60996aa14c317f 1-96
+.tekton/pull-request.yaml
+  s_944cef61b41816::t_d1fe8628167e6d 1-95
+vllm/compilation/passes/fusion/sequence_parallelism.py
+  s_944cef61b41816::t_917a35c88ecdd5 43-47,57
+vllm/models/deepseek_v4/attention.py
+  h_15da545fc8cfbe 110-115,118
+  s_944cef61b41816::t_419d50f20ca5b1 9,41-45,54,56,60,84,153-159,197-211,218,221,225-226,248-249,293-299,308-314,326-328,336,348,351-353,355-356,402-534,550-557,559-575,578-595,598-610,683-781,845-846,909,921-929,933-1039,1063-1064,1095,1135-1141,1145-1147,1151-1155,1185-1186,1191-1192,1208-1212,1246-1253
+vllm/v1/utils.py
+  s_944cef61b41816::t_02013f5a1b51b8 721-723,762-768,779
+vllm/v1/worker/gpu/sample/bad_words.py
+  s_944cef61b41816::t_86b22bae771bdd 157-159,161
+vllm/v1/attention/ops/triton_unified_attention.py
+  s_944cef61b41816::t_5eee160140c247 519,567,1027-1034,1041
+tests/v1/attention/test_b12x_ckv_prefetch_policy.py
+  s_944cef61b41816::t_9785bdfc3da554 1-441
+csrc/libtorch_stable/cooperative_topk.cu
+  s_944cef61b41816::t_5129964655b9ff 87
+homelab/atom_reference/spec_decode/dspark_scheduler.py
+  s_944cef61b41816::t_76a06810684868 1-320
+vllm/sampling_params.py
+  s_944cef61b41816::t_5cf905e6520aef 74-118,123-130,420-450,475-476,540-541,580-585,701-719
+docs/contributing/kernel_targets/memory_model.md
+  s_944cef61b41816::t_e66223bebc684c 1-419
+vllm/model_executor/layers/vocab_parallel_embedding.py
+  s_944cef61b41816::t_5eb153b38c722b 30,264
+vllm/config/speculative.py
+  s_944cef61b41816::t_d45bb4ac659b07 6,67,251-278,1378-1384,1442-1483
+  h_15da545fc8cfbe 86-89,1572-1575
+tests/quantization/test_moe_wna16.py
+  s_944cef61b41816::t_661ed9b777053f 15-20,29-34,37-40,51-91
+docs/deployment/integrations/llm-d.md
+  s_944cef61b41816::t_6311246d92e54b 38-39
+tests/rocm/test_moe_weight_replay.py
+  s_944cef61b41816::t_b41bad279c2510 1-305
+vllm/distributed/parallel_state.py
+  s_944cef61b41816::t_9c7a27563bd994 644,738-796,1461-1573,1582-1622,1687-1706,2074,2102-2162,2391-2410
+tests/v1/worker/test_gpu_block_table.py
+  s_944cef61b41816::t_8a658fbf2335ec 8,136,140-142,146-156,158-174,177-210,212-278
+vllm/model_executor/models/mimo_v2.py
+  s_944cef61b41816::t_881ff6205e01e4 3,74-79,294-296,305-317,321-333,346,362-368,370-373,632-643,646-647,649,658-662,911-916
+vllm/platforms/cuda.py
+  s_944cef61b41816::t_afe4b49b483df8 285-288,813-839,1030-1037
+vllm/utils/numa_utils.py
+  s_944cef61b41816::t_4ba7c33cf0042c 604-760
+vllm/distributed/device_communicators/all_reduce_utils.py
+  s_944cef61b41816::t_55c032d803761f 71-77,82-88
+tests/model_executor/layers/test_b12x_moe_warmup.py
+  s_944cef61b41816::t_4afd0b23306d4d 1-664
+tests/models/deepseek_v4/test_b12x_mhc_expected_m.py
+  s_944cef61b41816::t_877f9606845f03 1-243
+tests/v1/worker/test_mixed_warmup_gate.py
+  s_944cef61b41816::t_9fa568fe2fa08f 9-13,20-37
+vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
+  s_944cef61b41816::t_60c3b7afe3f766 759-761
+vllm/models/minimax_m3/common/sparse_attention.py
+  s_944cef61b41816::t_40f93b277b2ea6 18,24,63-64,181,242,299,357-405,442,470-477,498-505,509,514-521,523-546,568,574-575
+csrc/libtorch_stable/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm120.cu
+  s_944cef61b41816::t_f092038961a33c 1-132
+csrc/libtorch_stable/cutlass_extensions/common.cpp
+  s_944cef61b41816::t_3dbbdb61395b86 2,4,6-9,12
+vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+  s_944cef61b41816::t_cac0736e9925b4 9,26-33,39,88-94
+vllm/model_executor/layers/fused_allreduce_gemma_rms_norm.py
+  s_944cef61b41816::t_054eb0fd1cb173 120-123
+csrc/libtorch_stable/torch_bindings.cpp
+  s_944cef61b41816::t_b1cecc37ee6348 327-332,925-928,1028-1029
+VLLM.md
+  s_944cef61b41816::t_4dad8b4844c4d3 1-110
+csrc/libtorch_stable/attention/mla/safe_query_bmm.cu
+  s_944cef61b41816::t_8a17df8b3680fa 1-106
+vllm/v1/core/sched/scheduler.py
+  h_15da545fc8cfbe 759-767,774-788
+tests/v1/attention/test_b12x_attn.py
+  s_944cef61b41816::t_64c73a42ee3021 1-262
+vllm/entrypoints/openai/completion/protocol.py
+  s_944cef61b41816::t_a56b0d2e17b227 9,30,36,252-266,420-421
+vllm/model_executor/layers/fused_moe/router/triton_topk_softmax.py
+  s_944cef61b41816::t_362e3719b019c0 1-112
+homelab/rocm-dev-test.sh
+  s_944cef61b41816::t_e09e94ce38a3af 1-140
+vllm/_custom_ops.py
+  s_944cef61b41816::t_32924f6763af9a 1025,2730-2732,2738-2756,2759,2761,2763-2765,3141,3143-3146,3148-3149,3151,3535,3918,3920-3921,3947
+.github/workflows/scripts/build.sh
+  s_944cef61b41816::t_b30ccc75445838 23-27
+vllm/model_executor/layers/quantization/quark/quark_moe.py
+  h_15da545fc8cfbe 1662-1663
+homelab/atom_reference/plugin/gdn_backend_compaction.py
+  s_944cef61b41816::t_01dc83d6f61062 1-121
+tests/utils_/test_mem_utils.py
+  s_944cef61b41816::t_229e67a12773d0 8-12,155-204
+benchmarks/kernels/benchmark_moe.py
+  s_944cef61b41816::t_0fe8c10d1895d4 18-26,531-619,918-919,921-931,1055-1062,1098-1102,1115,1118-1139,1206-1212
+tests/v1/attention/test_indexer_dcp_localize.py
+  s_944cef61b41816::t_10e7df5bb5c21f 4-5,10,13-18,24,31-127,198-207,350-351,369,372,425-437,460-463
+vllm/_aiter_ops.py
+  s_944cef61b41816::t_041fb65676ddb0 138,150-154,157,159
+vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+  s_944cef61b41816::t_8a6c43661f294f 1100,1103,1106,1114,1117,1120
+docs/configuration/README.md
+  s_944cef61b41816::t_30cd9bb1cc64af 10-56
+vllm/model_executor/warmup/deepseek_v4_compressor_warmup.py
+  s_944cef61b41816::t_62812a94a911b3 1-189
+tests/parser/engine/test_qwen3_reasoning.py
+  s_944cef61b41816::t_9a37d9aad7752b 195-245
+vllm/v1/metrics/loggers.py
+  s_944cef61b41816::t_57d9479d530d0d 150-154,215
+homelab/strix.Dockerfile
+  s_944cef61b41816::t_f338da2f51bd5b 1-359
+vllm/compilation/cuda_graph.py
+  s_944cef61b41816::t_fc5be02d000d32 15-18,31,317-330,332-341
+vllm/engine/arg_utils.py
+  h_15da545fc8cfbe 539-540,1543-1550,2360-2361
+  s_944cef61b41816::t_44b277d18d35dd 534-535,559,601,649,664,1212-1216,1219-1221,1491-1494,1648-1653,1872-1876,1963,2033,2756
+tests/distributed/test_pcie_comm_gates.py
+  s_944cef61b41816::t_b604f00a6236fb 1-148
+vllm/model_executor/warmup/dflash_spec_decode_warmup.py
+  s_944cef61b41816::t_eb223361174dee 1-26
+tests/v1/spec_decode/test_dynamic_sd.py
+  s_944cef61b41816::t_706ea4bbdf01e7 34,45-47,252-278
+vllm/v1/attention/ops/common.py
+  s_944cef61b41816::t_af22eecf9e7bbd 3-4,9,54,77,87-91,214-219,267,282-320
+vllm/parser/deepseek_v4.py
+  s_944cef61b41816::t_432719058e78e9 51-56,144-145,152-153,208-229
+tests/quantization/test_trtllm_nvfp4_hidden_dim_padding.py
+  s_944cef61b41816::t_5217f4ffc625b9 4,8-10,67-126
+tests/v1/attention/test_mla_backends.py
+  s_944cef61b41816::t_3a8b9b5aa3c68e 25-27,34-36,68-141,171-239,301-792,1132-1447,1730,1733,1735-1736,1816-1818,2042-2069,2118-2143,2427-2429,2431-2436
+vllm/v1/kv_offload/config.py
+  s_944cef61b41816::t_21dfcbbfa25872 25-27
+vllm/models/deepseek_v4/common/rope.py
+  s_944cef61b41816::t_23550c257e9bea 5-6,19,23-24,40-43
+tests/model_executor/test_flashinfer_autotune_cache.py
+  s_944cef61b41816::t_b051ff39da3f9e 1-413
+vllm/config/cache.py
+  s_944cef61b41816::t_72685d68bb0f5a 28,50,71,74-94,199-208,236,293-347
+csrc/rocm/torch_bindings.cpp
+  s_944cef61b41816::t_61e9e2e2d6c399 55-56,72-79
+vllm/v1/metrics/stats.py
+  s_944cef61b41816::t_ccd8dfa52b7dbd 216-218
+vllm/transformers_utils/configs/laguna.py
+  s_944cef61b41816::t_7a0cc420c2f108 72-126
+scripts/verify-dsv4-027-equality-gate.py
+  s_944cef61b41816::t_0e73543375715e 1-73
+tests/utils_/test_system_utils.py
+  s_944cef61b41816::t_10de0a96a09d72 4-5,10-18,38-130
+docs/contributing/mia-dspark-patch-manifest.md
+  h_15da545fc8cfbe 1-52
+homelab/atom_reference/fla/fused_cumsum_kkt.py
+  s_944cef61b41816::t_e07d503e5338bb 1-147
+vllm/config/virtual_tp.py
+  s_944cef61b41816::t_3d099c5f87ccea 1-1016
+vllm/v1/engine/core.py
+  s_944cef61b41816::t_8ed25104b2b479 50,167-171,321-325,329,611-616,620-634,637,729-734,743-745,1012-1014,1088-1092,1326-1328,1941,1946-1947,1977,2114,2119,2143-2145,2218,2250,2265-2267,2272-2274,2276,2279-2282,2304-2315,2319,2328,2500-2503
+vllm/model_executor/models/qwen3_next_mtp.py
+  s_944cef61b41816::t_ee8f7a75934f1f 27,76-80,83,131
+vllm/model_executor/models/glm_ocr_mtp.py
+  s_944cef61b41816::t_38b97eeda3fa20 134,145-158
+tests/quantization/test_nvfp4_nf3_hybrid.py
+  s_944cef61b41816::t_843cb59f417b56 1-111
+docs/features/quantization/online.md
+  s_944cef61b41816::t_604703c488ec59 70-72,76-80,93-160
+vllm/v1/attention/backends/fa_utils.py
+  s_944cef61b41816::t_550af6f3dd4d00 17-24,28-53,328-331
+benchmarks/kernels/benchmark_sliding_window_paged_decode.py
+  s_944cef61b41816::t_34f3bd0d1d3d12 1-971
+vllm/model_executor/virtual_tp.py
+  s_944cef61b41816::t_4cfe156edc8b03 1-146
+tests/quantization/test_modelopt.py
+  s_944cef61b41816::t_febe7607981feb 9,18-19,47,52,68-71,117-243,245-248,250-284,287-292,294,625,631-633,715,718,723-725,728,768-960
+vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+  s_944cef61b41816::t_cfea4cf1c27d80 3,12,24,47,63-69,121-126,170,215-222,225,237-238,285,290-291,297-314,354,365-410,488,491,565-567,576-579,585-586,589,597-598,623-624,635,651-653
+  h_15da545fc8cfbe 212
+vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  s_944cef61b41816::t_4a2fb2a4ca10b1 22,160-174
+tests/entrypoints/test_cli_main.py
+  s_944cef61b41816::t_fba924f9b99c31 1-45
+vllm/v1/worker/cp_utils.py
+  s_944cef61b41816::t_46dc73c689920f 40-50,56-60,67
+vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+  s_944cef61b41816::t_7ccff0fda249eb 204-222,323-329,369-379
+tests/model_executor/layers/test_b12x_ep_moe.py
+  s_944cef61b41816::t_e862f64df12652 1-371
+vllm/parser/engine/parser_engine.py
+  s_944cef61b41816::t_bfa5a74c8145ac 189-198
+vllm/v1/worker/gpu_worker.py
+  s_944cef61b41816::t_d3872d56596d35 53-57,59-61,75,108-122,185,188,230-233,258,265,268-271,424-425,477-504,525-528,543,551,553-579,588-589,667-668,671-742,794-797,847,886,888,909-912,914,917,971-975,1065-1077,1317,1324,1371-1376,1388-1390,1409-1411
+  h_15da545fc8cfbe 58
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+  s_944cef61b41816::t_45a80f5e32d40b 296-305,309-311,314,319-320
+tests/kernels/mamba/test_mamba_mixer2.py
+  s_944cef61b41816::t_c5a3ed1a707aa2 4,14-17,22-46,136,141
+csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu
+  s_944cef61b41816::t_3d56f36ae32069 393,431
+vllm/v1/core/block_pool.py
+  s_944cef61b41816::t_f684e1e13526b7 285-294
+vllm/config/__init__.py
+  s_944cef61b41816::t_a21a5a3584097e 54-56,141-142
+tests/model_executor/layers/test_mxfp4_w2_realign.py
+  s_944cef61b41816::t_6c9d3e347583e1 1-107
+homelab/toolbox/models.yaml.example
+  s_944cef61b41816::t_9576e27473c339 1-35
+tests/v1/spec_decode/test_dspark_fp8_draft_head.py
+  s_944cef61b41816::t_ba9698fe7ef401 1-144
+tests/kernels/test_safe_mla_query_bmm.py
+  s_944cef61b41816::t_ae40b1c9eb5f1a 1-77
+vllm/v1/spec_decode/dflash.py
+  s_944cef61b41816::t_df9edf299d55c6 9,13,16,36,61-65,81,105-134,138-147,164,167-242,263,272,280-317,319-322,344,417,423,438-440,442-484
+homelab/atom_reference/fla/chunk_fused.py
+  s_944cef61b41816::t_d31ce720ca3cfc 1-501
+vllm/platforms/__init__.py
+  s_944cef61b41816::t_c65ab7513bb672 110-129,148-151
+tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+  s_944cef61b41816::t_f70ce3338c4b10 318,320
+csrc/rocm/q_gemm_rdna3.cu
+  s_944cef61b41816::t_aa7b5f6fff7206 36,48,711,717-728,759-770
+tools/generate_cmake_presets.py
+  s_944cef61b41816::t_e045e7fe74cc07 7,30-31,33-160,162-168,188-246,269-281,296-340,359-360,370-371
+tests/v1/spec_decode/test_async_draft_output.py
+  s_944cef61b41816::t_6622afa796c5d3 1-32
+vllm/v1/attention/backends/mla/sparse_utils.py
+  s_944cef61b41816::t_e73a0474b9bca4 10-150,246,255,258,316,324,327-329,357,392-393,421-423,436,442-445,447-451,453-456,459-468,485
+vllm/compilation/b12x_capture.py
+  s_944cef61b41816::t_7c9edc7beefb6d 1-53
+tests/v1/worker/test_utils.py
+  s_944cef61b41816::t_df1de84bb0b8e6 4-6,9-17,104-182
+homelab/atom_reference/moe/moe_gu_interleave.py
+  s_944cef61b41816::t_4c64020d06551a 1-120
+tests/v1/engine/test_engine_core_client.py
+  s_944cef61b41816::t_dd045fafd1c384 344-397
+vllm/model_executor/layers/quantization/utils/fp8_utils.py
+  s_944cef61b41816::t_81a3dbc56da251 1123-1128,1164
+vllm/v1/attention/ops/triton_decode_attention.py
+  s_944cef61b41816::t_e287743d1c7854 533-547
+tests/model_executor/test_b12x_mxfp4_moe.py
+  s_944cef61b41816::t_a4a41a3d1288a6 1-746
+tests/v1/attention/test_rocm_attention_backends_selection.py
+  s_944cef61b41816::t_f7aa54d768ad6d 225,228-234,334-435,457-700
+vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+  s_944cef61b41816::t_9dfcb7dd11dcda 12,351-361
+vllm/v1/executor/multiproc_executor.py
+  s_944cef61b41816::t_fbe67772f956bd 60,125-139
+tests/model_executor/layers/test_sparse_attn_indexer_b12x.py
+  s_944cef61b41816::t_641a92c2afe028 1-1636
+docs/contributing/kernel_targets/toolchain.md
+  s_944cef61b41816::t_c1edcaa19c9298 1-285
+vllm/config/vllm.py
+  h_15da545fc8cfbe 623,2468,2471
+  s_944cef61b41816::t_3cf60aeb172bb7 42,92-132,185,196-202,707,712-716,943-949,1094-1096,1268-1272,1322,1342,1348-1350,1352-1356,1359-1361,1363,1431,1445,1463-1465,1542,1577,1589,1598,1631,1821-1828,1832,1840,1846,1894,1918-1919,1944,2282,2284,2364-2367,2382-2388,2393-2396,2410-2415,2449-2456,2467
+vllm/model_executor/layers/sparse_attn_indexer.py
+  s_944cef61b41816::t_dd28094956e9ff 5-6,13-16,23,42-55,58-762,838,1012-1655,1678-1680,1690-1710,1715-1716,1720-1781,1783-1790,1824-1852,1875,1904-1908,1917-1931,1933-2084,2164-2173,2178-2268,2271,2307,2326,2329,2333-2334,2338,2341,2344,2387-2389,2449-2451,2453,2460,2491-2495,2506-2508,2517-2533,2535-2546,2603-2606
+  h_15da545fc8cfbe 1672,1711-1714,1808-1816,1883-1885,2443,2511
+homelab/atom_reference/kernels/swiglu_oai.py
+  s_944cef61b41816::t_68cc8e1e6a2938 1-104
+vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+  s_944cef61b41816::t_b7ef5147312b64 229
+vllm/entrypoints/cli/main.py
+  s_944cef61b41816::t_44f62fe7dce58e 9,18-36,38-39
+docs/contributing/kernel_targets/porting_sm120_to_gfx1151.md
+  s_944cef61b41816::t_4d22a60d586f0e 1-415
+tests/v1/attention/test_deepseek_v4_sparse_mla_metadata.py
+  s_944cef61b41816::t_09560f11cbfe44 1-140
+vllm/models/deepseek_v4/common/ops/__init__.py
+  s_944cef61b41816::t_d25cbf94cd07a2 7,21
+vllm/model_executor/layers/mamba/mamba_mixer2.py
+  s_944cef61b41816::t_75d609fb65ecac 179-180,188-190,194-195,198,206-211,227,233-240,244
+tests/v1/worker/test_gpu_rejection_sampler_dist.py
+  s_944cef61b41816::t_34e98de8034827 1-116
+vllm/v1/kv_offload/file_mapper.py
+  s_944cef61b41816::t_bf38dee27e1476 38-39,79-81,114-115
+tests/v1/attention/test_attention_splitting.py
+  s_944cef61b41816::t_1ac08eef275b22 9-13,194-293
+vllm/v1/worker/gpu/async_utils.py
+  s_944cef61b41816::t_57cd597c97b050 15,126,134-135,137-138,141,172-192,195,206-209,216-226
+rust/src/chat/src/output/default/structural_tag.rs
+  s_944cef61b41816::t_e578c7e3479e89 25,47-49,54,155,219,234,249,266,286,299,314,320-360
+tests/model_executor/test_flashinfer_b12x_moe.py
+  s_944cef61b41816::t_eaf19089eceb46 1-306
+vllm/model_executor/layers/fused_moe/oracle/fp8.py
+  s_944cef61b41816::t_71e6f032d105ed 4,124-130,327,490,510-513,723
+csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu
+  s_944cef61b41816::t_77e97f326ab2f9 63-64,82,84,128,130,146,148,164,167
+homelab/atom_reference/attention/attention_gdn.py
+  s_944cef61b41816::t_265423dca80ce3 1-424
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+  s_944cef61b41816::t_a68ed1d7315598 18-20,40-44,93,146-148
+docs/configuration/conserving_memory.md
+  s_944cef61b41816::t_00d44c3c5ba463 78-125
+docs/contributing/kernel_targets/sm120.md
+  s_944cef61b41816::t_2cf00b87ac83ab 1-234
+vllm/v1/core/sched/async_scheduler.py
+  s_944cef61b41816::t_21741932bed17b 23-25
+PIN.md
+  s_944cef61b41816::t_cdef11cdb2b233 1-31
+homelab/atom_reference/attention/triton_fused_qkv_norm_rope_cache.py
+  s_944cef61b41816::t_9f93e9915ddb6a 1-418
+vllm/models/deepseek_v4/nvidia/model.py
+  s_944cef61b41816::t_01ba2e867b9696 6,13,15,24,51,53,75,87-148,666-668,762-767,833-834,851-852,871,876-887,896,898,923-938,968-1295,1305-1352,1408,1436-1443,1471-1473,1482-1492,1498,1512,1541-1542,1555-1560,1591,1604,1622-1635,1641-1649,1658,1705,1710,1783-1785,1789,1796,1839-1844,1941,1946,1993,2010
+docs/contributing/README.md
+  s_944cef61b41816::t_77e99d168f0a8b 75-76,143-148
+tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+  s_944cef61b41816::t_ce27ca3bd80d04 4,25,68,71-74,76,78,82-83,85-86,88-112,114,116-118,120-122,124-127,164-167,169,171-173,175-179,181,183,185-186,188,191-193,196-201,205,211,216,218-220,223-224,230,235-236,238-240,341,349,407,426,429,431-433,470-471,481-482,495,527,539,591,688,701-707,710-711,713,902,906,910,914,918,922,928,935,941,949,957,1111,1142,1188,1239,1465,1519-1520,1556-1558,1561,1564-1565,1653-1655,1769,1848,2668,2702,2804,2860-2861
+examples/deployment/deepseek-v4-flash-dspark-llmd.yaml
+  s_944cef61b41816::t_f32ebdd8ae1bdb 1-42
+vllm/envs.py
+  s_944cef61b41816::t_99d86727ff3d55 54,62-94,101,174,203-205,254-260,305-306,354,614-615,617,621,627-629,928-929,975,977,1073,1129-1275,1570-1575,1596-1599,1616-1630,1838,1929-1961,2071-2073,2089-2102,2332-2335,2378-2394
+  h_15da545fc8cfbe 192-193,1584-1587
+.buildkite/test-amd.yaml
+  s_944cef61b41816::t_1ee7db0ea680fe 2466-2467,2469,2474
+tests/v1/spec_decode/test_spec_telemetry.py
+  s_944cef61b41816::t_7434dd4f9fa084 1-203
+csrc/libtorch_stable/cooperative_topk.cuh
+  s_944cef61b41816::t_284d7f117f7e17 144-153,158,214,271-273,354,385,395,408,457,545
+tests/v1/worker/test_attn_utils.py
+  s_944cef61b41816::t_fd0c6e2443f48f 4-5,8,12,16-17,19,164-261
+tests/models/test_deepseek_v2_indexer_loader.py
+  s_944cef61b41816::t_f67fc53fba4f5b 1-117
+.devcontainer/devcontainer.json
+  s_944cef61b41816::t_41bad9e049c4e4 1-48
+vllm/distributed/device_communicators/symm_mem_pcie_barrier.py
+  s_944cef61b41816::t_8899a117ccc5ff 1-364
+csrc/libtorch_stable/ops.h
+  s_944cef61b41816::t_933b5fd3499019 186-196,212-217,606-610
+tests/model_executor/layers/test_mla_cache_format.py
+  s_944cef61b41816::t_468c933a88566e 1-114
+vllm/model_executor/warmup/deep_gemm_warmup.py
+  s_944cef61b41816::t_da1c08d2d44344 153-155,364-367,371-373,384-386,401-403
+vllm/models/minimax_m3/amd/model.py
+  s_944cef61b41816::t_85f2f3f12e8f47 21,1137-1140,1368-1386,1391-1395
+vllm/tool_parsers/deepseekv4_engine_tool_parser.py
+  s_944cef61b41816::t_74d21626e81230 4,10-14
+vllm/multimodal/gpu_ipc_memory.py
+  s_944cef61b41816::t_faa14dabd867cb 202,242-244
+vllm/config/observability.py
+  s_944cef61b41816::t_a8ddff6c373441 60-64
+tests/kernels/attention/test_cache.py
+  s_944cef61b41816::t_f8a5840c6c3681 908-1026
+vllm/models/minimax_m3/nvidia/sparse_attention_b12x.py
+  s_944cef61b41816::t_911b280f349769 1-1182
+tests/quantization/test_compressed_tensors.py
+  s_944cef61b41816::t_f5fdc6275ed428 28,69-97
+tests/model_executor/model_loader/test_safetensors_prefix_filter.py
+  s_944cef61b41816::t_e4777966ba0e72 1-83
+vllm/models/deepseek_v4/sparse_mla.py
+  s_944cef61b41816::t_da54c5da2c8cec 138,149-160,164-175,230-249,261-263,268-276,308-311,321,332-340,347,356-358,402,411-413,420-421,447,453-455,475,481-483,494-499,502,508-545,554,560
+  h_15da545fc8cfbe 122-126,277-283,290,376-387
+tests/kernels/attention/test_minimax_m3.py
+  s_944cef61b41816::t_a1d67e36480d57 261,282,613,629
+vllm/reasoning/minimax_m3_reasoning_parser.py
+  s_944cef61b41816::t_7bda8a8055d59a 43-44,314-319
+vllm/model_executor/layers/fused_moe/routed_experts.py
+  s_944cef61b41816::t_4e6aa3e2ef7197 4,29-33,41-44,213-230,365-366,378-379,401-402,522,532-537,541-546,555-560,564,568,577-578,582,588-614,617-622,624-628,632,636,758-767,897-898,929-930,962-963,975-982,989-992
+requirements/build/rocm.txt
+  s_944cef61b41816::t_75ce9c36b3bc8d 5-9,17
+homelab/atom_reference/kernels/fused_aux_rmsnorm.py
+  s_944cef61b41816::t_f30eca17e8d65f 1-194
+tests/model_executor/model_loader/test_reload.py
+  s_944cef61b41816::t_a93c8089d828d3 686-709
+csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+  s_944cef61b41816::t_d34a6b4c9577bf 22
+docs/contributing/kernel_targets/numerics.md
+  s_944cef61b41816::t_59eb2f14f3382c 1-393
+tests/v1/core/test_single_type_kv_cache_manager.py
+  s_944cef61b41816::t_3a6b3d8725882e 605-648
+vllm/v1/spec_decode/llm_base_proposer.py
+  s_944cef61b41816::t_d231b2add682b7 5,29,43-47,67,74-83,147-149,173-174,454-489,492,494,499,533,536-537,650,681,702,785,808-810,819-821,1074-1078,1346-1353,1356-1357,1359,1364-1372,1376-1378,1380-1381,1385,1412-1421,1435-1446,1472,1488,1505-1513,1573,1575,1807-1809,1824-1880,1883-1885
+vllm/model_executor/kernels/linear/mixed_precision/rdna3_w4a16.py
+  s_944cef61b41816::t_9327df58fb7466 3,5,31,39,41-42
+tests/kernels/moe/test_unquantized_backend_selection.py
+  s_944cef61b41816::t_1726dff9943004 11,14,22-23,77,84
+vllm/v1/core/sched/output.py
+  s_944cef61b41816::t_de60347b49ea38 269,285-290
+vllm/config/reasoning.py
+  s_944cef61b41816::t_99c8c9c41b421c 8,12-13,31-34,44-50,77-86,98,104-107,141-154
+docker/docker-bake.hcl
+  s_944cef61b41816::t_c33ac178148bc0 23
+tests/v1/worker/test_gpu_worker.py
+  s_944cef61b41816::t_9eac0a787deaa0 4,6,10-16,19,25-217
+tests/quantization/test_mxfp4_online_overlay.py
+  s_944cef61b41816::t_0f5b3529fb7c5e 1-81
+vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+  h_15da545fc8cfbe 333,424
+  s_944cef61b41816::t_41476b38a8af89 12,15,31-34,43,48-54,213-222,245,252-258,260-275,278-291,293-312,324-332,334-362,368-369,372-375,378-398,400,405-414,418-423,425-428,431-448,451-476,551-560,583,591-592,596-615,621-624,626-637,740-749,751-761,763-776,944-947,949
+vllm/entrypoints/openai/chat_completion/protocol.py
+  s_944cef61b41816::t_5a06377b0c35f3 6,14,17,27,32,98,146,535-536,660-691,724-727,881-883,885-892,976-987,1119,1121,1124-1125,1140-1141
+AGENTS.md
+  s_944cef61b41816::t_01273d93a45fd5 45,47-48,50,52-58,60-63,65-66,68,76-83,90-95,104-114,137-150,156,186-194
+vllm/entrypoints/chat_utils.py
+  s_944cef61b41816::t_0151f97f309d31 2032
+vllm/models/deepseek_v4/nvidia/b12x.py
+  s_944cef61b41816::t_706b195a8f8a30 1-865
+rust/src/chat/src/output/default/mod.rs
+  s_944cef61b41816::t_e85c2fde8afc0c 53,60-61,75-80,83-90
+tests/models/test_deepseek_mtp_mxfp8_loader.py
+  s_944cef61b41816::t_ce8e9aed32a0ae 1-159
+.gitmodules
+  s_944cef61b41816::t_4e3c667b2932e8 1-12
+Makefile.toml
+  s_944cef61b41816::t_3fd8c0ffb03368 1-69
+homelab/strix-toolbox.Dockerfile
+  s_944cef61b41816::t_cad6946b3bc3c6 1-34
+vllm/v1/attention/backends/b12x_attn.py
+  s_944cef61b41816::t_735b1021c4d2f1 1-1825
+homelab/atom_reference/spec_decode/verify_scheduler.py
+  s_944cef61b41816::t_f011388d5b6bca 1-154
+tests/v1/core/test_prefix_caching.py
+  s_944cef61b41816::t_bb3df2f6c284c3 180-420
+tests/v1/core/test_kv_sharing.py
+  s_944cef61b41816::t_839449652fcb38 4-5,9,109-134
+vllm/v1/spec_decode/timing.py
+  s_944cef61b41816::t_9eb09838700ce7 1-13
+vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+  s_944cef61b41816::t_c95698eda80a4e 49,382-393,454-458,572-590,597,615-619,627
+tests/models/test_deepseek_v4_o_proj_recipe.py
+  s_944cef61b41816::t_3a0100bfef3427 1-43
+tests/quantization/test_exl3.py
+  s_944cef61b41816::t_facd0e790064ba 1-541
+tools/build_deepgemm_C.py
+  s_944cef61b41816::t_9cc6e0b8e3bcf5 3,5,14-77,79-158
+vllm/v1/worker/gpu/spec_decode/dspark/online_sts.py
+  s_944cef61b41816::t_fccc55deeb5618 1-192
+tests/config/test_speculative_draft_hf_overrides.py
+  s_944cef61b41816::t_65faca7617946f 15,138-232
+homelab/devloop/src/docker.rs
+  s_944cef61b41816::t_053a37c4a7b987 1-468
+vllm/model_executor/warmup/flashinfer_autotune_cache.py
+  s_944cef61b41816::t_e687d02b6742b4 16,26-31,50-78,80,92-111
+vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+  s_944cef61b41816::t_d1ab1a78ca8f21 6,13-72,103,106-108
+csrc/libtorch_stable/cutlass_extensions/common.hpp
+  s_944cef61b41816::t_3efae2a123baba 28
+homelab/atom_reference/kernels/lm_head_argmax.py
+  s_944cef61b41816::t_fcfe88f78bc0f9 1-89
+tests/v1/spec_decode/test_draft_tokens_handler.py
+  s_944cef61b41816::t_2f05d9f0479fc7 1-56
+docs/features/speculative_decoding/dynamic_speculative_decoding.md
+  s_944cef61b41816::t_01b3758bc91273 14-25,47-80,118-144,150-151
+vllm/model_executor/model_loader/weight_utils.py
+  s_944cef61b41816::t_009895049307e9 16,64,430,447-449,481-488,493,510-515,621-662,895,905-907,990-993,1011-1014,1033-1036,1047,1071-1075,1119,1167-1170,1184-1189,1198,1231-1232,1237,1239-1244,1343-1345,1361-1363
+vllm/v1/worker/gpu_model_runner.py
+  s_944cef61b41816::t_bbc531d2eae67a 7,12,52,59,84,131,141,143,281-289,534,1028-1030,1174,1180,1217,1243-1244,2385-2386,2473-2480,2513,2532-2537,2569-2573,2591-2592,2607-2614,2630-2634,3077-3078,3256,3258,3315,3566-3570,3778,3780,3958-3959,3966-3969,3971-3977,4007-4010,4012,4043-4047,4233-4235,4460-4467,4528,4838-4839,4859-4860,4867-4876,5085-5087,5354-5357,5396-5398,5407,5415,5428-5434,5437-5438,5442,5470-5475,5487-5488,5585,5590,5624,5658,5756-5757,5759,5784-5787,5802,5812,5889-5890,5918-5923,5958,5971,5976-5979,6132,6147-6151,6198,6347-6350,6564-6572,6574-6576,6996-7006,7084,7120-7128,7130-7133,7146,7148,7150,7413-7540,7567-7570,7608-7614,7616-7617,7619-7651,7664-7684,7741-7744,7749,7905-7906,7908-7917,7928-7929,7961-7975
+tests/v1/worker/gpu/sample/test_thinking_budget.py
+  s_944cef61b41816::t_2fcb7322008ff7 1-338
+vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+  s_944cef61b41816::t_b6b87f3b3a48ee 3-5,10,17-80,104-107,148-150
+.tekton/image-build.yaml
+  s_944cef61b41816::t_da87d6384a39b3 1-170
+tests/v1/spec_decode/test_mtp.py
+  s_944cef61b41816::t_ad3bfc511b2e86 4,26,31,67-97
+vllm/utils/multi_stream_utils.py
+  s_944cef61b41816::t_467a02ecee6014 4-6,12-34,41-89,146-147,175-181,201,211-212
+tests/v1/kv_offload/test_file_mapper.py
+  s_944cef61b41816::t_5b4cf6bdc29944 32,39,152-177
+tests/v1/core/test_kv_policy_replay.py
+  s_944cef61b41816::t_82cd2b3ef82206 1-251
+tests/distributed/test_dcp_a2a.py
+  s_944cef61b41816::t_29e2816343abd6 11,13-14,30-35,38,121-127,371-1001,1056,1058-1093,1256-1426,1459-1474
+vllm/v1/worker/gpu/sample/gumbel.py
+  s_944cef61b41816::t_11d24abbee92ed 15-17,97-100,103,112-124,126-133,135-136,140,155,168-169,181-184,194,218-221,224,228,240-242,248-249,256-259,265-268,278
+vllm/models/deepseek_v4/compressor.py
+  h_15da545fc8cfbe 98,106-107
+  s_944cef61b41816::t_7587e3e5c90e7f 5,85-97,109,114,204,236,358-359,421-422,424-431,433-440,442-445,450,457-459,462-472
+vllm/model_executor/layers/quantization/online/base.py
+  s_944cef61b41816::t_2cfa4036e96c59 46,96,99-100,168-174
+tests/models/deepseek_v4/test_attention_stream_events.py
+  s_944cef61b41816::t_7184e363659a57 1-160
+vllm/v1/worker/gpu/spec_decode/dspark/capacity.py
+  s_944cef61b41816::t_934bcd7204f31e 1-174
+vllm/model_executor/layers/quantization/modelopt.py
+  s_944cef61b41816::t_24d65b80eb7b93 11-13,16-17,61-63,65-71,92,192-256,266-271,493,538,631,728,857-875,1004,1332,1338-1341,1352-1355,1357-1362,1491,1503-1511,1670,1691,1706-1708,2098-2181,2268-2286,2369-2373,2429-2433,2435-2436,2444-2463,2537-2538,2547,2550-2555,2557,2559-2583,2602-2611,2626-2627,2644-2645
+vllm/transformers_utils/configs/qwen3_5_moe.py
+  s_944cef61b41816::t_ec27fffae65b89 24
+csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_entry.cu
+  s_944cef61b41816::t_2f2195e15999e4 50
+vllm/v1/attention/backends/flashinfer.py
+  s_944cef61b41816::t_4eefd00b51ddb3 5,8-9,1302,1540-1545,1687-1691,1693,1705,1707,1722,2181-2189,2558-2565,2588,2630,2637-2665
+vllm/v1/worker/gpu/sample/thinking_budget.py
+  s_944cef61b41816::t_4a6c99dfc23f32 20-25,54-60,62-68,77-89,113-144,159-186,201-220,231-239,257-265,292-293,306-307,311-318,413-415,419,424-427,485-497,531-608,624-630,640-642,655-656,659-682,698-701,705
+vllm/config/parallel.py
+  s_944cef61b41816::t_f08964efa83908 541-542
+vllm/v1/spec_decode/metrics.py
+  s_944cef61b41816::t_a484a3c3bf8eff 27,38,74,84,117,123,128,136
+.dockerignore
+  s_944cef61b41816::t_4ef2eaecec612b 10-15,45-60
+vllm/compilation/breakable_cudagraph.py
+  s_944cef61b41816::t_491f10fd60409e 36-39,51,386-395,397-403
+csrc/libtorch_stable/topk_histogram_4096.cuh
+  s_944cef61b41816::t_6c656fbdce1607 100-102,104,106-107,110-113,423
+vllm/model_executor/models/qwen3_5.py
+  s_944cef61b41816::t_fbc42f596445cf 54,178-182,253-254
+tests/quantization/test_exl3_prefill_plan.py
+  s_944cef61b41816::t_a34c43fe1418d2 1-286
+vllm/v1/core/kv_cache_utils.py
+  h_15da545fc8cfbe 1991,1999-2037
+  s_944cef61b41816::t_25f95b538e543a 36-37,433-452,629-648,657-658,669,673-674,678,689-691,694,712-741,993-995,997-1001,1024-1033,1039-1041,1110-1123,1129-1136,1149-1152,1155,1164-1167,1171-1172,1179,1183,1188,1282,1284,1295,1320,1322-1323,1325-1326,1328,1331,1334,1336-1419,1426-1432,1458-1478,1480-1483,1486,1489-1498,1500,1576-1578,1720-1797,1802-1803,1809,1811-1827,1830,1832,1836-1841,1844-1846,1849-1870,1874-1877,1881-1882,1885,1887,1966,1968-1976,1981-1985,1988,1990,1992-1998,2039-2045,2047-2055,2142-2146,2182,2238-2252,2589-2605
+tests/kernels/attention/test_rocm_triton_attn_dsv4.py
+  s_944cef61b41816::t_062809ee69d60f 4,720-1193
+vllm/model_executor/layers/quantization/base_config.py
+  s_944cef61b41816::t_d52744fcb94af0 74-77
+tests/models/minimax_m3/test_nvidia_model.py
+  s_944cef61b41816::t_e6ecf552253072 1-1052
+homelab/spark-cross.Dockerfile
+  h_15da545fc8cfbe 197,241-242,370-371,417-419,421-429
+  s_944cef61b41816::t_1082d90f2cfdd1 1-196,198-240,244-369,372-416,420,430-473
+  s_ae7bba1a110cba::t_c4248b87653da9 243
+vllm/model_executor/layers/mla.py
+  s_944cef61b41816::t_f7edbbf0c4c2d8 3-5,7,11,14-17,19-113,220-232,234-265,294,303,307-313,321-325,335
+vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+  s_944cef61b41816::t_33035315518a09 53,69-74,120-122,127,201-203,212-217,221-222,224,226-227,314,326-329,335-337,339-349,352-353,374,478-484,486,492-493,559,639,849,854,961,996-998,1006-1014,1019,1030,1035,1045-1046,1082,1084,1106,1116-1117,1134,1176,1259,1264,1269,1311,1320-1321,1324
+tests/quantization/test_deepseek_v4_mixed_precision.py
+  s_944cef61b41816::t_3b3a3b77af95ce 1-82
+vllm/model_executor/layers/quantization/online/mxfp8.py
+  s_944cef61b41816::t_1073efe696d9a3 36-49
+homelab/spark-toolbox.Dockerfile
+  s_944cef61b41816::t_fd5cc8e78a9dcb 1-37
+homelab/toolbox/vllm_toolbox.py
+  s_944cef61b41816::t_71b73af5eb65ec 1-611
+docs/features/reasoning_outputs.md
+  s_944cef61b41816::t_67578daa102dc8 320-419
+vllm/utils/system_utils.py
+  s_944cef61b41816::t_58170cfe61b448 115-155,171-174
+tests/models/deepseek_v4/test_cache_utils.py
+  s_944cef61b41816::t_d25a9624b24874 1-66
+docs/contributing/kernel_targets/verification.md
+  s_944cef61b41816::t_dc9d219ddb287e 1-161
+vllm/reasoning/abs_reasoning_parsers.py
+  s_944cef61b41816::t_e59f458d0b509b 115-124
+vllm/model_executor/warmup/minimax_m3_msa_warmup.py
+  s_944cef61b41816::t_5f0cd003c67d7d 6-9,11,22-71,84,87-116,118-120,122,127,129-165
+tests/v1/structured_output/test_reasoning_structured_output.py
+  s_944cef61b41816::t_9297e1a4fd6057 219-328
+tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+  s_944cef61b41816::t_b675365b83955c 8,17,47-49,69-71,96,99,102,106,111,118,120,140-143,150,187,218,293,341-345,371,444,524,585,632,680,735,798,878,937,1011,1094,1168,1204-1205,1217,1223,1231,1334,1392
+csrc/libtorch_stable/quantization/fp4/mxfp4_blockwise_moe_kernel.cu
+  s_944cef61b41816::t_6017337350ce1e 379
+vllm/model_executor/kernels/attention/b12x_mxfp8_bmm.py
+  s_944cef61b41816::t_8858af6d86c00c 1-473
+vllm/v1/sample/rejection_sampler.py
+  s_944cef61b41816::t_be8da88aaffcff 341-344
+csrc/libtorch_stable/sampler.cu
+  s_944cef61b41816::t_8899f2eae31be9 714,716-721
+tests/v1/worker/test_mamba_utils.py
+  s_944cef61b41816::t_b7e996c8be0d9d 5,18,156-210,233,354
+benchmarks/profile_dspark_sps_curve.py
+  s_944cef61b41816::t_2fd766a2fdfb2e 1-165
+tests/quantization/test_fp8_moe_oracle.py
+  s_944cef61b41816::t_498d9f58a585cd 1-260
+tests/v1/cudagraph/test_breakable_cudagraph.py
+  s_944cef61b41816::t_8f3eb9df9e0810 11,34-355
+vllm/config/scheduler.py
+  h_15da545fc8cfbe 70-74
+vllm/tool_parsers/abstract_tool_parser.py
+  s_944cef61b41816::t_e8aa0c8f359f76 73-87
+tests/model_executor/test_eagle_quantization.py
+  s_944cef61b41816::t_839a6c1011df98 4,58-100
+vllm/v1/worker/gpu/model_states/encoder_decoder.py
+  s_944cef61b41816::t_c903aca7c6d023 129,134,148
+vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+  s_944cef61b41816::t_d1e650735c18c4 1-2890
+tests/v1/worker/test_gpu_model_runner_v2_draft_capacity.py
+  s_944cef61b41816::t_209d11e40dff9a 1-1000
+vllm/v1/attention/ops/dcp_alltoall.py
+  s_944cef61b41816::t_d1ddcb2b5ca928 23-25,30-31,33,41-457,536-618,625-646,882-883,887,927-929,946-948,961-973
+benchmarks/kernels/benchmark_thinking_budget.py
+  s_944cef61b41816::t_a93e2ff281a610 22-36,44-66,82-83,111,123-126,156-170,272-274,284-286,289-303,341-344,358-370,373-375,384-385,414-430,462-463,471
+tests/transformers_utils/test_hf_overrides_flat_routing.py
+  s_944cef61b41816::t_021f41e832151f 1-77
+docs/contributing/kernel_targets/.nav.yml
+  s_944cef61b41816::t_d4bed8c5c8e7ed 1-12
+vllm/model_executor/layers/quantization/exl3.py
+  s_944cef61b41816::t_ecbbd3b715edf5 1-2447
+vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py
+  s_944cef61b41816::t_e8704e474da7e4 3,16,40-56,69-71,80-91,103,110-111,138-159,162-187,189-193,197-198,262-264,268-270,276,283
+vllm/v1/attention/backends/mla/triton_mla_tuning.py
+  s_944cef61b41816::t_92791b2ab38075 1-180
+vllm/model_executor/models/qwen3_vl.py
+  s_944cef61b41816::t_089a73c1f8faa8 79-82,462-464,474-475,616-626,676-677,855
+homelab/devloop/Cargo.lock
+  s_944cef61b41816::t_9ee95043c2686a 1-325
+docs/deployment/frameworks/lws.md
+  s_944cef61b41816::t_0345e97075c2e1 1-2
+homelab/devloop/Cargo.toml
+  s_944cef61b41816::t_ff296a37678bad 1-21
+vllm/model_executor/models/glm4_moe.py
+  s_944cef61b41816::t_3a561d96151085 27-28,48,63-66,73,167,415,445,456,476-480,482-483,486-503,505-506,508-677,775,781-783,794-809
+vllm/distributed/device_communicators/custom_all_reduce.py
+  s_944cef61b41816::t_08a91996377ddc 4,6-8,18,35-216,238,247,261-270,275,282,288-294,303-308,324-333,341,347-375,377-415,420,428-605,610-612,614-620,628-630,632-637,639,641-650,652-655,658-663,665,668-673,675,677,680-726,728-732,734,752,754-769,771-781,787-790,794-802,812-840,851-910,920-924,935-940,982-1000
+vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+  s_944cef61b41816::t_0a3661d3fc8b25 328,330,339,552-554
+vllm/v1/worker/cpu_worker.py
+  s_944cef61b41816::t_d4ab26d3216ebc 27,74-78,90-91,93-97
+tests/compile/test_config.py
+  s_944cef61b41816::t_7581618d1ec8c2 442-446,503-557,605-613,620-621,629-630,638-639
+tests/tools/test_build_deepgemm_c.py
+  s_944cef61b41816::t_3902e0be6b218f 1-62
+vllm/model_executor/warmup/kernel_warmup.py
+  s_944cef61b41816::t_eab92aaa3ba747 9,13,17-28,42-43,62-67,71,82,84,89-136,140-149,151-187,192-248,250-267,271,274-279,281,303-352,361-372,382,385-387,391,394,400,404,415-417,448-449,457,459,463-481,484,496-507,510,512,514-521,523-530
+  h_15da545fc8cfbe 249,282,284-285,373-381
+homelab/toolbox-entrypoint.sh
+  s_944cef61b41816::t_65f10aaeb78b47 1-12
+vllm/distributed/device_communicators/cuda_communicator.py
+  s_944cef61b41816::t_cc5278aa5acf88 71-77,132,268,426-523
+vllm/models/deepseek_v4/quant_config.py
+  s_944cef61b41816::t_21605993859dda 53,97-99,106-133,219,232-236
+  h_15da545fc8cfbe 214-218
+vllm/models/deepseek_v4/common/ops/cache_utils.py
+  s_944cef61b41816::t_5fd3b33dbc9fb7 35-36,414,479-512,531,547,565-627
+tests/model_executor/layers/test_logits_processor.py
+  s_944cef61b41816::t_56df2241ebebcf 1-65
+csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_entry.cu
+  s_944cef61b41816::t_534a9e0d1d528a 68-81,192-193,196-200,202,239,302-310,330,345,367-368,392,452
+docs/contributing/kernel_targets/rdna35.md
+  s_944cef61b41816::t_8046313076197a 1-349
+vllm/transformers_utils/configs/qwen3_next.py
+  s_944cef61b41816::t_5b85b1e87a460c 163
+vllm/model_executor/layers/quantization/__init__.py
+  s_944cef61b41816::t_2294ff42423cc5 17,36,125,139,149,166
+vllm/model_executor/layers/linear.py
+  s_944cef61b41816::t_a8902bd72b5e33 44-47,555-557,669-671,687,690-698,769-770,772,774,777-778,835-837,861,875-880,928-931,933,938,942-945,1021-1026,1044-1045,1054-1065,1136,1139-1140,1144-1146,1244,1247-1248,1252-1254,1278-1306,1355-1357,1402-1568,1617-1624,1626-1633,1663-1665,1717-1718,1722-1723,1755,1757-1758,1761-1913,2033-2035
+tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+  s_944cef61b41816::t_c106c723fb4c87 15,89-109
+tests/entrypoints/openai/chat_completion/test_completion_with_function_calling.py
+  s_944cef61b41816::t_bb45a1e859f7d0 25
+tests/compile/test_sequence_parallelism_threshold.py
+  s_944cef61b41816::t_1548a4be123702 113-135
+vllm/models/deepseek_v4/amd/mtp.py
+  s_944cef61b41816::t_e4247b9e95ad85 273,278-288
+vllm/v1/core/single_type_kv_cache_manager.py
+  s_944cef61b41816::t_59ecbe15dbaddd 31
+  s_944cef61b41816::t_2fae1d47ad184e 32,80-89,1923-1925,1929-1949
+  s_944cef61b41816::t_d556b3934f22a7 1989-1993
+  s_944cef61b41816::t_f3feaee419b23f 125-126,395,400-424,518-526,696,736-742,758,781,952-957,1139,1301,1330,1346,1366,1435,1502,1805,1816,1826,1832,1850-1859
+vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py
+  s_944cef61b41816::t_c99f5436c08e73 1-1297
+vllm/model_executor/models/qwen2_moe.py
+  s_944cef61b41816::t_c19b40c86e8db1 84,87-88,96
+vllm/parser/engine/adapters.py
+  s_944cef61b41816::t_dc36d8775f7008 68-76,129-140
+vllm/model_executor/layers/fp8_draft_head.py
+  s_944cef61b41816::t_53395f144b214a 1-89
+vllm/profiler/wrapper.py
+  s_944cef61b41816::t_e663406045693e 28-36,316-321,325-328
+tests/v1/worker/test_cp_utils.py
+  s_944cef61b41816::t_b9a46d26416ac5 3-4,9,49-96
+vllm/v1/spec_decode/step3p5.py
+  s_944cef61b41816::t_3e52ff08b3944a 340-345
+tests/v1/e2e/spec_decode/mtp/test_mtp.py
+  s_944cef61b41816::t_8592ce0c14afe3 4,8,10-11,13,154-213
+vllm/tool_parsers/deepseekv32_engine_tool_parser.py
+  s_944cef61b41816::t_ec52b91e0a6f44 4,10-14
+vllm/utils/torch_utils.py
+  s_944cef61b41816::t_d3c0129c8763fb 48,81,612
+requirements/cuda.txt
+  s_944cef61b41816::t_1606f67ffa47ca 13,15-18,25-29
+  h_15da545fc8cfbe 20-21,24
+vllm/v1/engine/input_processor.py
+  s_944cef61b41816::t_32035e294c5e08 38-62,149,151-159,360-363,367-369
+tests/v1/attention/test_sparse_mla_backends.py
+  s_944cef61b41816::t_9edd1cd96dec0f 5,44-49,51,89-695,803-808,856-865,883-890,915-919,1014-1025,1031,1130-1150,1232-1365
+tests/v1/worker/test_gpu_model_runner.py
+  s_944cef61b41816::t_0c268374694381 882-916,1628-1635,1637,1643-1644,1651-1652,1654,1660-1661,1664,1670-1671,1678-1679,1681,1687-1688,1696-1697,1705-1706,1714-1715,1723-1724,1732-1733,1741-1742,1745-1783
+tests/v1/attention/test_b12x_mla_fp8_rope_writer.py
+  s_944cef61b41816::t_a771a92499bf27 1-436
+tests/test_config.py
+  h_15da545fc8cfbe 19,34,1912-1932
+  s_944cef61b41816::t_541e5fb0ad222a 25,72-128,1843-1911
+homelab/toolbox/README.md
+  s_944cef61b41816::t_75ee59b2b3acb1 1-63
+vllm/v1/attention/backends/triton_attn.py
+  s_944cef61b41816::t_89a480d9c14073 76,409-412
+homelab/devloop/src/main.rs
+  s_944cef61b41816::t_b032646f89526c 1-629
+vllm/model_executor/model_loader/default_loader.py
+  s_944cef61b41816::t_881186ed47c75b 28,72-74,120-142,162,230,263-268,290,307,313,323,331,372-374,392
+vllm/v1/spec_decode/dynamic/telemetry.py
+  s_944cef61b41816::t_63487406526745 1-453
+tests/v1/worker/test_workspace.py
+  s_944cef61b41816::t_3f970e2edd764e 46-47
+vllm/models/deepseek_v4/nvidia/mtp.py
+  s_944cef61b41816::t_603b80d45af8db 58,163-175,277,282-292,466-469,494
+tests/utils.py
+  s_944cef61b41816::t_7b913945d8a355 91-108,115-117,119,122,590-601,603,610,1566-1583
+vllm/v1/worker/gpu/spec_decode/dspark/confidence_scheduler.py
+  s_944cef61b41816::t_a69364a12ff05b 1-444
+tests/v1/spec_decode/test_dflash_cudagraph_lifetime.py
+  s_944cef61b41816::t_d97590f7ef315b 1-65
+vllm/platforms/rocm.py
+  s_944cef61b41816::t_917f6bdac4c82f 4,43-55,110,213-236,246-254,280-288,430-434,446-507,946,954-966,1135-1186
+vllm/model_executor/layers/logits_processor.py
+  s_944cef61b41816::t_2cd6f3e4fd2a9e 180-200,205-212
+vllm/model_executor/models/glm4_moe_mtp.py
+  s_944cef61b41816::t_f211c46cf14109 195,217-230
+tests/kernels/attention/test_flashinfer.py
+  s_944cef61b41816::t_d63e9e8846452e 160-227
+vllm/transformers_utils/configs/speculators/algos.py
+  s_944cef61b41816::t_03110520e6cc6b 104-108,114-121,123-124,126-128,131,161-162
+README.md
+  s_944cef61b41816::t_2239394642fe7c 1,3-6,8-11,13-17,19,21,23-25,27,29,31-33,35-37,39-40,43-44,46-48,50,52-56,58-62,64-65,67,69-75,78,80-84,86-188
+vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+  s_944cef61b41816::t_c6204c3e00c9fa 108
+docker/Dockerfile
+  s_944cef61b41816::t_0dbadcc7dbc006 240,1001
+tests/kernels/attention/test_rocm_indexer_cache_layout.py
+  s_944cef61b41816::t_ee6ca748ec0cb0 1-508
+vllm/compilation/passes/fusion/allreduce_rms_fusion.py
+  s_944cef61b41816::t_ea45fd273f77d2 15,23-25,232,325-364,543-605,1093,1107-1116,1181-1195,1260-1261,1274,1553-1554
+docs/contributing/incremental_build.md
+  s_944cef61b41816::t_80d496d0828666 3-5,19-33,35,38,40-42,45-117,124-126,136-138,152,154,193-248,251-255
+tests/v1/attention/test_deepseek_v4_dspark_metadata.py
+  s_944cef61b41816::t_be09da8e17dd73 1-46
+vllm/v1/spec_decode/utils.py
+  s_944cef61b41816::t_7cbadf08fa4d45 136,178-185,488,554-558
+vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+  s_944cef61b41816::t_b769a902f56eb3 178-183
+vllm/model_executor/layers/mla_cache_format.py
+  s_944cef61b41816::t_9f79eb2606e8d7 1-75
+vllm/config/model.py
+  s_944cef61b41816::t_4c4291ad03cd18 231-234,308-315,1229-1235
+tests/v1/core/kv_policy_replay.py
+  s_944cef61b41816::t_5a16efb389b954 1-363
+vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+  s_944cef61b41816::t_35994b9c86c26b 58,77,161-168,243,273-281,339,343-366,529,533-563,579-580,582,589-592,620,624-625,627,721-722,725-732,768,785-788,791,794,1028
+vllm/model_executor/models/deepseek_v2.py
+  s_944cef61b41816::t_8b9a8f65373809 79,99,454,475-477,608-674,685-697,703-731,735-737,742-743,757,795-809,835-839,853-859,861-864,875-876,887-888,920-921,958-993,997-1019,1024-1027,1037-1045,1049,1051-1052,1054-1065,1184,1187,1229,1237,1284,1289-1303,1335,1376-1378,1397-1400,1408-1411,1419-1423,1456,1472,1474-1476,1478,1585,1589,1598-1608,1611,1628,1642,1710-1711,1736-1737,1739-1743,1804-1808,1815-1818,1830-1837,2135-2137,2191-2223
+tests/quantization/test_online.py
+  s_944cef61b41816::t_2a81bf4ba3981d 15-20,27-28,33,38-63,66-87,89-96,209-210,244
+tests/v1/spec_decode/test_dflash_swa.py
+  s_944cef61b41816::t_25f2a8af07bb99 1-228
+vllm/model_executor/layers/fused_moe/b12x_ep_moe.py
+  s_944cef61b41816::t_6f5aa43dc90002 1-441
+tests/model_executor/layers/fused_moe/test_shared_experts_stream.py
+  s_944cef61b41816::t_610b8785f74b2f 1-35
+tests/v1/logits_processors/test_correctness.py
+  s_944cef61b41816::t_3f6858eef11e81 4,24-28,113-120,983-1067,1545-1547,1849-1851,1892-2798
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 739-740,1809-1810
+vllm/v1/worker/workspace.py
+  s_944cef61b41816::t_1bb05839808424 37-41,54-56
+vllm/models/minimax_m3/__init__.py
+  s_944cef61b41816::t_dfbada2a95a31f 7-8
+vllm/v1/worker/gpu/attn_utils.py
+  s_944cef61b41816::t_167bbdf46dcfa7 22,24,32,121-126,139-147,187,370,423-425,428-430,436,457-475,481-488,582-641,701,709-710,720-728,736-739,758,762-764,770-775,780-784,799-800
+vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py
+  s_944cef61b41816::t_f5277b82c4b965 268-269
+tests/v1/e2e/spec_decode/test_spec_decode.py
+  s_944cef61b41816::t_97669095cce73e 1-1658
+docs/configuration/optimization.md
+  s_944cef61b41816::t_67c070916e74ec 24,40
+  h_15da545fc8cfbe 80-85
+vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+  s_944cef61b41816::t_41169b9b166d8e 173,338-340
+vllm/v1/attention/backends/utils.py
+  s_944cef61b41816::t_76e5fd616dcc63 488,563,988-991
+vllm/v1/worker/gpu/warmup.py
+  s_944cef61b41816::t_ddd6260e863263 21,24,41-47,52-74,80,83-84,90-92,187-189,191-193,199-207,209-210,232-241,243-247,255-256,263,319-328,330-342,344-345,347-356,364-556
+examples/deployment/deepseek-v4-flash-dspark-lws.yaml
+  s_944cef61b41816::t_1bcfed81746b33 1-73
+vllm/v1/worker/gpu/sample/states.py
+  s_944cef61b41816::t_2ad8049c123d2c 18,22-25,57-61
+vllm/model_executor/layers/fused_moe/experts/b12x_mxfp4_moe.py
+  s_944cef61b41816::t_eeef2c14c3962e 1-740
+vllm/model_executor/models/qwen2_5_vl.py
+  s_944cef61b41816::t_9a89d9648a7795 355-356,383-384
+tests/v1/attention/test_sparse_utils_dcp_topk.py
+  s_944cef61b41816::t_d527b7181ce146 1-65
+vllm/v1/engine/llm_engine.py
+  s_944cef61b41816::t_03ebfea04d7a5a 311
+vllm/model_executor/models/glm4_moe_lite_mtp.py
+  s_944cef61b41816::t_6f54d82f0ea07e 207,229-237
+vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+  s_944cef61b41816::t_59ecd35711a875 10,70-78
+tests/kernels/test_top_k_per_row.py
+  s_944cef61b41816::t_513c647a70064b 20-23,26-27,31-33,811-814
+vllm/config/quantization.py
+  s_944cef61b41816::t_74dc55f46db531 85,94-96,100,107,161-195,203,205-207,209-211,213-215,218-221,224,237
+vllm/models/minimax_m3/nvidia/model.py
+  s_944cef61b41816::t_c8fedd33f17a5d 16,22,25,27,42,45-46,89,94-100,108-142,162-190,192-247,250-351,353-354,356-359,522-524,530-535,588,637-639,650-654,658-659,661-698,745,755,759,763,810-856,862-863,865-867,884-901,924-926,931-947,950-962,977-1037,1039-1056,1182,1277-1280,1303,1306-1308,1315-1319,1322-1329,1347-1357,1366,1369-1372,1374,1376,1378,1380,1383,1505,1514-1530,1535-1537
+vllm/entrypoints/openai/chat_completion/serving.py
+  h_15da545fc8cfbe 5,71-81,756-762,766-768,770-787,1101-1115,1122
+  s_944cef61b41816::t_dcb68943998e3a 359-363
+tests/config/test_config_utils.py
+  s_944cef61b41816::t_6b41fabd06aaeb 279-303
+vllm/model_executor/models/qwen3_dflash.py
+  s_944cef61b41816::t_6af2eeee9b7b5c 4,35-38,43-48,179-216,292,345,350,353-355,486-491,500,506-510,512-520,522,749-758,760,762-767,769-770,773,775-807,822-825,836-837,900-903
+vllm/parser/qwen3.py
+  s_944cef61b41816::t_5d5b8902fc7437 277-295
+vllm/v1/spec_decode/dynamic/acceptance_length.py
+  s_944cef61b41816::t_30b4900a512b1e 1-2,4-5,8-13,16-17,19-23,25-27,29-32,34-49,51-56,58-83
+vllm/v1/worker/gpu/block_table.py
+  s_944cef61b41816::t_e3488be66d1f78 29,40-47,135,153,160,167,175,179-181,183,187,190-191,193-195,200,203,256-262,270,273-274,276,283,304,306,309,314-315,317-319,321-323,330-348
+vllm/models/deepseek_v4/xpu/xpu_sparse_decode_fp8.py
+  s_944cef61b41816::t_1aef5cf3340051 281-282,289
+tests/model_executor/test_b12x_sparse_indexer_warmup.py
+  s_944cef61b41816::t_fe9ce1ccb79d4f 1-84
+tests/v1/core/test_scheduler.py
+  h_15da545fc8cfbe 203-279
+vllm/v1/worker/gpu/spec_decode/utils.py
+  s_944cef61b41816::t_7bef625b2bce8b 10-52,55-59,61,70-72,78-80,84-87,102-106,108-109
+tests/entrypoints/openai/chat_completion/test_empty_tools_validation.py
+  s_944cef61b41816::t_f1962d3215b6f2 1-92
+CMakeLists.txt
+  s_944cef61b41816::t_0cb6c98f10ada4 126,275-281,488-489,494-495,1025-1026,1233-1241,1551-1556,1562-1567,1584-1588
+vllm/models/minimax_m3/common/indexer.py
+  s_944cef61b41816::t_16a22e892d5185 26,219-262,289-291,417,447-471,479-485,497,521,539,665-671
+vllm/v1/attention/backend.py
+  s_944cef61b41816::t_a24419f8ba5d92 5,160-164,467-571,602,650,667-679,746-768,793,807-900,937-939
+tests/v1/core/utils.py
+  h_15da545fc8cfbe 55-56,103-104
+vllm/v1/worker/kv_connector_model_runner_mixin.py
+  s_944cef61b41816::t_47119b66b69184 213,219
+tests/kernels/attention/test_cp_lse_ag_rs.py
+  s_944cef61b41816::t_4390d5314a2652 1-42
+tests/model_executor/test_jit_warmup.py
+  s_944cef61b41816::t_529ad4132a2b92 5,43,243,262,292,308,329,373-500
+vllm/v1/kv_cache_interface.py
+  s_944cef61b41816::t_1beff2e18ce8b7 87,211-217,219-225,281-282,284-288,317-332,336-339,391-392,409-450,460-485,513-514,518-519,522-523,527-528,531-532,534,538-539,547-548,653-656,687-690,703,719-720,733-754,762-763,769,772-773,779,789-790,800,809-810,959-962,966-969,972-981,983,1133
+csrc/spinloop.cpp
+  s_944cef61b41816::t_c1d836d3aab0ef 10-15
+tests/v1/attention/test_b12x_mla_dcp_workspace.py
+  s_944cef61b41816::t_5ad0fab29e92f8 1-461
+tests/v1/kv_connector/unit/test_late_kv_xfer_completions.py
+  s_944cef61b41816::t_488dbea387f91a 1-147
+docs/features/speculative_decoding/README.md
+  s_944cef61b41816::t_6e5cef8fb8f4ca 86
+vllm/v1/worker/ubatch_utils.py
+  s_944cef61b41816::t_8b30c79dce1abb 245
+vllm/model_executor/layers/fused_moe/b12x_moe.py
+  s_944cef61b41816::t_bc1be4832da62a 1-1647
+vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+  s_944cef61b41816::t_d27dd23600733c 65-72
+vllm/v1/attention/ops/triton_unified_attention_diffkv.py
+  s_944cef61b41816::t_45927031f45f4d 229
+vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json
+  s_944cef61b41816::t_960738f62dbaf4 1-21
+homelab/atom_reference/fla/fused_merge_recompute.py
+  s_944cef61b41816::t_fcebdfebea7308 1-336
+vllm/v1/attention/backends/mla/sparse_swa.py
+  s_944cef61b41816::t_9090b1385ec393 12,90,98-108,317-337,351-354,359,361-377,397-401,465,475-476,482-494,497-505,519-521,547-565,589-623,733-736,771,778,795-883,1023-1096
+tests/engine/test_arg_utils.py
+  s_944cef61b41816::t_82a0c4196f41b7 4,13-19,235-271,516-528,947-1067
+vllm/distributed/device_communicators/symm_mem.py
+  s_944cef61b41816::t_6a5ff1e8cdc28f 11,31-32,82-105,117,133-140,147-153,166,183-184,187-200
+vllm/utils/deep_gemm.py
+  s_944cef61b41816::t_2a774f23b7bb1d 629-630,636-637
+.gitignore
+  s_944cef61b41816::t_c381e65fd4a28e 4-6,47,122-124,264-280
+vllm/model_executor/layers/attention/attention.py
+  s_944cef61b41816::t_4446e73af14463 413-415
+vllm/v1/attention/backends/rocm_aiter_unified_attn.py
+  s_944cef61b41816::t_b4781d7a63230e 28-42,164,173-221,295-344
+pyproject.toml
+  s_944cef61b41816::t_3b4ac668b64501 195-227
+vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+  s_944cef61b41816::t_c89d9791a2a4d0 15-22
+vllm/v1/worker/cpu_model_runner.py
+  s_944cef61b41816::t_b3fbf19a823b1b 5,83,86,89,92,106
+vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+  s_944cef61b41816::t_cf2df233b3c623 7-8,10-11,22,42-59,62,206-209
+vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
+  s_944cef61b41816::t_635fd04f12bdca 11-12,86-110,140,204-206,265
+vllm/v1/attention/ops/xpu_mla_sparse.py
+  s_944cef61b41816::t_32314a3e9818e0 187,190-191,229-241
+vllm/model_executor/models/deepseek_mtp.py
+  s_944cef61b41816::t_d150e937394b42 3-4,10,17,24-28,49-351,360,364-373,380-386,392-394,402,411-421,424,427-430,437-440,478-484,494-496,504-512,547-548,560-561,579-580,586-600,604-610,613-617,619-621,626-655,701-707,743-754,756-759,779-786,806-842,848,850-852,918-920,959,972-979
+tests/reasoning/test_minimax_m3_reasoning_parser.py
+  s_944cef61b41816::t_264ab0c40f6d16 462-480
+vllm/v1/worker/gpu/spec_decode/capacity.py
+  s_944cef61b41816::t_8077846342f9dc 1-980
+vllm/reasoning/poolside_v1_reasoning_parser.py
+  s_944cef61b41816::t_01cfda50b31aa6 51-67
+docs/contributing/kernel_targets/matrix_units.md
+  s_944cef61b41816::t_d261bd266d19dd 1-326
+vllm/model_executor/model_loader/reload/layerwise.py
+  s_944cef61b41816::t_be95e34e844da1 36,84-103,120-121
+docker/versions.json
+  s_944cef61b41816::t_09eef9dc48d278 47
+tools/flashinfer-build.sh
+  s_944cef61b41816::t_e9136b69edc9f2 7-9,11-14,16,26-29,31-48,61,63,67-70,76-78,82-89,92,97-99
+vllm/v1/sample/thinking_budget_state.py
+  s_944cef61b41816::t_9b57a940e2c31a 9,17-18,59-61,65,71-72,84,101-107,109-112,114,179,182-242,253-257,287-288,291-293,306-308,320-440,442-444,522-524,545-551,563-570,679-697,699-710,725,733-734,766-767,770-788
+vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+  s_944cef61b41816::t_17566e71218981 55-57,108-110,154-156,184-201,204,221,717-719,751-768,771,787,913-915,949-966,969,985
+tests/v1/spec_decode/test_dynamic_sd_cug.py
+  s_944cef61b41816::t_dde0c5786e3cb0 66-69,407-454
+vllm/model_executor/layers/fused_moe/config.py
+  s_944cef61b41816::t_899d7defbb1a3c 868-869,882-883
+docs/design/metrics.md
+  s_944cef61b41816::t_c2e573a8cb037d 280-291
+vllm/entrypoints/llm.py
+  s_944cef61b41816::t_8716394b40bc9e 114-126,210-211,328
+vllm/model_executor/layers/quantization/fp8.py
+  s_944cef61b41816::t_7f99e91bcc5a9b 92-131,142,156,205,216,223-232,260-277,280,284-312,471-474,607-610
+vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+  s_944cef61b41816::t_cddfa5888763e4 218,223,273,278
+vllm/model_executor/kernels/mhc/tilelang.py
+  h_15da545fc8cfbe 303-336,615,819,829-834,860-870
+  s_944cef61b41816::t_a22f4b20140ac5 754,785-803,818,820-822,825,837,844,849-859,871-879,882
+tests/test_multi_stream_utils.py
+  s_944cef61b41816::t_f81fb0e7893eb8 1-130
+.devcontainer/postattach.sh
+  s_944cef61b41816::t_012546efe886d0 1-80
+vllm/v1/outputs.py
+  s_944cef61b41816::t_a520b491e1cd8d 15,313-317,344-346
+vllm/transformers_utils/config.py
+  s_944cef61b41816::t_f6c44ac535cabf 687-731,844
+tests/v1/spec_decode/test_acceptance_length_controller.py
+  s_944cef61b41816::t_b97c4428cf5740 1-328
+vllm/utils/mem_utils.py
+  s_944cef61b41816::t_975422d95d3514 51-65,162
+csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu
+  s_944cef61b41816::t_1d4d4b89df7686 635,725
+tests/kernels/attention/test_flashmla_sparse.py
+  s_944cef61b41816::t_8fcd679e98662a 7-13
+vllm/v1/attention/backends/mla/flashmla_sparse.py
+  h_15da545fc8cfbe 865
+  s_944cef61b41816::t_72bdd79961898e 223-228,230-232,234
+vllm/model_executor/kernels/linear/scaled_mm/__init__.py
+  s_944cef61b41816::t_cf2eb3fac8a3a9 7
+  s_944cef61b41816::t_0d66f783a56d38 8-12,77-78
+vllm/model_executor/model_loader/reload/__init__.py
+  s_944cef61b41816::t_0a34b469e586e8 22,31
+docs/contributing/kernel_targets/README.md
+  s_944cef61b41816::t_4e20f95c6bf6f0 1-93
+vllm/v1/worker/gpu/states.py
+  s_944cef61b41816::t_a0e0b39535b5e7 87-96,126-127,137
+vllm/v1/request.py
+  s_944cef61b41816::t_0c1972722ee961 174-179
+csrc/libtorch_stable/nvfp4_kv_cache.h
+  s_944cef61b41816::t_94d2ac8e62e98b 1-25
+vllm/model_executor/kernels/linear/mxfp8/__init__.py
+  s_944cef61b41816::t_e89e8ee562fbf3 4,11
+tests/v1/worker/test_gpu_autoregressive_speculator.py
+  s_944cef61b41816::t_695fc11c3e2a3b 25,250-333
+tests/tool_parsers/test_deepseekv4_tool_parser.py
+  s_944cef61b41816::t_e3b93dd1764fb4 19-22,420-546
+vllm/model_executor/warmup/eagle_spec_decode_warmup.py
+  s_944cef61b41816::t_c5b41ed34ee9c0 1-73
+tests/evals/gsm8k/configs/DeepSeek-V4-Flash-DSpark-varlen-TP4.yaml
+  s_944cef61b41816::t_a8474ca8341cb3 1-22
+vllm/transformers_utils/configs/minimax_m3.py
+  s_944cef61b41816::t_dece1d5eed3d44 56,73-74,109
+tests/kernels/attention/test_prefix_prefill.py
+  s_944cef61b41816::t_b9f7bc1cc8df1b 1011-1326
+vllm/models/deepseek_v32/attention.py
+  s_944cef61b41816::t_1caffea43bf57c 36,39,58,66-67,83,85,123,134,141,161-162,203-207,220,224-225,235,246-247,269-270,272-285,287-292,294-297,316-318,367-387,401-404,462,484,500-501,520-521
+vllm/v1/worker/gpu/spec_decode/speculator.py
+  s_944cef61b41816::t_8866763384fefd 5,16,22,26,29-32,37-48,57-63,80,86,95-97,115,166,238-245,254-256,258-261,267-292,297-328,356-380,393-400,423-426
+tests/platforms/test_rocm.py
+  s_944cef61b41816::t_3ef1e58b35ed05 1-96
+third_party/b12x
+  s_944cef61b41816::t_6589ad8016a155 1
+third_party/deep_gemm
+  s_944cef61b41816::t_a169ae86e6116d 1
+third_party/flashinfer
+  s_944cef61b41816::t_b01797d48219f7 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0de19faab60e75afb91f1cab77faacdaad8b503f",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  },
+  "sessions": {
+    "s_944cef61b41816": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_944cef61b41816",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    },
+    "s_ae7bba1a110cba": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_ae7bba1a110cba",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
