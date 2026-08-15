@@ -1,0 +1,15 @@
+.gitignore
+  h_15da545fc8cfbe 261-263
+  h_15da545fc8cfbe 259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7f94e640c84c9830bd9ea06b42552fefff3fd9fd",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
