@@ -122,6 +122,11 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        # Partial-tail offload hand-offs are produced only by Mamba align
+        # managers; all managers share the coordinator's drain interface.
+        self._pending_partial_tail_offloads: list[
+            tuple[str, int, KVCacheBlock, int]
+        ] = []
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -384,6 +389,13 @@ class SingleTypeKVCacheManager(ABC):
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
         return pending_copies
+    def take_pending_partial_tail_offloads(
+        self,
+    ) -> list[tuple[str, int, KVCacheBlock, int]]:
+        """Drain producer partial-tail hand-offs."""
+        pending = self._pending_partial_tail_offloads
+        self._pending_partial_tail_offloads = []
+        return pending
 
     def pending_cow_block_index(self, request_id: str) -> int | None:
         """Return the pending partial-hit CoW index without consuming it."""
@@ -503,6 +515,15 @@ class SingleTypeKVCacheManager(ABC):
         ``reachable_boundaries`` are token positions whose reachable tail must be
         retained; the base (dense) policy ignores them.
         """
+        del (
+            start_block,
+            end_block,
+            alignment_tokens,
+            kv_cache_spec,
+            use_eagle,
+            retention_interval,
+            reachable_boundaries,
+        )
         return None
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
@@ -667,6 +688,7 @@ class SingleTypeKVCacheManager(ABC):
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        del num_computed_tokens
         """
         Get the number of tokens that will be skipped for attention computation.
 
@@ -1096,6 +1118,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return max(0, num_computed_tokens - self.sliding_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
         So it's not correct to count ref_cnt like FullAttentionManager. Return
@@ -1257,6 +1280,7 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         return num_skipped_tokens
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         cascade attention is not supported by chunked local attention.
         """
@@ -1283,6 +1307,10 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # Requests that registered their own last-prompt-boundary partial
+            # tail (producers). On the next step's CoW the boundary state moves
+            # into a private cow_block for connector offload.
+            self._producer_partial_tail_reqs: dict[str, int] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1297,6 +1325,7 @@ class MambaManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del drop_eagle_block
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
@@ -1385,6 +1414,7 @@ class MambaManager(SingleTypeKVCacheManager):
         any cross-request shared-prefix junction, Marconi-style APC); their
         boundary state is always kept so sparse retention does not defeat reuse.
         """
+        del use_eagle
         if retention_interval is None or alignment_tokens is None:
             # Dense caching (default) or no alignment constraint imposed.
             return None
@@ -1451,6 +1481,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         """
         cascade attention is not supported by mamba
         """
@@ -1630,6 +1661,18 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
+                        boundary_tokens = self._producer_partial_tail_reqs.pop(
+                            request_id, None
+                        )
+                        if boundary_tokens is not None:
+                            self._pending_partial_tail_offloads.append(
+                                (
+                                    request_id,
+                                    self.kv_cache_group_id,
+                                    cow_block,
+                                    boundary_tokens,
+                                )
+                            )
                         if cow_block.block_hash is not None:
                             # The moved entry is only filled by this step's
                             # copy, so defer same-step hits on it.
@@ -1647,6 +1690,12 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._producer_partial_tail_reqs.pop(request_id, None)
+            self._pending_partial_tail_offloads = [
+                entry
+                for entry in self._pending_partial_tail_offloads
+                if entry[0] != request_id
+            ]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1721,6 +1770,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
+            self._producer_partial_tail_reqs[request.request_id] = num_tokens
         return partial_hash
 
 
@@ -1734,6 +1784,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
+        del request_id, num_local_computed_tokens, num_external_computed_tokens
         # We do not cache blocks for cross-attention to be shared between
         # requests, so  `new_computed_blocks` should always be empty.
         assert len(new_computed_blocks) == 0
@@ -1744,6 +1795,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
+        del request_id, num_local_computed_tokens, num_external_computed_tokens
         # Cross-attention does not use prefix caching / external KV loads.
         return
 
@@ -1753,11 +1805,13 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        del request, num_tokens, retention_interval
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
         raise ValueError("Should not be called as prefix caching is disabled.")
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
         # Cross-attention blocks contain request-specific encoder states
         # and are not shared between different requests
         return 0
@@ -1775,6 +1829,16 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del (
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            drop_eagle_block,
+            alignment_tokens,
+            dcp_world_size,
+            pcp_world_size,
+        )
         assert isinstance(kv_cache_spec, CrossAttentionSpec), (
             "CrossAttentionManager can only be used for cross-attention groups"
         )
