@@ -138,12 +138,16 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                     "(model_type=%s).",
                     self.model_type,
                 )
-            if quant_config.quant_dtype == "mxfp8":
-                self.fake_input_scale = torch.ones(
-                    self.num_experts,
-                    device=self.device,
-                    dtype=torch.float32,
-                )
+
+        if (
+            quant_config.weight_quant_dtype == "mxfp4"
+            and quant_config.quant_dtype == "mxfp8"
+        ):
+            self.fake_input_scale = torch.ones(
+                self.num_experts,
+                device=self.device,
+                dtype=torch.float32,
+            )
 
     @property
     def expects_unquantized_inputs(self) -> bool:

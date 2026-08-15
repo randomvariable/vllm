@@ -726,7 +726,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
-            with use_workspace_lane(1):
+            with use_workspace_lane(self._draft_workspace_lane):
                 # HACK(woosuk)
                 self.speculator.set_attn(
                     self.model_state,
@@ -745,7 +745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            with use_workspace_lane(1):
+            with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
@@ -1149,7 +1149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     progress_bar_desc="Profiling CUDA graph memory",
                 )
                 if self.speculator is not None:
-                    with use_workspace_lane(1):
+                    with use_workspace_lane(self._draft_workspace_lane):
                         self.speculator.capture(capture_phase="profile")
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -2436,7 +2436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.verification_capacity_manager is not None
                 and not self.verification_capacity_manager.capacity_bypassed
             ):
-                with use_workspace_lane(1):
+                with use_workspace_lane(self._draft_workspace_lane):
                     draft_token_capacity = self.speculator.compute_capacities(
                         input_batch
                     )
