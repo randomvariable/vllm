@@ -418,8 +418,13 @@ COPY --from=builder /src/ccache-stats-vllm.txt /src/ccache-stats-flashinfer.txt 
 # Keep FlashInfer Python/cubin pins intact; local wheels are installed after
 # the matching cubin package and must pass the import-time version check.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r /runtime-requirements/cuda.txt && \
-    uv pip install --system /wheels-flashinfer/flashinfer_python-*.whl && \
+    sed -E '/^flashinfer-(python|cubin|jit-cache)==/d' \
+      /runtime-requirements/cuda.txt > /tmp/cuda-without-local-flashinfer.txt && \
+    uv pip install --system -r /tmp/cuda-without-local-flashinfer.txt && \
+    uv pip install --system --no-deps \
+      /wheels-flashinfer/flashinfer_cubin-*.whl && \
+    uv pip install --system --no-deps \
+      /wheels-flashinfer/flashinfer_python-*.whl && \
     uv pip install --system --no-deps \
       /wheels-flashinfer/flashinfer_jit_cache-*.whl && \
     uv pip install --system /wheels-b12x/*.whl && \
