@@ -1,0 +1,19 @@
+vllm/v1/engine/core.py
+  s_77addc9646d9bb::t_54c2ee8d8e8d94 1654-1655,1663-1673,1680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ba261e20745241134593a12ee7c45a2c36310ac3",
+  "prompts": {},
+  "sessions": {
+    "s_77addc9646d9bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "s_77addc9646d9bb",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
