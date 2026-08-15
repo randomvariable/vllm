@@ -1,0 +1,18 @@
+docs/contributing/mia-dspark-patch-manifest.md
+  h_15da545fc8cfbe 19
+tests/test_config.py
+  h_15da545fc8cfbe 34,1912-1919
+vllm/config/speculative.py
+  h_15da545fc8cfbe 86-89,1603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "95de054ac871661b8ab18dc74dedf31fd20dd4e4",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
