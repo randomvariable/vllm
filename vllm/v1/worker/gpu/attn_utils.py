@@ -29,7 +29,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
-    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -426,7 +425,6 @@ def _reshape_kv_cache(
                     "auto"
                     if cache_dtype != "fp8_ds_mla"
                     and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
                 )
                 cache_dtype_str = (
@@ -517,7 +515,6 @@ def _align_mixed_attention_kv_cache_views(
             "auto"
             if cache_dtype != "fp8_ds_mla"
             and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-            and not isinstance(kv_cache_spec, TQFullAttentionSpec)
             else cache_dtype
         )
         cache_dtype_str = (
