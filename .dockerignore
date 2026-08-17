@@ -58,3 +58,5 @@ rust/target/
 docs
 examples
 benchmarks
+
+.logs
