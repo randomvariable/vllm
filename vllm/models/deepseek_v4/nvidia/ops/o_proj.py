@@ -6,8 +6,11 @@ import torch.nn as nn
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
+    deepseek_v4_fp8_einsum,
+    deepseek_v4_fp8_einsum_config,
+)
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -15,18 +18,20 @@ def _deepseek_v4_fp8_o_proj_einsum(
     o_fp8: torch.Tensor,
     o_scale: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale_inv: torch.Tensor,
+    weight_scale: torch.Tensor,
     z: torch.Tensor,
     recipe_0: int,
     recipe_1: int,
     recipe_2: int,
 ) -> None:
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (weight, weight_scale_inv),
+    deepseek_v4_fp8_einsum(
+        o_fp8,
+        o_scale,
+        weight,
+        weight_scale,
         z,
-        recipe=(recipe_0, recipe_1, recipe_2),
+        "bhr,hdr->bhd",
+        [recipe_0, recipe_1, recipe_2],
     )
 
 
@@ -34,7 +39,7 @@ def _deepseek_v4_fp8_o_proj_einsum_fake(
     o_fp8: torch.Tensor,
     o_scale: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale_inv: torch.Tensor,
+    weight_scale: torch.Tensor,
     z: torch.Tensor,
     recipe_0: int,
     recipe_1: int,
@@ -56,21 +61,16 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
-
-    The packed layout is a tcgen05/TMEM feature, so it keys off SM100
-    exactly rather than "anything newer than SM90". SM12x (GB10, RTX 50xx)
-    reports a numerically higher capability but has no TMEM, so it must use
-    the SM90 block-scale layout — the checkpoint stores wo_a scales as
-    [g, r/128, d/128], which only matches sfb_gran_mn=128.
+    SM12x (and every other arch, including SM110): RTX PRO / GB10 do not expose
+    the same TMA/TCGEN05 path, so keep the legacy FP32 block-scale layout
+    expected by DeepGEMM (this is the ``deepseek_v4_fp8_einsum_config`` else
+    branch — only SM100 takes the packed path).
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    packed_tmem_scales = cap.major == 10
-    einsum_recipe = (1, 1, 128) if packed_tmem_scales else (1, 128, 128)
-    tma_aligned_scales = packed_tmem_scales
-    return einsum_recipe, tma_aligned_scales
+    return deepseek_v4_fp8_einsum_config(cap.major)
 
 
 def deep_gemm_fp8_o_proj(
@@ -108,14 +108,17 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    weight_scale = (
-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
-    )
+    # MarlinFP8.process_weights_after_loading renames block-FP8 scales to
+    # weight_scale_inv. Non-Marlin kernels keep the on-disk weight_scale name.
+    # CompressedTensors non-block schemes only expose weight_scale.
+    wo_a_scale = getattr(wo_a, "weight_scale_inv", None)
+    if wo_a_scale is None:
+        wo_a_scale = wo_a.weight_scale
     torch.ops.vllm.deepseek_v4_fp8_o_proj_einsum(
         o_fp8,
         o_scale,
         wo_a.weight,
-        weight_scale,
+        wo_a_scale,
         z,
         einsum_recipe[0],
         einsum_recipe[1],
