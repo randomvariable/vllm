@@ -219,7 +219,8 @@ def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> st
     if input_batch.num_draft_tokens > 0:
         return "verify"
     if (
-        input_batch.max_query_len <= 1
+        input_batch.max_query_len is not None
+        and input_batch.max_query_len <= 1
         and input_batch.num_tokens == input_batch.num_reqs
     ):
         return "decode"
