@@ -19,10 +19,8 @@
 # The base image is TheRock's rocm7.14 gfx1151 PyTorch image (torch 2.12.0 +
 # rocm7.14, arch list includes gfx1151, GPU enumerates as "AMD Radeon 8060S").
 
-ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu26.04_py3.14_pytorch_release_2.12.0
 
-# Coherent TheRock nightly used for the BUILD toolchain (hipcc/cmake) and the
-# build-time torch. Runtime keeps the base image's release torch.
 ARG ROCM_NIGHTLY=7.14.0a20260612
 ARG ROCM_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx1151/
 ARG BUILD_TORCH=2.12.0+rocm7.14.0a20260612
@@ -46,11 +44,19 @@ ARG GGUF_PLUGIN_REPOSITORY
 ARG GGUF_PLUGIN_REF
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VLLM_TARGET_DEVICE=rocm \
     MAX_JOBS=8 \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
     VERBOSE=1
+COPY homelab/pip-rocm.conf /etc/pip.conf
+COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
+RUN chmod 0755 /usr/local/bin/install-system-packages
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    /usr/local/bin/install-system-packages \
+      curl perl make build-essential protobuf-compiler libprotobuf-dev
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -82,23 +88,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # (an external CI harness) owns which commit is checked out.
 # .git is excluded by .dockerignore (common CI pattern) so setuptools-scm
 # cannot derive the version. The external CI harness must supply it.
-ARG VLLM_SCM_VERSION=0.1.dev1
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SCM_VERSION}
-COPY . /src/vllm
-
-# --- Rust vllm-rs frontend ----------------------------------------------------
-# Must run before the wheel build: setup.py's optional Rust extensions otherwise
-# allow a wheel with no vllm-rs or _rust_tool_parser to build silently.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/src/vllm/target,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        curl perl make build-essential protobuf-compiler libprotobuf-dev && \
     /opt/venv/bin/pip install "setuptools-rust>=1.9.0" && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain none && \
@@ -182,7 +176,7 @@ ARG ROCM_INDEX
 ARG PYTORCH_ROCM_ARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
     VLLM_TARGET_DEVICE=rocm \
     PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH} \
@@ -203,11 +197,12 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 # ccache is the difference between a re-edit costing seconds and costing minutes;
 # setup.py wires it in automatically once it is on PATH (CMAKE_HIP_COMPILER_LAUNCHER).
+COPY homelab/pip-rocm.conf /etc/pip.conf
+COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
+RUN chmod 0755 /usr/local/bin/install-system-packages
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean \
- && apt-get update \
- && apt-get install -y --no-install-recommends ccache git
+    /usr/local/bin/install-system-packages ccache git
 
 # Coherent nightly ROCm SDK in its own venv. rocm-sdk-devel is lazily
 # materialised, so `rocm-sdk init` MUST run in this same layer or ROCM_PATH
@@ -291,12 +286,16 @@ CMD ["bash"]
 # ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS runtime
 ARG PYTORCH_ROCM_ARCH
-
+ARG VLLM_BUILD_COMMIT=unknown
+ARG VLLM_BUILD_PIPELINE=local
+ARG VLLM_BUILD_URL=
+ARG VLLM_IMAGE_TAG=local/vllm-strix:dev
 # Runtime env for Strix Halo / gfx1151 (kyuz0-validated knobs). NO
 # HSA_OVERRIDE_GFX_VERSION (gfx1151 is native in this ROCm). The base image's
 # RELEASE torch + HSA runtime initialise the 8060S without the nightly InitDma
 # crash, so the nightly SDK is deliberately absent here.
 ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
     VLLM_TARGET_DEVICE=rocm \
     VLLM_USE_RUST_FRONTEND=1 \
     PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
@@ -309,8 +308,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_DISABLE_COMPILE_CACHE=1 \
     HIP_FORCE_DEV_KERNARG=1 \
     RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1 \
+    TIKTOKEN_ENCODINGS_BASE=/opt/vllm/tiktoken_encodings \
     HF_HOME=/opt/vllm/cache/huggingface \
     VLLM_CACHE_ROOT=/opt/vllm/cache
+COPY homelab/pip-rocm.conf /etc/pip.conf
+COPY homelab/install-strix-runtime.sh /usr/local/bin/install-strix-runtime
+RUN chmod 0755 /usr/local/bin/install-strix-runtime
 
 COPY --from=builder /wheels /wheels
 COPY --from=builder /wheels-gguf /wheels-gguf
@@ -320,21 +323,7 @@ COPY --from=builder /runtime-requirements /runtime-requirements
 # then the vLLM wheel --no-deps, then the GGUF plugin wheel if it built.
 # xxhash128 prefix-cache support (--prefix-caching-hash-algo xxhash)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    set -eux; \
-    grep -vhiE '^[[:space:]]*(-r|#|$)' \
-        /runtime-requirements/rocm.txt /runtime-requirements/common.txt \
-      | grep -viE '^[[:space:]]*(torch|pytorch-triton-rocm|triton|torchvision|torchaudio|rocm[-_]?sdk[-_a-z]*)([[:space:]]|==|>|<|~|;|\[|$)' \
-      | sort -u > /tmp/runtime-reqs.txt; \
-    /opt/venv/bin/pip install --no-cache-dir -r /tmp/runtime-reqs.txt; \
-    /opt/venv/bin/pip install --no-cache-dir xxhash; \
-    /opt/venv/bin/pip install --no-cache-dir --no-deps /wheels/vllm-*.whl; \
-    if ls /wheels-gguf/*.whl >/dev/null 2>&1; then \
-        /opt/venv/bin/pip install --no-cache-dir --no-deps /wheels-gguf/*.whl \
-          && /opt/venv/bin/pip install --no-cache-dir "gguf>=0.17.0" \
-          && echo "GGUF plugin installed"; \
-    else echo "GGUF plugin wheel absent; skipping"; fi; \
-    rm -rf /wheels /wheels-gguf
-
+    /usr/local/bin/install-strix-runtime
 # Build-time smoke. The HIP-extension import triggers torch GPU init, which needs
 # /dev/kfd + /dev/dri -- absent in a rootless BuildKit pod -- so both checks are
 # NON-FATAL here. Authoritative import+GPU validation is the on-box `docker run`
@@ -345,7 +334,8 @@ RUN /opt/venv/bin/python -c "import vllm; print('vllm', vllm.__version__)" \
     /opt/venv/bin/python -c "import vllm._C, vllm._rocm_C; print('HIP extensions import OK')" \
       || echo "WARN: HIP-extension import needs GPU device; validate on-box with docker run --device /dev/kfd --device /dev/dri"
 
-RUN mkdir -p "$HF_HOME" "$VLLM_CACHE_ROOT"
+COPY homelab/setup-runtime.sh /usr/local/bin/setup-runtime
+RUN chmod 0755 /usr/local/bin/setup-runtime && /usr/local/bin/setup-runtime
 
 LABEL org.opencontainers.image.title="vllm-strix-runtime" \
       org.opencontainers.image.description="vLLM runtime for AMD Strix Halo gfx1151 (Radeon 8060S)" \
@@ -354,6 +344,14 @@ LABEL org.opencontainers.image.title="vllm-strix-runtime" \
       org.randomvariable.vllm.gpu-arch="gfx1151" \
       org.randomvariable.vllm.build-policy="nightly TheRock SDK builds; release ROCm 7.14 runtime (InitDma-safe); no source patches"
 
+LABEL org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
+      org.opencontainers.image.url="${VLLM_BUILD_URL}" \
+      ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
+      ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
+      ai.vllm.build.url="${VLLM_BUILD_URL}" \
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+ENV LD_PRELOAD="/opt/rocm/lib/libmimalloc.so.2"
 WORKDIR /opt/vllm
 ENTRYPOINT ["vllm"]
 CMD ["serve"]

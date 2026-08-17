@@ -128,7 +128,7 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "examples/pooling/token_embed/*", "tests/models/language/pooling/*",
     "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*",
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
-    "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
+    "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html",
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*", "rust/src/parser/**",
     "rust/src/text/src/output/decoded.rs",
@@ -196,3 +196,32 @@ CANN = "CANN"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+
+override-dependencies = [
+  "cuda-toolkit==13.3.1",
+    "nvidia-cutlass-dsl==4.6.2",
+    "nvidia-cutlass-dsl-libs-base==4.6.2",
+    "nvidia-cutlass-dsl-libs-core==4.6.2",
+    "nvidia-cutlass-dsl-libs-cu12==4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13==4.6.2",
+]
+
+# Keep CUDA and FlashInfer packages available to uv without repeating index
+# configuration in each builder image.
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+
+
+[tool.poe.tasks]
+typecheck = "ty check"
