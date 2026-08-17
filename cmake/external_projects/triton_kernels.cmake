@@ -10,14 +10,13 @@ if (DEFINED ENV{TRITON_KERNELS_SRC_DIR})
   )
 
 else()
-  if (VLLM_TARGET_DEVICE STREQUAL "rocm")
-    set(TRITON_GIT "https://github.com/ROCm/triton.git")
-    # Pinned from release/internal/3.6.x
-    set(TRITON_KERNELS_TAG "0f380657dbf3ee86eb57558ff71df24f03b5d4e7")
-  else()
-    set(TRITON_GIT "https://github.com/triton-lang/triton.git")
-    set(TRITON_KERNELS_TAG "v3.5.1")
-  endif()
+  set(TRITON_GIT "https://github.com/triton-lang/triton.git")
+  # Fork code (gpt_oss_triton_kernels_moe.py, mxfp4.py) imports
+  # triton_kernels.matmul_ogs and triton_kernels.routing, which were renamed
+  # to matmul / removed in triton v3.6.0+ (triton-lang/triton#9186, #9539).
+  # Keep the v3.5.1 API that the fork is written against.
+  set(TRITON_KERNELS_TAG "v3.5.1")
+
   message (STATUS "[triton_kernels] Fetch from ${TRITON_GIT}:${TRITON_KERNELS_TAG}")
   FetchContent_Declare(
           triton_kernels
