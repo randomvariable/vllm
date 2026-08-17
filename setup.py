@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from collections.abc import Sequence
 from pathlib import Path
 from shutil import which
 
@@ -32,7 +33,111 @@ def load_module_from_path(module_name, path):
 
 
 ROOT_DIR = Path(__file__).parent
-logger = logging.getLogger(__name__)
+
+
+class _SetupJsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "event": record.getMessage(),
+        }
+        fields = getattr(record, "setup_fields", None)
+        if fields:
+            payload["fields"] = fields
+        return json.dumps(payload, default=str, sort_keys=True)
+
+
+_SENSITIVE_NAME = re.compile(r"(?i)(token|password|secret|api[_-]?key|credential|auth)")
+
+
+def _redact_value(name: str, value: str) -> str:
+    if _SENSITIVE_NAME.search(name):
+        return "<redacted>"
+    value = re.sub(r"(?i)(://)([^/@\s]+):([^/@\s]+)@", r"\1<redacted>@", value)
+    value = re.sub(
+        r"(?i)([?&](?:token|password|secret|api[_-]?key|credential|auth)[^=]*=)[^&#\s]+",
+        r"\1<redacted>",
+        value,
+    )
+    return re.sub(
+        r"(?i)((?:token|password|secret|api[_-]?key|credential|auth)\s*[=:]\s*)[^\s,]+",
+        r"\1<redacted>",
+        value,
+    )
+
+
+def _redact_argv(argv: Sequence[str | os.PathLike[str]]) -> list[str]:
+    redacted = []
+    redact_next = False
+    for raw in argv:
+        # cmake invocations pass Path objects straight to subprocess (e.g. the
+        # --prefix of the install step), so argv is not guaranteed to be str.
+        arg = os.fspath(raw) if isinstance(raw, os.PathLike) else str(raw)
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+        elif _SENSITIVE_NAME.search(arg):
+            if "=" in arg:
+                name, _ = arg.split("=", 1)
+                redacted.append(f"{name}=<redacted>")
+            else:
+                redacted.append(arg)
+                redact_next = True
+        else:
+            redacted.append(_redact_value("", arg))
+    return redacted
+
+
+def _configure_setup_logging() -> logging.Logger:
+    logger = logging.getLogger("vllm.setup")
+    level_name = os.getenv("VLLM_SETUP_LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
+    if not isinstance(level, int):
+        level = logging.WARNING
+    handler = logging.StreamHandler()
+    handler.setFormatter(_SetupJsonFormatter())
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    logger.debug(
+        "setup.start",
+        extra={
+            "setup_fields": {
+                "argv": _redact_argv(sys.argv[1:]),
+                "log_level": logging.getLevelName(level),
+                "python": sys.executable,
+                "platform": sys.platform,
+                "root_dir": str(ROOT_DIR),
+            }
+        },
+    )
+    return logger
+
+
+logger = _configure_setup_logging()
+
+
+def _setup_log(level: int, event: str, **fields: object) -> None:
+    logger.log(level, event, extra={"setup_fields": fields})
+
+
+_SetupArgv = Sequence[str | os.PathLike[str]]
+
+
+def _setup_command_fields(
+    command: _SetupArgv, cwd: str | os.PathLike[str] | None
+) -> dict[str, object]:
+    return {"command": _redact_argv(command), "cwd": cwd}
+
+
+def _run_setup_command(
+    command: _SetupArgv, *, cwd: str | os.PathLike[str] | None = None
+) -> None:
+    _setup_log(logging.DEBUG, "setup.command", **_setup_command_fields(command, cwd))
+    subprocess.check_call(command, cwd=cwd)
+
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 # setuptools-rust installs PyO3 artifacts as `<module>.<ext-suffix>`, where the
@@ -105,6 +210,37 @@ elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is Non
         logger.info("Auto-detected CUDA")
     else:
         VLLM_TARGET_DEVICE = "cpu"
+_setup_log(
+    logging.DEBUG,
+    "setup.environment",
+    target_device=VLLM_TARGET_DEVICE,
+    torch_cuda=torch.version.cuda,
+    torch_hip=torch.version.hip,
+    cuda_home=CUDA_HOME,
+    rocm_home=ROCM_HOME,
+    use_precompiled_extensions=USE_PRECOMPILED_EXTENSIONS,
+    use_precompiled_rust_frontend=USE_PRECOMPILED_RUST_FRONTEND,
+    environment={
+        name: _redact_value(name, os.getenv(name, ""))
+        for name in (
+            "VLLM_TARGET_DEVICE",
+            "VLLM_USE_PRECOMPILED",
+            "VLLM_USE_PRECOMPILED_RUST",
+            "VLLM_PRECOMPILED_WHEEL_LOCATION",
+            "VLLM_PRECOMPILED_WHEEL_VARIANT",
+            "VLLM_PRECOMPILED_WHEEL_COMMIT",
+            "VLLM_ROCM_WHEEL_INDEX",
+            "VLLM_MAIN_CUDA_VERSION",
+            "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX",
+            "CMAKE_BUILD_TYPE",
+            "CMAKE_ARGS",
+            "FETCHCONTENT_BASE_DIR",
+            "MAX_JOBS",
+            "NVCC_THREADS",
+        )
+        if os.getenv(name) is not None
+    },
+)
 
 
 def is_sccache_available() -> bool:
@@ -235,6 +371,12 @@ class cmake_build_ext(build_ext):
             except Exception as e:
                 logger.warning("Failed to get NVCC version: %s", e)
 
+        _setup_log(
+            logging.DEBUG,
+            "build.parallelism",
+            jobs=num_jobs,
+            nvcc_threads=nvcc_threads,
+        )
         return num_jobs, nvcc_threads
 
     #
@@ -319,8 +461,17 @@ class cmake_build_ext(build_ext):
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:
             cmake_args += other_cmake_args.split()
+        _setup_log(
+            logging.DEBUG,
+            "build.cmake.options",
+            extension=ext.name,
+            build_type=cfg,
+            target_device=VLLM_TARGET_DEVICE,
+            generator="Ninja" if build_tool else "default",
+            cmake_args=[_redact_value("", arg) for arg in cmake_args],
+        )
 
-        subprocess.check_call(
+        _run_setup_command(
             ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp,
         )
@@ -332,9 +483,11 @@ class cmake_build_ext(build_ext):
         except OSError as e:
             raise RuntimeError("Cannot find CMake executable") from e
 
+        if build_temp := os.environ.get("VLLM_BUILD_TEMP"):
+            self.build_temp = os.path.abspath(build_temp)
+
         # Create build directory if it does not exist.
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+        os.makedirs(self.build_temp, exist_ok=True)
 
         targets = []
 
@@ -355,7 +508,7 @@ class cmake_build_ext(build_ext):
             *[f"--target={name}" for name in targets],
         ]
 
-        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+        _run_setup_command(["cmake", *build_args], cwd=self.build_temp)
 
         # Install the libraries
         for ext in self.extensions:
@@ -382,7 +535,7 @@ class cmake_build_ext(build_ext):
                 "--component",
                 target_name(ext.name),
             ]
-            subprocess.check_call(install_args, cwd=self.build_temp)
+            _run_setup_command(install_args, cwd=self.build_temp)
 
     def run(self):
         # First, run the standard build_ext command to compile the extensions
@@ -592,16 +745,21 @@ class precompiled_wheel_utils:
     def detect_system_cuda_variant() -> str:
         """Auto-detect CUDA variant from torch, nvidia-smi, or env default."""
 
-        # Map CUDA major version to hosted wheel variants on wheels.vllm.ai
         supported = {12: "cu129", 13: "cu130"}
 
-        # Respect explicitly set VLLM_MAIN_CUDA_VERSION
         if envs.is_set("VLLM_MAIN_CUDA_VERSION"):
             v = envs.VLLM_MAIN_CUDA_VERSION
+            variant = "cu" + v.replace(".", "")[:3]
+            _setup_log(
+                logging.DEBUG,
+                "precompiled_wheel.variant",
+                source="VLLM_MAIN_CUDA_VERSION",
+                cuda_version=v,
+                variant=variant,
+            )
             print(f"Using VLLM_MAIN_CUDA_VERSION={v}")
-            return "cu" + v.replace(".", "")[:3]
+            return variant
 
-        # Try torch.version.cuda
         cuda_version = None
         try:
             import torch
@@ -610,7 +768,6 @@ class precompiled_wheel_utils:
         except Exception:
             pass
 
-        # Try nvidia-smi
         if not cuda_version:
             try:
                 out = subprocess.run(
@@ -621,13 +778,18 @@ class precompiled_wheel_utils:
             except Exception:
                 pass
 
-        # Fall back to default
         if not cuda_version:
             cuda_version = envs.VLLM_MAIN_CUDA_VERSION
 
-        # Map to supported variant
         major = int(cuda_version.split(".")[0])
         variant = supported.get(major, supported[max(supported)])
+        _setup_log(
+            logging.DEBUG,
+            "precompiled_wheel.variant",
+            source="detected",
+            cuda_version=cuda_version,
+            variant=variant,
+        )
         print(f"Detected CUDA {cuda_version}, using variant {variant}")
         return variant
 
@@ -821,6 +983,12 @@ class precompiled_wheel_utils:
         local_wheel = precompiled_wheel_utils.find_local_rocm_wheel()
         if local_wheel is not None:
             print(f"Found local ROCm wheel: {local_wheel}")
+            _setup_log(
+                logging.DEBUG,
+                "precompiled_wheel.selected",
+                source="local_rocm",
+                wheel=local_wheel,
+            )
             return local_wheel, None
 
         import platform
@@ -865,6 +1033,14 @@ class precompiled_wheel_utils:
                     wheel_url = urljoin(f"{repo_url}vllm/", wheel["path"])
                     download_filename = wheel.get("filename")
                     print(f"Using precompiled wheel URL: {wheel_url}")
+                    _setup_log(
+                        logging.DEBUG,
+                        "precompiled_wheel.selected",
+                        source="rocm_metadata",
+                        arch=arch,
+                        variant=variant,
+                        wheel=wheel_url,
+                    )
                     return wheel_url, download_filename
             logger.warning(
                 "No precompiled vllm wheel found for architecture %s "
@@ -882,6 +1058,12 @@ class precompiled_wheel_utils:
         wheel_url = precompiled_wheel_utils.fetch_wheel_from_pypi_index(index_url)
         download_filename = wheel_url.split("/")[-1].split("#")[0]
         print(f"Using ROCm precompiled wheel: {wheel_url}")
+        _setup_log(
+            logging.DEBUG,
+            "precompiled_wheel.selected",
+            source="rocm_pypi",
+            wheel=wheel_url,
+        )
         return wheel_url, download_filename
 
     @staticmethod
@@ -901,6 +1083,12 @@ class precompiled_wheel_utils:
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is not None:
             print(f"Using user-specified precompiled wheel location: {wheel_location}")
+            _setup_log(
+                logging.DEBUG,
+                "precompiled_wheel.selected",
+                source="explicit_location",
+                location=wheel_location,
+            )
             return wheel_location, None
         else:
             # ROCm: resolve wheels from wheels.vllm.ai with environment-matched variant
@@ -965,6 +1153,14 @@ class precompiled_wheel_utils:
                     wheel_url = urljoin(repo_url, wheel["path"])
                     download_filename = wheel.get("filename")
                     print(f"Using precompiled wheel URL: {wheel_url}")
+                    _setup_log(
+                        logging.DEBUG,
+                        "precompiled_wheel.selected",
+                        source="nightly_metadata",
+                        arch=arch,
+                        variant=variant,
+                        wheel=wheel_url,
+                    )
                     break
             else:
                 raise ValueError(
@@ -1315,7 +1511,7 @@ def get_requirements() -> list[str]:
         cuda_major, cuda_minor = torch.version.cuda.split(".")
         modified_requirements = []
         for req in requirements:
-            if "vllm-flash-attn" in req and cuda_major != "12":
+            if "vllm-flash-attn" in req and (cuda_major != "12" or cuda_major != "13"):
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
                 continue
@@ -1341,6 +1537,12 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("xpu.txt")
     else:
         raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
+    _setup_log(
+        logging.DEBUG,
+        "dependencies.selected",
+        target_device=VLLM_TARGET_DEVICE,
+        count=len(requirements),
+    )
     return requirements
 
 
@@ -1442,6 +1644,15 @@ package_data = {
 }
 
 
+_setup_log(
+    logging.DEBUG,
+    "build.extensions",
+    extensions=[ext.name for ext in ext_modules],
+    use_precompiled_extensions=USE_PRECOMPILED_EXTENSIONS,
+    use_precompiled_rust_frontend=USE_PRECOMPILED_RUST_FRONTEND,
+)
+
+
 def add_vllm_package_data(filename: str) -> None:
     vllm_files = package_data.setdefault("vllm", [])
     if filename not in vllm_files:
@@ -1528,8 +1739,11 @@ setup(
         #   - .buildkite/test_areas/kernels.yaml
         #   - .buildkite/test-amd.yaml
         "helion": ["helion==1.4.0"],
-        # Optional deps for gRPC server (vllm serve --grpc)
-        "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
+        # Optional deps for gRPC server (vllm serve --grpc).
+        # The servicer's own `[vllm]` extra depends on published `vllm`, which
+        # resolves back to this project and forms a cycle; its extra payload
+        # (pyzmq, msgspec, vllm) is already covered by our core requirements.
+        "grpc": ["smg-grpc-servicer >= 0.5.2"],
         # Optional deps for OpenTelemetry tracing
         "otel": [
             "opentelemetry-sdk>=1.26.0",
