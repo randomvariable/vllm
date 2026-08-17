@@ -1231,19 +1231,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model_state.encoder_runner.capture()
 
                 if capture_decoder:
-                self.cudagraph_manager.capture(
-                    self.model,
-                    self.model_state,
-                    self.input_buffers,
-                    self.intermediate_tensors,
-                    self.block_tables,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    has_lora=self.lora_config is not None,
-                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                    lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-                    channel_id="vllm:target:production",
-                )
+                    self.cudagraph_manager.capture(
+                        self.model,
+                        self.model_state,
+                        self.input_buffers,
+                        self.intermediate_tensors,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        has_lora=self.lora_config is not None,
+                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                        lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                        channel_id="vllm:target:production",
+                    )
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
                         self.speculator.capture(capture_phase="production")
