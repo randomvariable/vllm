@@ -50,16 +50,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         "/usr/local/cuda/targets/sbsa-linux/lib/$(basename "$stub")"; \
     done
 
-# Python's generic headers come from the builder image. Add only the arm64
-# pyconfig header required when the cross compiler defines __aarch64__.
+# Python's generic headers come from the uv-managed 3.12 in the builder image.
+# Add only the arm64 pyconfig header required when the cross compiler defines
+# __aarch64__. Ubuntu 26.04 ships no Python 3.12 (3.14 is default), so the arm64
+# dev headers are pulled from the noble (24.04) archive; pyconfig.h is stable
+# across 3.12 patch versions, so the pinned 3.12.3 header matches the uv 3.12.x
+# used for the cross compile.
 RUN set -eux; \
-    ver="$(dpkg-query -W -f='${Version}' libpython3.12-dev)"; \
     curl -fsSL -o /tmp/libpython3.12-dev-arm64.deb \
-      "https://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/libpython3.12-dev_${ver}_arm64.deb"; \
+      "https://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/libpython3.12-dev_3.12.3-1ubuntu0.16_arm64.deb"; \
     dpkg-deb -x /tmp/libpython3.12-dev-arm64.deb /tmp/pyarm64; \
     mkdir -p /usr/include/aarch64-linux-gnu; \
     cp -a /tmp/pyarm64/usr/include/aarch64-linux-gnu/python3.12 \
       /usr/include/aarch64-linux-gnu/python3.12; \
+    test -f /usr/include/aarch64-linux-gnu/python3.12/pyconfig.h; \
     rm -rf /tmp/pyarm64 /tmp/libpython3.12-dev-arm64.deb
 
 COPY requirements/build/cuda.txt requirements/build/rust.txt /tmp/build-requirements/
