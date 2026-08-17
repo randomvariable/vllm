@@ -1218,8 +1218,19 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    # CMake's default search path may omit nonstandard CUDA roots such as
+    # /opt/cuda, even when FindCUDAToolkit has located the toolkit there.
     find_library(VLLM_CUBLAS_LIBRARY cublas
-      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib" NO_DEFAULT_PATH)
+      HINTS
+        "${CUDAToolkit_LIBRARY_DIR}"
+        "${CUDAToolkit_LIBRARY_ROOT}/lib64"
+        "${CUDAToolkit_LIBRARY_ROOT}/lib"
+        "${CUDAToolkit_ROOT}/lib64"
+        "${CUDAToolkit_ROOT}/lib"
+        "$ENV{CUDA_HOME}/lib64"
+        "$ENV{CUDA_HOME}/lib"
+      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib"
+      NO_DEFAULT_PATH)
     if(NOT VLLM_CUBLAS_LIBRARY)
       find_library(VLLM_CUBLAS_LIBRARY cublas)
     endif()

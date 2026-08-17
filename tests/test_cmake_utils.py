@@ -80,3 +80,26 @@ endif()
     )
 
     subprocess.run([_get_cmake_bin(), "-P", script], check=True)
+
+
+def test_cublas_search_uses_detected_cuda_toolkit_root(tmp_path: Path):
+    toolkit_lib = tmp_path / "cuda" / "targets" / "x86_64-linux" / "lib"
+    toolkit_lib.mkdir(parents=True)
+    (toolkit_lib / "libcublas.so").touch()
+    script = tmp_path / "test_cublas.cmake"
+    script.write_text(
+        f"""
+set(CUDAToolkit_LIBRARY_DIR "{toolkit_lib}")
+find_library(VLLM_CUBLAS_LIBRARY cublas
+  HINTS
+    "${{CUDAToolkit_LIBRARY_DIR}}"
+  NO_DEFAULT_PATH)
+if(NOT VLLM_CUBLAS_LIBRARY)
+  message(FATAL_ERROR "Expected cuBLAS under detected toolkit root")
+endif()
+if(NOT VLLM_CUBLAS_LIBRARY STREQUAL "{toolkit_lib / 'libcublas.so'}")
+  message(FATAL_ERROR "Unexpected cuBLAS path: ${{VLLM_CUBLAS_LIBRARY}}")
+endif()
+"""
+    )
+    subprocess.run([_get_cmake_bin(), "-P", script], check=True)
