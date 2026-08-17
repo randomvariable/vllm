@@ -48,12 +48,14 @@ UV ?= uv
 
 # Cross compilation keeps all target-specific paths, toolchain flags, and
 # memory-sensitive concurrency in one place instead of duplicating them in the
-# Dockerfile.
-cross: MAX_JOBS=4
-cross: CMAKE_BUILD_PARALLEL_LEVEL=4
-cross: NVCC_THREADS=1
-cross: FLASHINFER_MAX_JOBS=2
-cross: FLASHINFER_NVCC_THREADS=1
+# Dockerfile. Concurrency uses ?= so an exported MAX_JOBS /
+# CMAKE_BUILD_PARALLEL_LEVEL / NVCC_THREADS (e.g. from the spark-cross
+# Dockerfile build-arg ENV) can raise it, defaulting to the memory-safe 4/4/1.
+cross: MAX_JOBS?=4
+cross: CMAKE_BUILD_PARALLEL_LEVEL?=4
+cross: NVCC_THREADS?=1
+cross: FLASHINFER_MAX_JOBS?=2
+cross: FLASHINFER_NVCC_THREADS?=1
 cross: CUDA_HOME=/usr/local/cuda
 cross: CUDA_TOOLKIT_ROOT=/usr/local/cuda
 cross: DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++
@@ -153,9 +155,22 @@ build-wheel:
 		--out-dir $(WHEEL_DIR) .
 
 SPARK_IMAGE ?= local/vllm-spark:dev
+SPARK_CROSS_IMAGE ?= local/vllm-spark-cross:dev
+SPARK_CROSS_PLATFORM ?= linux/arm64
+SPARK_CROSS_MAX_JOBS ?= 4
+SPARK_CROSS_CMAKE_BUILD_PARALLEL_LEVEL ?= 4
+SPARK_CROSS_NVCC_THREADS ?= 1
 
 spark-docker: | .logs
 	$(DOCKER_BUILD) --load -t $(SPARK_IMAGE) -f homelab/spark.Dockerfile . 2>&1 | tee .logs/spark-docker.log
+
+spark-cross-docker: | .logs
+	$(DOCKER_BUILD) --load --platform $(SPARK_CROSS_PLATFORM) \
+		--build-arg MAX_JOBS=$(SPARK_CROSS_MAX_JOBS) \
+		--build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(SPARK_CROSS_CMAKE_BUILD_PARALLEL_LEVEL) \
+		--build-arg NVCC_THREADS=$(SPARK_CROSS_NVCC_THREADS) \
+		-t $(SPARK_CROSS_IMAGE) -f homelab/spark-cross.Dockerfile . \
+		2>&1 | tee .logs/spark-cross-docker.log
 
 strix-docker: | .logs
 	$(DOCKER_BUILD) --load -t $(STRIX_IMAGE) -f homelab/strix.Dockerfile . 2>&1 | tee .logs/strix-docker.log
