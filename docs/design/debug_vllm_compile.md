@@ -145,6 +145,35 @@ If you encounter a graph break, please [open an issue to pytorch/pytorch](https:
 Then, try your best to rewrite the code to avoid the graph break.
 For more information, see this [Dynamo guide](https://docs.pytorch.org/docs/stable/compile/programming_model.dynamo_core_concepts.html).
 
+To get the exact "skipped function" / graph-break reason at runtime, set the
+debug env vars in the serving environment (they surface the full
+`Unsupported: Attempted to call function marked as skipped` message plus the
+call site):
+
+```sh
+TORCHDYNAMO_VERBOSE=1 TORCH_LOGS="+dynamo"
+```
+
+These are the fastest way to identify *why* a runtime symbol can't be traced.
+Two recurring classes on this fork:
+
+- **A third-party C/C++ extension (e.g. DeepGEMM `fp8_einsum`) used inside the
+  compiled region.** Dynamo reports it as "marked as skipped ... cannot
+  determine source file". Fix: wrap it in a custom op registered with
+  `direct_register_custom_op` (see the `o_proj` einsum) so dynamo treats it as
+  opaque, rather than letting the dispatcher call `current_platform.
+  get_device_capability()` (an `lru_cache`) inline — dynamo cannot trace that
+  either.
+- **A Python `None`-able field read as an int inside the compile/warmup path**
+  (e.g. `input_batch.max_query_len <= 1` when `max_query_len` is only set under
+  adaptive verification, so it is `None` during `warmup_kernels`). The
+  `TypeError: '<=' not supported between instances of 'NoneType' and 'int'`
+  only fires at warmup, after the model has loaded. Guard the `None` case
+  explicitly.
+
+Both classes surface only after the model fully loads and warmup begins, so
+debug them with the model running, not at import time.
+
 ## Debugging Dynamic Shape full graph capture
 
 vLLM requires that the model's forward pass be capturable into a full graph that is dynamic
