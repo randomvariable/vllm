@@ -1124,6 +1124,14 @@ def deepgemm_post_process_fp8_weight_block(
         r = wq.size(0) // g
         wq = wq.view(g, r, d)
         ws = ws.view(g, r // quant_block_shape[0], d // quant_block_shape[1])
+        cap = current_platform.get_device_capability()
+        if cap is not None and cap.major == 12:
+            # SM12x routes o_proj (and other is_bmm linears) through the Triton
+            # fp8_einsum fallback, which needs plain fp32 block scales
+            # (g, r/128, d/128). Skip the DeepGEMM int32 UE8M0 packing that
+            # transform_sf_into_required_layout would otherwise apply, so the
+            # scale stays fp32 at load time with no per-forward unpack.
+            return wq, ws
         dg_ws = deepgemm_post_process_weight_scale_block(
             ws=ws,
             mn=r,
