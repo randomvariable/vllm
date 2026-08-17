@@ -1,0 +1,13 @@
+[pip]
+break-system-packages = true
+
+index-strategy = "unsafe-best-match"
+
+[[index]]
+url = "https://flashinfer.ai/whl/"
+
+[[index]]
+url = "https://flashinfer.ai/whl/cu130/"
+
+[[index]]
+url = "https://download.pytorch.org/whl/cu130"
