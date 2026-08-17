@@ -4,11 +4,29 @@ ARG VLLM_BUILD_COMMIT=unknown
 ARG VLLM_BUILD_PIPELINE=local
 ARG VLLM_BUILD_URL=
 ARG VLLM_IMAGE_TAG=local/vllm-spark-cross:dev
+# SBSA cross-build concurrency + source identity, consumed by the
+# vllm-runtime build pipeline (server6). Re-declared in the builder stage
+# below so the values reach `make cross` (exported via ENV), the OCI labels
+# resolve, and the wheel carries the setuptools-scm version.
+ARG MAX_JOBS=4
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+ARG NVCC_THREADS=1
+ARG VLLM_SCM_VERSION=0.1.dev0
 
 FROM --platform=linux/amd64 nvidia/cuda:13.3.1-devel-ubuntu26.04 AS builder
 
+ARG VLLM_SCM_VERSION=0.1.dev0
+ARG MAX_JOBS=4
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+ARG NVCC_THREADS=1
+
 ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH}
+    PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
+    VLLM_BUILD_TEMP=/vllm-build \
+    VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} \
+    MAX_JOBS=${MAX_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
+    NVCC_THREADS=${NVCC_THREADS}
 COPY homelab/install-uv.sh /usr/local/bin/install-uv
 COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
 RUN chmod 0755 /usr/local/bin/install-uv /usr/local/bin/install-system-packages
