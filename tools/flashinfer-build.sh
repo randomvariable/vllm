@@ -69,7 +69,9 @@ FLASHINFER_DIST_DIR="$(realpath "${FLASHINFER_DIST_DIR}")"
 
 pushd "${FLASHINFER_SOURCE_DIR}"
     # Make sure the wheel is built for the correct CUDA version
-    export UV_TORCH_BACKEND=cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')
+    # FlashInfer's published CUDA 13 wheels use the cu130 uv backend for
+    # CUDA 13.x toolkits; uv has no separate cu133 backend.
+    export UV_TORCH_BACKEND=cu130
 
     export TORCH_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}"
     export FLASHINFER_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}"
