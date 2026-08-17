@@ -79,7 +79,7 @@ RUN curl --fail --silent --show-error --location \
     unzip -q /tmp/torch-aarch64.whl -d /opt/torch-aarch64 && \
     rm -f /tmp/torch-aarch64.whl
 
-COPY sbsa-toolchain.cmake /opt/sbsa-toolchain.cmake
+COPY homelab/sbsa-toolchain.cmake /opt/sbsa-toolchain.cmake
 
 RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
