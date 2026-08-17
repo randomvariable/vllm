@@ -1,0 +1,39 @@
+# Install and inspect the ccache configuration used for vLLM native builds.
+#
+#   make -f Makefile.ccache install   # write the config, creating dirs as needed
+#   make -f Makefile.ccache show      # effective config with its source per key
+#   make -f Makefile.ccache stats     # hit rates, with direct-mode split
+#   make -f Makefile.ccache zero      # reset counters before a timing run
+
+CCACHE ?= ccache
+CONFIG_HOME ?= $(or $(XDG_CONFIG_HOME),$(HOME)/.config)
+DEST ?= $(CONFIG_HOME)/ccache/ccache.conf
+# Deliberately not named ccache.conf: ccache treats a ccache.conf in the
+# current directory as a directory config, where max_size is rejected and
+# every ccache invocation from here would hard-error.
+SRC := $(dir $(lastword $(MAKEFILE_LIST)))vllm-ccache.conf
+
+.PHONY: install show stats zero
+
+install:
+	@command -v $(CCACHE) >/dev/null || { echo "ccache not on PATH"; exit 1; }
+	@if [ -e '$(DEST)' ] && ! cmp -s '$(SRC)' '$(DEST)'; then \
+		cp -p '$(DEST)' '$(DEST).bak'; \
+		echo "existing config saved to $(DEST).bak"; \
+	fi
+	@install -Dm644 '$(SRC)' '$(DEST)'
+	@echo "installed $(DEST)"
+	@$(CCACHE) -p | grep -E '^\(environment\)' \
+		&& echo "WARNING: the keys above come from the environment and override this file" \
+		|| true
+
+show:
+	@$(CCACHE) -p | grep -E 'max_size|depend_mode|file_clone|inode_cache|sloppiness|hash_dir|compiler_check|base_dir|cache_dir'
+
+# Direct is the number that matters: preprocessed-only hits mean depend mode is
+# not engaging, usually because an include path varies between builds.
+stats:
+	@$(CCACHE) -sv
+
+zero:
+	@$(CCACHE) -z
