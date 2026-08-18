@@ -292,3 +292,19 @@ Remaining discriminators (fusions A/B #50773, DSpark-off A/B, aux-hidden/mHC
 staleness) all require isolated GPU capacity that does not currently exist
 (server17/19 GPUs fully occupied by serving ranks; LWS template applies
 spec config to all replicas). Deferred to a maintenance window.
+
+## 2026-08-18 (analysis correction) — Two claims in the prior entry retracted
+
+1. "_has_unaligned_cached_prefix + target recompute" as an unaligned-prefix
+   fail-closed for proposals: NOT VERIFIED. The only observed call site of
+   _has_unaligned_cached_prefix gates confidence/capacity bookkeeping
+   (dspark/speculator.py:428, use_draft_token_capacity path), NOT proposal
+   itself. Whether unaligned restored prefixes are suppressed anywhere in
+   the propose path remains UNRESOLVED — the trace must be treated as
+   incomplete. (The block-aligned shift/slot/seq_lens consistency findings
+   stand as verified.)
+2. Validation status restated (final): parser-only pass (zero leakage,
+   structured calls recovered); semantic validation FAILED/INCONCLUSIVE —
+   strict runs showed repeated tool calls on final-answer turns and
+   length-truncated empty finals; harness defects prevent attributing
+   these to model vs spec-decode. No claim of semantic green.
