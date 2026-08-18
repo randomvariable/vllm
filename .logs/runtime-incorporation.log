@@ -412,3 +412,18 @@ cached=512, identical output), the verified claim: greedy output is
 identical between a cold execution and warm prefix-hit executions at
 cached=512. Unverified remains: deep-restored-prefix block coverage
 equivalence, fusions axis, stochastic draft path.
+
+## 2026-08-18 (discriminator) — temp=0 semantic workload: deterministic per-assertion, variable content
+
+The v4 semantic workload re-run at temperature=0.0/seed=42 (3 runs, both
+concurrent sessions, behavior hashed per session): ALL ASSERTIONS PASSED
+every run — no leakage, no cross-session bleed, no invalid tools, no
+repetition loops, no empty finals. Content hashes vary BETWEEN runs
+(sessions A/B produce different valid answers across runs) despite
+temperature=0. This is expected under DSpark probabilistic drafting:
+accepted-draft sequences differ per run, so greedy target-verification
+still lands on different-but-valid continuations. It also means the
+earlier v4 anomalies (repeated tools / length-empty finals) are NOT
+reproducible at temp=0 with adequate budget — consistent with
+model/stochastic-draft behavior rather than deterministic state
+corruption, but not conclusive for the fusions axis, which stays open.
