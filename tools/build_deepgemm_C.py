@@ -48,7 +48,7 @@ if cuda_home is None:
 torch_root = os.environ.get("DEEPGEMM_TORCH_ROOT")
 cuda_lib_dir = os.environ.get("DEEPGEMM_CUDA_LIB_DIR")
 torch_include = (
-    [f"{torch_root}/include"]
+    [f"{torch_root}/include", f"{torch_root}/include/torch/csrc/api/include"]
     if torch_root
     else cpp_extension.include_paths(device_type="cuda")
 )
