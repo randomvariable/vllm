@@ -308,3 +308,18 @@ spec config to all replicas). Deferred to a maintenance window.
    strict runs showed repeated tool calls on final-answer turns and
    length-truncated empty finals; harness defects prevent attributing
    these to model vs spec-decode. No claim of semantic green.
+
+## 2026-08-18 (analysis, verified) — Unaligned fail-closed located; prefix trace now complete
+
+The propose-path unaligned fail-closed EXISTS and is verified in source:
+vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:611-618 — propose()
+begins with `if not dummy_run and self._has_unaligned_cached_prefix(...)`:
+fills draft_tokens with -1 batch-wide and logs "block-unaligned
+cache-restored prefix" (warning_once). The dspark/speculator.py:428 use is
+a second, separate gating of confidence only. With this, the V2 prefix
+trace is complete and consistent end-to-end: unaligned restored prefixes
+disable drafting (this guard); aligned restored prefixes shift the draft
+block table by whole blocks with matching slot-mapping/seq_lens arithmetic
+(verified earlier). Production log check: the guard signature has not
+fired in the 6h since rollout (0 occurrences). Retraction entry above is
+superseded by this verification.
