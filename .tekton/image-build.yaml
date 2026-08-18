@@ -3,8 +3,13 @@ kind: PipelineRun
 metadata:
   name: vllm-image-build
   annotations:
-    pipelinesascode.tekton.dev/on-event: "[push]"
-    pipelinesascode.tekton.dev/on-target-branch: "[homelabs-main]"
+    # Aspirational template, superseded by spark-build-on-push.yaml and
+    # strix-build-on-push.yaml. Neutralized so it cannot fire broken runs
+    # (REDACTED placeholders) on every homelabs-main push. Re-enable only
+    # after filling the placeholders or deleting in favour of the real
+    # pipelines.
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      false
 spec:
   params:
     - name: repo_url
