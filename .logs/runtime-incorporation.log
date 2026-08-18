@@ -237,3 +237,14 @@ all well-formed choices with valid finish_reason values (36 tool_calls, 36
 stop), no empty messages, no DSML/placeholder leakage. Semantic-corruption
 validation therefore remains INCONCLUSIVE pending a corrected validator and
 three clean runs.
+
+## 2026-08-18 (r29 cont.) — Final validation-record state
+
+Consolidated correction: the hardened-harness series was 2/3 passing, not
+3/3 (run1 recorded a harness-side indexing failure). All pass claims for
+the semantic discriminator are withdrawn. Standing verified facts: parser
+leakage fixed and validated (recovery test + malformed-wrapper live test);
+72 persisted responses well-formed with valid finishes (36 tool_calls / 36
+stop); one transient empty-answer event, cause unknown, not reproduced.
+Semantic-corruption validation: INCONCLUSIVE. Next required step: corrected
+validator with defensive empty-list handling, three clean runs.
