@@ -248,3 +248,26 @@ leakage fixed and validated (recovery test + malformed-wrapper live test);
 stop); one transient empty-answer event, cause unknown, not reproduced.
 Semantic-corruption validation: INCONCLUSIVE. Next required step: corrected
 validator with defensive empty-list handling, three clean runs.
+
+## 2026-08-18 (r29 final correction) — Validation record settled
+
+Consolidated final state, superseding the conflicting entries above:
+
+Verified facts:
+1. Parser fix (upstream #52645 through c848ab5aa4, commit 10cb5be03f):
+   validated. Zero DSML/placeholder leakage in every persisted response
+   across all harness generations (100+ responses).
+2. Semantic validation: NOT PASSED. Validator runs were inconsistent
+   across harness versions (some passed, some flagged repeated weather
+   tool calls on final-answer turns and length/empty events); the
+   harnesses themselves had defects and were repeatedly revised, so no
+   harness generation's result can be treated as conclusive in either
+   direction. Discriminating model/prompt behavior (verbose reasoning,
+   legitimate extra tool calls at low max_tokens) from spec-decode
+   semantic corruption requires a controlled A/B, not this harness.
+3. No engine death, no crash, no token soup reproduced since r29.
+
+Next step (when pursued): controlled A/B on an isolated endpoint — same
+v4 workload with DSpark OFF first — to separate model behavior from
+spec-decode corruption. Production pods stay on r29 (parser fix is a
+strict improvement).
