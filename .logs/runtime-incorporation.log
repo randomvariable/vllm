@@ -342,3 +342,23 @@ isolation; the active speculator may pass shared mutable buffers
 (hidden/workspace) through the head. Correct statement: the Markov
 projection itself has no internal mutable state; END-TO-END cross-request
 isolation remains unresolved pending buffer-flow inspection.
+
+## 2026-08-18 (analysis) — Buffer-flow inspection for cross-request isolation
+
+MRO verified: DSparkSpeculator.propose (confidence bookkeeping only,
+dspark/speculator.py:415) -> DFlashSpeculator.propose (unaligned-prefix
+fail-closed at :611 runs before any draft work) -> DraftModelSpeculator.
+
+Markov head: projection-level statelessness (no internal mutable state);
+end-to-end flow passes through speculator-owned shared buffers.
+
+mHC kernels: all intermediates are torch.empty allocated PER CALL inside
+the host wrapper, sized to current num_tokens (tilelang.py:176-190); no
+persistent layer-owned workspace. TileLang JIT caches hold code, not data.
+
+Speculator persistent buffers (hidden_states, _context_slot_mappings,
+draft_logits, input buffers): persistent for CUDA-graph address stability;
+rewritten each propose() via copy_ (:644) and kernel stores (:904-909),
+PAD reset (:233). Residual isolation risk confined to consumers reading
+beyond the written prefix — runtime-observable only (A/B-gated). Static
+analysis exhausted; no further code-level defect found in this class.
