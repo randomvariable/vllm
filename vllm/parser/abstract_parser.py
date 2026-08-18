@@ -1026,6 +1026,9 @@ class DelegatingParser(Parser):
 
         # Reasoning extraction
         if self._in_reasoning_phase(state):
+            reasoning_parser = self._reasoning_parser
+            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
+                reasoning_parser.adjust_request(request)
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
                 current_text=current_text,
@@ -1034,7 +1037,6 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            reasoning_parser = self._reasoning_parser
             if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
                 should_transition = (
                     reasoning_parser.has_engine_confirmed_reasoning_end()
@@ -1171,6 +1173,21 @@ class DelegatingParser(Parser):
             # skip_tool_parsing=True.  Flushing that would leak spurious
             # content (e.g. a stray '"'), so skip it.
             if parser is self._reasoning_parser and reasoning_ended:
+                # Flush the deferred boundary separator (e.g. newline) only
+                # when a recovery hold from the reasoning state completed in
+                # this request (a tool wrapper spawned after reasoning).
+                # Standalone reasoning keeps trailing whitespace stripped.
+                consume = getattr(parser, "consume_reasoning_recovery_completed", None)
+                if consume is not None and consume():
+                    drain = getattr(parser, "drain_deferred_reasoning", None)
+                    if drain is not None:
+                        sep = drain()
+                        if sep:
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.reasoning = (
+                                delta_message.reasoning or ""
+                            ) + sep
                 continue
             finish = getattr(parser, "finish_streaming", None)
             if finish is None:

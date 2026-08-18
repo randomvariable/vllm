@@ -65,9 +65,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
 
-    def is_reasoning_end_for_prompt(
-        self, input_ids: Sequence[int]
-    ) -> bool:
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
         # Forward to the engine: parsers that render adaptive templates
         # override this on the engine class itself (see Qwen3Parser).
         # Without this forwarder the base-class default delegates to
@@ -85,6 +83,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         model_output: str,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
+        self.adjust_request(request)
         self._streaming_count_valid = False
         with self._skip_tool_parsing():
             return self._parser_engine.extract_reasoning(model_output, request)
@@ -121,7 +120,10 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         self,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> ChatCompletionRequest | ResponsesRequest:
-        return self._parser_engine.adjust_request(request)
+        request = self._parser_engine.adjust_request(request)
+        with self._skip_tool_parsing():
+            self._parser_engine._check_skip_tool_parsing(request)
+        return request
 
     def has_engine_confirmed_reasoning_end(self) -> bool:
         return self._parser_engine.reasoning_ended
@@ -141,6 +143,14 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def finish_streaming(self) -> DeltaMessage | None:
         with self._skip_tool_parsing():
             return self._parser_engine.finish_streaming()
+
+    def drain_deferred_reasoning(self) -> str:
+        """Forward deferred-reasoning drain to the wrapped parser engine."""
+        return self._parser_engine.drain_deferred_reasoning()
+
+    def consume_reasoning_recovery_completed(self) -> bool:
+        """Forward the atomic recovery-from-reasoning one-shot flag."""
+        return self._parser_engine.consume_reasoning_recovery_completed()
 
     def get_streaming_fallback_content(
         self,

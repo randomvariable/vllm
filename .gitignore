@@ -264,3 +264,6 @@ mutagen.yml.lock
 
 # Agent harness local state
 .omp/
+
+# local logs (not for public fork)
+.logs/

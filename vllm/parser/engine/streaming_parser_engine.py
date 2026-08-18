@@ -220,6 +220,10 @@ class StreamingParserEngine:
         self._recovery_prior_state = self.state
         self._recovery_prior_tool_index = -1
         self._recovery_outer_closer_pending = False
+        # Sticky: records whether a recovery hold began from the reasoning
+        # state, survived hold clear, so _flush_engine_parsers can flush the
+        # deferred boundary separator only for tool-wrapper spawns.
+        self._reasoning_recovery_completed = False
 
     def feed(
         self,
@@ -405,6 +409,11 @@ class StreamingParserEngine:
                 self._in_skipped_tool_span = False
             return self._emit_for_state(value, token_count)
 
+        if self.skip_tool_parsing and (
+            transition.provisional_tool_call or self._recovery_hold_active
+        ):
+            return self._apply_transition(transition, value, token_count)
+
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             # Inkling reuses one terminal for tool, text, and reasoning exits.
             # Outside a forwarded tool span, apply its normal transition.
@@ -578,6 +587,34 @@ class StreamingParserEngine:
         if self.state == ParserState.TOOL_ARGS:
             if not transition.commit_provisional_tool_call:
                 return self._abort_recovery_hold()
+            if self.skip_tool_parsing:
+                raw = self._recovery_hold_raw
+                held_token_count = self._recovery_hold_token_count
+                prior_state = self._recovery_prior_state
+                prior_tool_index = self._recovery_prior_tool_index
+                self.state = ParserState.CONTENT
+                self.tool_index = prior_tool_index
+                self._reset_args_state()
+                self._clear_recovery_hold()
+                self._recovery_outer_closer_pending = True
+                events: list[SemanticEvent] = []
+                if prior_state == ParserState.REASONING:
+                    self._reasoning_recovery_completed = True
+                    events.append(
+                        SemanticEvent(
+                            EventType.REASONING_END,
+                            tool_index=prior_tool_index,
+                        )
+                    )
+                events.append(
+                    SemanticEvent(
+                        EventType.TEXT_CHUNK,
+                        value=raw,
+                        tool_index=prior_tool_index,
+                        token_count=held_token_count,
+                    )
+                )
+                return events
             transition_events = self._run_transition(transition, value, token_count)
             self._recovery_hold_events.extend(transition_events)
             events = self._recovery_hold_events
@@ -606,6 +643,13 @@ class StreamingParserEngine:
         self._recovery_hold_raw = ""
         self._recovery_hold_token_count = 0
         self._recovery_hold_name = ""
+
+    def consume_reasoning_recovery_completed(self) -> bool:
+        """Return-and-clear whether a recovery hold from the reasoning state
+        completed in this request (atomic one-shot; survives hold clear)."""
+        val = self._reasoning_recovery_completed
+        self._reasoning_recovery_completed = False
+        return val
 
     def _run_transition(
         self,
