@@ -1,0 +1,157 @@
+
+2026-08-17 cross-runtime alignment:
+- Compared native and cross runtime stages.
+- Aligned cross runtime to native packaging: Python 3.13, one uv setup, one wheel install, one setup-runtime invocation, matching wheel copies and runtime metadata.
+- Removed duplicate cross runtime COPY/RUN/LABEL/entrypoint tail introduced during prior edits.
+- Removed duplicate native LD_PRELOAD directive.
+- Targeted checks passed: docker buildx build --check -f homelab/spark-cross.Dockerfile ., .venv/bin/python -m py_compile for KV-cache modules, and git diff --check.
+- No full Docker build run.
+
+2026-08-17 native build fix:
+- Root cause: host `.deps/` (gitignored, but copied into the Docker context) contains
+  `cutlass-subbuild/CMakeCache.txt` baked with host path
+  `/home/naadir/go/src/github.com/randomvariable/vllm/main/.deps`; the container sees
+  `/app/.deps` and CMake fails with
+  "current CMakeCache.txt directory ... is different than the directory ... where CMakeCache.txt was created",
+  aborting every native wheel build after CUTLASS fetch.
+- Fix: spark.Dockerfile sync step now mounts `--mount=type=cache,target=/app/.deps,sharing=locked`
+  (same pattern spark-cross.Dockerfile already used), so the stale host-state directory is
+  replaced by a container-local BuildKit cache and CMake reconfigures fresh under /app.
+- Checks: docker buildx build --check -f homelab/spark.Dockerfile . passes; git diff --check passes.
+
+2026-08-17 triton_kernels pin fix:
+- Runtime error: "No module named 'triton_kernels.matmul_ogs'" (config.py:29, mxfp4.py:61).
+- Root cause: fork code (gpt_oss_triton_kernels_moe.py, mxfp4.py, fused_moe/config.py,
+  mxfp4_utils.py) imports triton_kernels.matmul_ogs and triton_kernels.routing, which were
+  renamed to matmul / removed in triton v3.6.0+ (triton-lang/triton#9186, #9539). The fork's
+  CMake pin had been bumped to v3.7.1, which no longer ships matmul_ogs.
+- Fix: cmake/external_projects/triton_kernels.cmake pins TRITON_KERNELS_TAG back to v3.5.1
+  (the API the fork is written against; also what upstream vLLM uses for CUDA). Verified v3.5.1
+  ships matmul_ogs.py and routing.py.
+- Checks: git diff --check passes.
+
+2026-08-17 NCCL RoCE provider fix:
+- Runtime error: "NCCL error: invalid usage" + "Failed to initialize any NET plugin" +
+  "libibverbs: Warning: couldn't open config directory '/etc/libibverbs.d'" during
+  init_worker_distributed_environment (NCCL 2.29.7+cuda13.2).
+- Root cause: pod runs NCCL_NET=IB with NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 (RoCE), but the
+  runtime image lacked the mlx5 libibverbs provider (ibverbs-providers package provides
+  libmlx5). Without it libibverbs cannot open the RoCE HCA, so NCCL fails to init any NET
+  plugin. librdmacm1 was also missing from the explicit list (its lib was present via libucx0).
+- Fix: added ibverbs-providers (and librdmacm1) to the runtime package list in both
+  homelab/spark.Dockerfile and homelab/spark-cross.Dockerfile.
+- Checks: docker buildx build --check passes for both Dockerfiles; git diff --check passes.
+
+2026-08-17 DeepseekV4FP8Config missing NVFP4 methods fix:
+- Runtime error: "AttributeError: 'DeepseekV4FP8Config' object has no attribute '_is_nvfp4_expert_layer'"
+  during worker init (get_quant_method).
+- Root cause: fork commit 6d926fc626 added a call to self._is_nvfp4_expert_layer(prefix) in
+  get_quant_method but never defined the method (or _nvfp4_expert_prefix_set / the
+  _nvfp4_expert_prefixes init field). The kaitakuai experiments patch
+  (quant_config_draft_moe.patch) defines them; ported them in.
+- Fix: vllm/models/deepseek_v4/quant_config.py now defines _nvfp4_expert_prefix_set(),
+  _is_nvfp4_expert_layer(), and initializes self._nvfp4_expert_prefixes; added `import re`.
+- Checks: .venv/bin/python -m py_compile passes; git diff --check passes.
+
+2026-08-17 fp8_einsum SM12x Triton fallback + dynamo boundary:
+- Repeated runtime failure in deepseek_v4 fp8 o_proj einsum on SM12x (GB10): DeepGEMM fp8_einsum
+  dies on layout.hpp:107 scale assert, then (after the Triton fallback) torch.compile traces into
+  the dispatcher and chokes on get_device_capability() (lru_cache) / get_tensor_model_parallel_rank().
+- Fix (port from jasl codex/ds4-sm120-min-enable):
+  - Added vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py (Triton SM12x einsum kernels +
+    deepseek_v4_fp8_einsum dispatcher + config).
+  - o_proj.py now calls deepseek_v4_fp8_einsum; compute_fp8_einsum_recipe delegates to
+    deepseek_v4_fp8_einsum_config (SM100 packed only on cap.major==10, else SM90-shaped
+    (1,128,128) FP32 block scales).
+  - Dispatcher extended to accept 3D b (is_bmm B12X weight layout), not just 2D.
+  - The einsum is invoked through torch.ops.vllm.deepseek_v4_fp8_o_proj_einsum custom op
+    (direct_register_custom_op) so dynamo keeps it opaque — without this boundary dynamo tries
+    to trace get_device_capability() and fails.
+- Docs: docs/contributing/kernel_targets/sm120.md documents the DeepGEMM fp8_einsum SM12x
+  incompatibility and Triton fallback dispatch.
+- Checks: py_compile for fp8_einsum.py and o_proj.py passes; git diff --check passes.
+
+2026-08-17 fp8_einsum Triton predicate dtype fix:
+- After the dynamo boundary fix, the Triton path still didn't fire: the dispatcher fell through
+  to DeepGEMM (layout.hpp:107) because the B12X weight path stores raw E8M0 scale bits as
+  torch.uint8 (weight_scale_inv.format_ue8m0=True), but _use_deepseek_v4_sm12x_triton_fp8_einsum
+  only accepted float32 / float8_e8m0fnu, and the kernel upcast only handled float8_e8m0fnu.
+- Fix: predicate now accepts torch.uint8 (plus float32/e8m0); both kernel wrappers
+  (einsum + quant) upcast torch.uint8 / float8_e8m0fnu scales to fp32 before launch.
+  _upcast_e8m0_to_fp32 already handles uint8 (view->int32<<23).
+- Checks: py_compile + git diff --check pass.
+
+2026-08-17 B12X CUTLASS DSL cute-to-nvvm ICE root cause:
+- Symptom (recurring): b12x w4a16 MoE / WO-projection JIT compile fails with
+  "ValueError: failed to add `cute-to-nvvm` with options ... cubin-chip=sm_121a (or sm_120f)"
+  wrapped as a CUTLASS DSLRuntimeError ICE. Independent of arch string (sm_121a and sm_120f
+  both fail), DSL version (4.6.2 and 4.7.0 both fail), and b12x fork pin (fork pin, fork master,
+  and local-inference-lab are identical on the failing w4a16 kernel).
+- Reproduced standalone in the aarch64 image:
+    CompileOptions().to_str() -> "opt-level=3 enable-pyir=false ..."
+    PassManager.parse("...enable-pyir=false...")   -> ValueError: no such option enable-pyir
+    PassManager.parse("...(without enable-pyir)...") -> OK
+  So the Python frontend (nvidia_cutlass_dsl.compiler) unconditionally serializes
+  `enable-pyir=false` into the cute-to-nvvm pipeline, but the native MLIR pass in the aarch64
+  wheel does not register that option, so PassManager.parse rejects the whole pipeline before
+  compiling any kernel. Root cause is Python/native version skew baked into the aarch64 wheel.
+- Fix (build-time, in install-runtime-wheels.sh): patch compiler.py so BooleanCompileOption
+  only emits the option when its value is truthy (enable-pyir defaults false and B12X never
+  uses the PyIR/FrontendNext preprocessor, so dropping the token is a no-op semantically).
+  Verified patched serialize() drops enable-pyir=false and PassManager.parse succeeds.
+
+2026-08-17 B12X cu13 runtime missing TVM FFI symbols:
+- After the enable-pyir patch, the DSL compiled but JIT link failed with
+  "Symbols not found: [ CuteDSLRT_TVMFFISetRaisedCudaError, CuteDSLRT_TVMFFISetRaisedCudaLaunchError ]".
+- Root cause: the cu13 runtime lib (libcute_dsl_runtime_cu13.so) is NVIDIA's cross-compiled
+  (SBSA) build and does NOT export the CuteDSLRT_TVMFFI* symbols, while the cu12 runtime lib
+  does. The generated host stub references them unconditionally, so linking against cu13 fails.
+  NVIDIA docs confirm cross-compiled DSL libs are not TVM-FFI compatible; the plain AOT export
+  path is expected. (apache-tvm-ffi was already in requirements/cuda.txt; the missing symbol is
+  in the native lib, not a missing pip package.)
+- Workaround (runtime env var, no rebuild): set CUTE_DSL_LIBS to the cu12 runtime lib so the
+  JIT links a runtime that exports the TVM FFI symbols.
+
+2026-08-17 B12X w4a16 route-packing expert_counts CUDA-graph-capture fix:
+- After the DSL compiled and linked, the model got past torch.compile and B12X MoE warmup but
+  crashed at CUDA graph capture with
+  "expert_counts is not initialized for CUDA graph capture; provide a preallocated W4A16
+  route-packing workspace" from route_pack._workspace_slice.
+- Root cause: b12x fused_moe/_impl.py only added expert_counts to the core workspace plan and
+  only passed it to the launch when full_rotation=True, but pack_topk_routes_by_expert requires
+  it on the non-full-rotation dynamic path too (unconditionally slices it). So during capture
+  it was None and route_pack tried to allocate inside the graph.
+- Fix (fork source + baked into wheel): always include the (route_E,) int32 expert_counts spec
+  in _plan_core_workspace tensor_specs and always pass binding.expert_counts at launch
+  (drop the `if full_rotation else None`). Arena sizing/mapping are spec-driven
+  (_core_workspace_nbytes / _map_core_workspace_views iterate tensor_specs), so no other change
+  needed; route_num_experts == prepared.num_experts == route_E matches the tensor shape.
+- Checks: py_compile of fused_moe/_impl.py and w4a16/kernel.py passes.
+
+## 2026-08-18 — DSv4 local corruption recurrence (two concurrent sessions) → parser recovery port
+
+Incident: two simultaneous agent sessions degraded to token salad on
+deepseek-v4-flash-lws-b-0 (V2 runner, r28-era image). Logs show silent
+corruption only — rank0's 13:23:25 exit was a clean SIGTERM shutdown
+(liveness probe), no CUDA fault. Hit rate climbed 7.2→89.3% across the
+window; two 400s at 12:51:59/12:52:12 preceded a ~600k-token prefill.
+
+Upstream evidence: #51914 + #52645 — DeepSeek-V4-Flash-0731 + DSpark k=5
+intermittently emits malformed DSML tool-call wrappers. Independent 2xGB10
+TP2 validation in the PR thread showed agent sessions degrade wholesale
+once leaked DSML re-enters context; post-patch, zero leakage over 7 rounds.
+Session text matches this fingerprint (<｜DSML｜tool_tool_updates snowball).
+
+Port: upstream #52645 through c848ab5aa4 only (commit 10cb5be03f). Final
+upstream commit 4f2aae22cd excluded — its own regression tests fail on pure
+upstream (ParserEngine.finish_streaming drops _deferred_reasoning; upstream
+CI never ran, contributor-gated). vllm/parser files byte-identical to
+c848ab5aa4. 79/79 DSv4 suite, 3812/3812 parser-engine suite green;
+pre-commit green. Pre-</think> bare-invoke recovery on the delegating path
+remains unsupported (documented residual, tracked as upstream gap).
+
+Ruled out this pass: #51318 C128A packed-stride (fork gates on
+compress_ratio==128; deployment runs C4A ratio 4); jasl #34 packed-KV zeroer
+stride (seg_block_strides present in vllm/v1/worker/utils.py). Remaining
+suspects if degradation persists post-port: #50773 fusions A/B,
+DSpark/prefix-caching diagnostic A/Bs (#51771/#50188 class).
