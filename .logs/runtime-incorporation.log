@@ -362,3 +362,12 @@ rewritten each propose() via copy_ (:644) and kernel stores (:904-909),
 PAD reset (:233). Residual isolation risk confined to consumers reading
 beyond the written prefix — runtime-observable only (A/B-gated). Static
 analysis exhausted; no further code-level defect found in this class.
+
+## 2026-08-18 (handoff correction) — Wording precision
+
+Prior handoff summary said the parser port fixed "the token-soup cascade."
+Overclaim: #52645(c848) fixes DSML LEAKAGE (malformed wrapper recovery);
+it is the leading candidate for the soup cascade but is not proven to be
+its sole root cause. Strict semantic tests remain unresolved (see entries
+above). Soak state at handoff: 349 chat requests served in the last hour
+on group-0, mean acceptance length 5.73, 0 restarts, 0 errors.
