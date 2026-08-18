@@ -323,3 +323,14 @@ block table by whole blocks with matching slot-mapping/seq_lens arithmetic
 (verified earlier). Production log check: the guard signature has not
 fired in the 6h since rollout (0 occurrences). Retraction entry above is
 superseded by this verification.
+
+## 2026-08-18 (analysis) — Draft Markov head cross-request isolation verified
+
+DSparkMarkovHead (qwen3_dspark.py:36-67, shared impl): markov_embed is a
+stateless nn.Embedding lookup; markov_bias is a pure projection
+(logits_processor over markov_w2) with apply_bias_gathered scattering into
+caller-owned buffers. No persistent/cached state in the head. The
+sequential sampling state (prev tokens in _sample_sequential) is
+per-proposal local. Draft-markov cross-request contamination: ruled out by
+construction. mHC persistent workspace + aux-hidden cache under concurrent
+eviction remain runtime-observable only (A/B-gated).
