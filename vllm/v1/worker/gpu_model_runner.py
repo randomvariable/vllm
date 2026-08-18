@@ -201,6 +201,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -692,6 +693,9 @@ class GPUModelRunner(
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dspark():
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
@@ -5288,6 +5292,7 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_dspark()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
@@ -5654,6 +5659,16 @@ class GPUModelRunner(
 
             if not layer_ids and eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
+        if not layer_ids:
+            # dspark_target_layer_ids name the layers whose OUTPUT the drafter
+            # was trained on, but the capture hook fires on `idx + 1 in
+            # aux_hidden_state_layers` (the input of layer L). Convert like the
+            # DFlash branch above; passing them raw shifts every aux hidden
+            # state down one layer and silently degrades acceptance.
+            dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+            if dspark_layer_ids:
+                layer_ids = [i + 1 for i in dspark_layer_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
@@ -7195,6 +7210,7 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         return spec_config is not None and (
             spec_config.use_eagle()
+            or spec_config.use_dspark()
             or spec_config.uses_draft_model()
             or spec_config.uses_extract_hidden_states()
         )
@@ -7450,6 +7466,7 @@ class GPUModelRunner(
         # Initialize drafter attention backend
         if self.speculative_config and (
             self.speculative_config.use_eagle()
+            or self.speculative_config.use_dspark()
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
@@ -7504,6 +7521,7 @@ class GPUModelRunner(
         # Initialize drafter's cudagraph dispatcher if using spec decode.
         if self.speculative_config and (
             self.speculative_config.use_eagle()
+            or self.speculative_config.use_dspark()
             or self.speculative_config.uses_draft_model()
             or self.speculative_config.uses_extract_hidden_states()
         ):
