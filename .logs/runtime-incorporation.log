@@ -387,3 +387,16 @@ expected even without corruption. This discriminator therefore rules out
 cache-restoration-state corruption on the greedy path (prefix hit vs miss
 yields identical output), and leaves only the stochastic draft path as
 untestable without the DSpark-off A/B.
+
+## 2026-08-18 (correction) — Bounding the greedy-replay discriminator claim
+
+The greedy-replay entry overstates scope in two ways: (1) the observed
+cached_tokens values were 0 then 512 on a 783-token prompt; coverage of
+the RESTORED portion of the prefix is not independently verified (hit
+metrics alone do not prove every restored block was exercised
+identically); (2) "only the stochastic draft path remains untested" is
+wrong — the fusions A/B (#50773) also remains open and untested. Correct
+statement: greedy determinism was observed across cold and warm prefix
+executions (0 vs 512 cached tokens); deep-restored-prefix equivalence and
+the fusions axis remain unverified; stochastic draft path remains
+untestable without the DSpark-off A/B.
