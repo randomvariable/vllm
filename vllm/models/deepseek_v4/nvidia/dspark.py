@@ -441,6 +441,23 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def apply_dspark_markov_bias(
+        self,
+        base_logits: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        step_idx: int,
+    ) -> torch.Tensor:
+        """Add the sequential Markov transition bias to draft logits.
+
+        Required by the V2 DSparkProposer. ``prev_token_ids`` are the
+        previously sampled tokens (one per draft position); the bias is the
+        low-rank ``markov_w2(markov_w1[token])`` projection added to the base
+        draft logits.
+        """
+        del step_idx
+        markov_embed = self.markov_embed(prev_token_ids)
+        return base_logits + self.markov_bias(markov_embed)
+
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor | None:
