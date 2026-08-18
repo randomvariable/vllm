@@ -195,3 +195,24 @@ validated for the parser-leakage symptom only. Broader corruption —
 wrong/repeated tool targets under concurrent shared-prefix load — remains
 UNRESOLVED and under investigation (open: V2 dspark prefix handling,
 aux-hidden/mHC staleness, fusions A/B per #50773).
+
+## 2026-08-18 (r29 cont.) — Semantic-corruption discriminator reruns
+
+Upgraded the concurrent agentic harness (2 sessions, disjoint city sets,
+6 turns, tool-result loop, payload persisted per response): assertions for
+valid tool name/JSON args, city within schema world and own session, no
+cross-session bleed, requested city present in final answer, non-empty
+final answer, bounded repetition, no DSML/placeholder leakage, no
+multilingual soup; empty/malformed choices captured as explicit failures.
+
+Results: 3/3 runs ALL ASSERTIONS PASSED (72 responses total, 36
+tool_calls + 36 stop finishes, zero empty finals). One earlier harness
+generation hit "answer missing city: empty string" once (run2 of the
+non-persisting harness); with payload capture enabled the case never
+reproduced across 72 responses, and the persisted dumps show no empty
+messages — consistent with a transient (e.g. truncation at max_tokens in
+the reasoning channel) rather than persistent corruption. Original
+incidents remain distinct in severity (full token soup); parser fix is
+validated for leakage, and the semantic discriminator is now green 3/3,
+but confidence requires sustained real agentic traffic. Remaining
+contingencies (fusions A/B, DSpark/prefix A/B) stay open pending that.
