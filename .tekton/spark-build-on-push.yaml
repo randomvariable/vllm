@@ -316,3 +316,5 @@ spec:
                     secretKeyRef: {name: "{{ notify_secret }}", key: url, optional: true}
 
 # Retrigger: push a commit touching this file (pathChanged) to rebuild at HEAD.
+
+# trigger rebuild 2026-08-18: fork-side pipeline cutover (vllm-runtime pipelines retired)
