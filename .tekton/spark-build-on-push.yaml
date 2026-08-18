@@ -150,14 +150,18 @@ spec:
                 # workspace. Public repo: no token needed, and the Dockerfile
                 # COPYs the source (no secret mount).
                 SRC="$(workspaces.source.path)"
-                SHORT_SHA=$(git rev-parse --short HEAD)
+                # SHAs come from the clone task's results. No git runs in this
+                # step: the build image's git refuses the workspace anyway
+                # (dubious ownership across the two task runs' UIDs on the
+                # shared PVC), and the results are authoritative.
+                FULL_SHA="$(tasks.clone.results.commit)"
+                SHORT_SHA="$(printf '%s' "$FULL_SHA" | cut -c1-7)"
                 # The Dockerfile excludes .git from the context so identical
                 # source yields an identical COPY layer across runs; the commit
                 # and the setuptools-scm version it can no longer derive are
                 # handed over explicitly. 0.1.dev1+g<9-char sha> reproduces what
                 # setuptools-scm produced from the shallow clone.
-                FULL_SHA=$(git rev-parse HEAD)
-                SCM_VERSION="0.1.dev1+g$(git rev-parse --short=9 HEAD)"
+                SCM_VERSION="0.1.dev1+g$(printf '%s' "$FULL_SHA" | cut -c1-9)"
                 LOG_DIR=/home/user/.local/share/buildkit/logs
                 mkdir -p "$LOG_DIR"
                 LOG_FILE="$LOG_DIR/spark-${SHORT_SHA}.log"

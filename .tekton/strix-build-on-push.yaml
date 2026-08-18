@@ -145,7 +145,10 @@ spec:
                 # into the source workspace. Public repo: no token needed, and
                 # the Dockerfile COPYs the source (no secret mount).
                 SRC="$(workspaces.source.path)"
-                SHORT_SHA=$(git rev-parse --short HEAD)
+                # SHA comes from the clone task's result; no git runs here (the
+                # build image's git refuses the workspace -- dubious ownership
+                # across the two task runs' UIDs on the shared PVC).
+                SHORT_SHA="$(printf '%s' "$(tasks.clone.results.commit)" | cut -c1-7)"
                 IMAGE_REF="${HARBOR_REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}"
                 # Concurrency guard on the shared PVC-backed BuildKit state root.
                 #
