@@ -444,3 +444,28 @@ cannot be dismissed as sampling variance. DSpark correctness remains
 UNRESOLVED pending the A/B; the determinism finding slightly ELEVATES the
 priority of the DSpark-off A/B because temp=0 nondeterminism across
 identical prompts is abnormal.
+
+## 2026-08-18 (finding, canonical) — temp=0 nondeterminism isolated and characterized
+
+Divergence isolated with canonical per-turn diffs (3 runs, concurrent
+sessions, temperature=0.0, seed=42, tool-result loops):
+
+1. Single-session replays are DETERMINISTIC (3/3 identical hashes, all
+   turns SAME) — including under prefix-cache hits.
+2. The original divergent condition reproduces only with the
+   tool-result-loop harness shape: first divergence is always at the
+   FINAL ANSWER after a tool round (t0.d1), producing trivially different
+   phrasings of the same fact ("+26°C and humid" vs "+26C and humid" vs
+   "26°C and humid").
+3. Concurrent two-session runs without tool-result loops: deterministic
+   (3/3 identical).
+
+Interpretation (evidence-bounded): nondeterminism appears only on turns
+whose prompt includes tool-role messages in the loop-shaped conversation
+and only across runs, at temp=0 — i.e., prompt-content-dependent greedy
+divergence consistent with batch-composition-dependent numerics (reduction
+order / kernel variant varying with concurrent batch shape), not with
+cross-session state corruption (single-session deterministic; concurrent
+no-tool-loop deterministic; facts always correct). DSpark verification
+correctness remains formally unresolved pending the capacity-gated A/B.
+No further runtime reproduction attempts.
