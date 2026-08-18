@@ -94,7 +94,8 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
     rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu
 COPY . /src/vllm
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    --mount=type=cache,target=/root/.cargo,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,id=vllm-spark-flashinfer-cubins-cross,target=/src/vllm/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins,sharing=locked \
     --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.cache/ccache,sharing=locked \
