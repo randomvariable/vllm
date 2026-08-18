@@ -155,3 +155,27 @@ compress_ratio==128; deployment runs C4A ratio 4); jasl #34 packed-KV zeroer
 stride (seg_block_strides present in vllm/v1/worker/utils.py). Remaining
 suspects if degradation persists post-port: #50773 fusions A/B,
 DSpark/prefix-caching diagnostic A/Bs (#51771/#50188 class).
+
+## 2026-08-18 (r29) — Rollout and live validation of the DSML recovery port
+
+Built local/vllm-spark:2026-08-18-r29 on 192.168.192.17 (docker.service had
+been left disabled; re-enabled via systemd, daemon 29.2.1). Pushed as
+harbor .../custom/vllm-spark:2026-08-17-r11 digest
+sha256:e38a9098435e44bf7682e7d7f9eb9435eb0ee9043a9ba5c858d44c84727c3c77
+(pod imageID e38a9098... is the config digest of the same push). Verified
+recovery code present inside image (recovery_tool_name_validator x3).
+Restarted both LWS groups (deepseek-v4-flash-0/-1 + workers); all four pods
+converged on digest e38a9098.
+
+Live validation on group-0 leader (172.20.1.43:8888):
+- Smoke: "What is the capital of France?" -> "The capital of France is
+  **Paris**."
+- Malformed-wrapper recovery: assistant turn seeded with corrupted outer
+  wrapper (<｜DSML｜toolcalls>) + valid invoke; follow-up with live tools ->
+  structured tool_calls (get_weather/Paris), zero DSML leakage in content.
+- Concurrent shared-prefix multi-turn (2 sessions in parallel, ~2k-token
+  shared system prefix, tools on, 3 turns each, assistant history fed back):
+  both sessions coherent across all turns, correct per-city tool_calls
+  (incl. parallel two-call turn), proper finish_reason (tool_calls/stop),
+  no DSML leakage, no garbled text, no engine death. Runs: flag-scan run
+  (33s) and raw-output run (18s) both clean.
