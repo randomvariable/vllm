@@ -273,7 +273,15 @@ def fused_topk_bias(
     # For batch invariance, use sorted=True to ensure deterministic expert selection
     if hash_indices_table is not None:
         assert input_tokens is not None
-        topk_indices = hash_indices_table[input_tokens]
+        # Guard the gather against out-of-range token ids. DSpark can emit an
+        # out-of-vocab token (e.g. the -1 placeholder used when drafting is
+        # disabled on a cache-restored prefix); indexing hash_indices_table
+        # with it is a negative/OOB access that faults every TP rank.
+        # Clamp to [0, vocab) so a bad id degrades to a valid expert instead
+        # of an illegal memory access (mirrors upstream #50844).
+        vocab_size = hash_indices_table.shape[0]
+        safe_tokens = input_tokens.clamp(0, vocab_size - 1)
+        topk_indices = hash_indices_table[safe_tokens]
     else:
         use_sorted = envs.VLLM_BATCH_INVARIANT
         topk_indices = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=use_sorted)[
