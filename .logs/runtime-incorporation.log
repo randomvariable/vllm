@@ -371,3 +371,19 @@ it is the leading candidate for the soup cascade but is not proven to be
 its sole root cause. Strict semantic tests remain unresolved (see entries
 above). Soak state at handoff: 349 chat requests served in the last hour
 on group-0, mean acceptance length 5.73, 0 restarts, 0 errors.
+
+## 2026-08-18 (discriminator, read-only) — Greedy replay vs warm prefix cache
+
+Bounded discriminator executed against the live group-0 leader (no capacity
+or restart needed): one fixed 3-turn agentic conversation, identical final
+question replayed 6x at temperature=0.0, seed=1234, with per-replay
+cached_tokens recorded. Result: DETERMINISTIC — rep0 (cold, cached=0)
+through rep5 (cached=512/783 prompt tokens, deep prefix-cache hits)
+produced byte-identical correct answers ("Seoul, Oslo, Paris, Lima, Tokyo,
+Cairo"), all finish=stop, no spurious tool calls. Scope: greedy sampling
+cannot exercise the probabilistic draft-sampling path (draft_sample_method
+= probabilistic is stochastic by design); divergence there would be
+expected even without corruption. This discriminator therefore rules out
+cache-restoration-state corruption on the greedy path (prefix hit vs miss
+yields identical output), and leaves only the stochastic draft path as
+untestable without the DSpark-off A/B.
