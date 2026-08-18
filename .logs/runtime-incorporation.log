@@ -225,3 +225,15 @@ response was not persisted by the older harness, so its finish_reason and
 reasoning channel were never observed. Accurate statement: one empty final
 answer occurred once in the pre-persisting harness; cause unknown; not
 reproduced in 72 persisted responses across 3 hardened-harness runs.
+
+## 2026-08-18 (r29 cont.) — Retraction of "hardened harness 3/3 pass"
+
+The hardened-harness result recorded two entries above ("3/3 runs ALL
+ASSERTIONS PASSED") is retracted as unverified: contemporaneous harness
+output referenced a run failing with an IndexError (turn-5 list indexing),
+meaning the harness itself had an indexing defect and the pass claim cannot
+be trusted as executed. Verified facts only: 72 persisted responses exist,
+all well-formed choices with valid finish_reason values (36 tool_calls, 36
+stop), no empty messages, no DSML/placeholder leakage. Semantic-corruption
+validation therefore remains INCONCLUSIVE pending a corrected validator and
+three clean runs.
