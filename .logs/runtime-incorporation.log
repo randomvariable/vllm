@@ -334,3 +334,11 @@ sequential sampling state (prev tokens in _sample_sequential) is
 per-proposal local. Draft-markov cross-request contamination: ruled out by
 construction. mHC persistent workspace + aux-hidden cache under concurrent
 eviction remain runtime-observable only (A/B-gated).
+
+## 2026-08-18 (correction) — Markov-head wording
+
+Prior entry overstates: stateless weights alone do not prove cross-request
+isolation; the active speculator may pass shared mutable buffers
+(hidden/workspace) through the head. Correct statement: the Markov
+projection itself has no internal mutable state; END-TO-END cross-request
+isolation remains unresolved pending buffer-flow inspection.
