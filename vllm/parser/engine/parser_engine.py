@@ -204,8 +204,32 @@ class ParserEngine(Parser):
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
         if events or self._deferred_content:
-            return self._events_to_delta(events, finished=True)
+            delta = self._events_to_delta(events, finished=True)
+            if delta is not None and delta.reasoning is not None:
+                # A reasoning-boundary separator (e.g. the newline before a
+                # rolled-back tool wrapper) was deferred while reasoning was
+                # open. EOF rollback events from the engine follow it, so the
+                # separator must precede them in the final reasoning text.
+                delta.reasoning = self._deferred_reasoning + delta.reasoning
+                self._deferred_reasoning = ""
+            return delta
         return None
+
+    def drain_deferred_reasoning(self) -> str:
+        """Return and clear trailing-whitespace reasoning deferred while
+        reasoning was open, without emitting any buffered tool markup.
+
+        Used when reasoning ended and the parser transitioned to the tool
+        phase: _flush_engine_parsers deliberately skips finish_streaming() to
+        avoid leaking buffered tool-call characters, but the deferred
+        reasoning separator (e.g. newline) must still reach the output.
+        """
+        deferred, self._deferred_reasoning = self._deferred_reasoning, ""
+        return deferred
+
+    def consume_reasoning_recovery_completed(self) -> bool:
+        """Return-and-clear the recovery-from-reasoning one-shot flag."""
+        return self._engine.consume_reasoning_recovery_completed()
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         self._engine.reset(initial_state=initial_state)
