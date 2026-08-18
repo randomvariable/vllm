@@ -3,13 +3,18 @@ kind: PipelineRun
 metadata:
   name: vllm-pull-request
   annotations:
+    # Aspirational template: contains REDACTED placeholders (service account,
+    # image digests) and no remote-task resolution for git-clone. Neutralized
+    # so PRs to homelabs-main cannot fire broken runs. Restore the CEL below
+    # only after templating it like spark/strix-build-on-push.yaml:
+    #   event == "pull_request" && target_branch == "homelabs-main" &&
+    #   (".tekton/**".pathChanged() || "docker/**".pathChanged() ||
+    #    "homelab/**".pathChanged() || "requirements/**".pathChanged() ||
+    #    "vllm/**".pathChanged() || "csrc/**".pathChanged() ||
+    #    "cmake/**".pathChanged() || "setup.py".pathChanged() ||
+    #    "pyproject.toml".pathChanged() || "build*.sh".pathChanged())
     pipelinesascode.tekton.dev/on-cel-expression: |
-      event == "pull_request" && target_branch == "homelabs-main" &&
-      (".tekton/**".pathChanged() || "docker/**".pathChanged() ||
-       "homelab/**".pathChanged() || "requirements/**".pathChanged() ||
-       "vllm/**".pathChanged() || "csrc/**".pathChanged() ||
-       "cmake/**".pathChanged() || "setup.py".pathChanged() ||
-       "pyproject.toml".pathChanged() || "build*.sh".pathChanged())
+      false
 spec:
   params:
     - name: repo_url

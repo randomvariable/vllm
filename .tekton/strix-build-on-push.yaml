@@ -1,0 +1,253 @@
+# Tekton build harness for the AMD Strix Halo (ROCm gfx1151) vLLM runtime image.
+#
+# Lives in the public vllm fork so the pipeline travels with the source it
+# builds. Every infrastructure-specific value (harbor registry + base-image
+# mirror, build node, BuildKit cache PVC, pull secrets) is templated via PAC
+# Repository params resolved from the cluster-side Repository CRD -- the fork
+# itself carries no infra specifics (memory #3980).
+#
+# Builds the fork's own source at the pushed revision: PAC injects
+# repo_url/revision from the push event (always the event HEAD, never a
+# stale YAML literal), git-clone materialises it into the source workspace,
+# and buildctl builds from there. The trigger is pathChanged on this file,
+# so a "retrigger" commit touching it rebuilds against the push HEAD.
+#
+# The build is a cross-compile (hipcc inside the container) -- it does NOT need
+# a GPU, but it is x86_64 (gfx1151 is an x86 APU), so it is pinned to the
+# x86_64 BuildKit node ({{ build_node }}, shared with the spark cross-build).
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: vllm-build-on-push-strix
+  annotations:
+    # Disabled in the source repo (vllm-runtime, commit 03a02ab); stay
+    # disabled through the migration. Enable deliberately as its own change
+    # once the fork pipeline is verified, by restoring:
+    #   event == "push" && target_branch == "homelabs-main" &&
+    #   ".tekton/strix-build-on-push.yaml".pathChanged()
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      false
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/task: "git-clone"
+spec:
+  timeouts:
+    pipeline: 8h0m0s
+  params:
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+  taskRunTemplate:
+    serviceAccountName: "{{ service_account }}"
+    podTemplate:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Dedicated x86_64 CI node for the gfx1151 cross-compile; its
+                  # warm BuildKit cache is backed by a topolvm PVC.
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ build_node }}"]
+      imagePullSecrets: [{name: "{{ pull_secret }}"}]
+      securityContext: {fsGroup: 65532}
+  workspaces:
+    # Ephemeral per-run source; the warm cross-compile caches live on the
+    # buildkitd PVC below, not here.
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "{{ storage_class }}"
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+  pipelineSpec:
+    params:
+      - {name: repo_url, type: string}
+      - {name: revision, type: string}
+    workspaces:
+      - name: source
+    tasks:
+      - name: clone
+        taskRef:
+          name: git-clone
+        params:
+          - name: url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+          - name: depth
+            value: "1"
+          - name: submodules
+            value: "true"
+          - name: deleteExisting
+            value: "true"
+        workspaces:
+          - name: output
+            workspace: source
+      - name: build-and-push
+        runAfter: [clone]
+        timeout: 8h0m0s
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          results:
+            - name: IMAGE_REF
+            - name: IMAGE_TAG
+          steps:
+            - name: fix-permissions
+              image: ubuntu:24.04
+              securityContext: {runAsUser: 0, runAsGroup: 0}
+              volumeMounts: [{name: buildkitd, mountPath: /buildkit-cache}]
+              script: |
+                #!/bin/sh
+                set -eu
+                chown -R 1000:1000 /buildkit-cache
+            - name: buildctl-build
+              image: moby/buildkit:master-rootless
+              workingDir: $(workspaces.source.path)
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                seccompProfile: {type: Unconfined}
+                appArmorProfile: {type: Unconfined}
+              # Cgroup backstop: the gfx1151 HIP compile is memory-hungry; cap it
+              # so it OOMs in the pod, not on the node's host. Request is kept
+              # modest (16Gi) so the pod schedules alongside the node's other
+              # workloads; the compile bursts toward the limit as memory allows.
+              computeResources:
+                requests:
+                  memory: 16Gi
+                limits:
+                  memory: 56Gi
+              env:
+                - {name: DOCKER_CONFIG, value: /tmp/docker}
+                - {name: HARBOR_REGISTRY, value: "{{ harbor_registry }}"}
+                - {name: IMAGE_NAME, value: "{{ strix_harbor_image }}"}
+                # Infra-specific: pull the ROCm base image from the harbor mirror
+                # (the Dockerfile defaults to the public rocm/pytorch image).
+                - name: ROCM_BASE_IMAGE
+                  value: "{{ strix_rocm_base_image }}"
+              script: |
+                #!/bin/sh
+                set -eu
+                mkdir -p /tmp/docker
+                cp /home/user/.docker/config.json /tmp/docker/config.json
+                # git-clone already materialised the fork at the push revision
+                # into the source workspace. Public repo: no token needed, and
+                # the Dockerfile COPYs the source (no secret mount).
+                SRC="$(workspaces.source.path)"
+                SHORT_SHA=$(git rev-parse --short HEAD)
+                IMAGE_REF="${HARBOR_REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}"
+                # Concurrency guard on the shared PVC-backed BuildKit state root.
+                #
+                # buildkitd.lock is an flock, not a PID file: buildkitd holds it
+                # for its lifetime and the kernel releases it when the process
+                # dies, so a crashed build leaves a file but no held lock. The
+                # previous unconditional "rm -f" was therefore never needed for
+                # the stale case, and was actively dangerous in the overlapping
+                # case -- deleting the file while another PipelineRun's buildkitd
+                # holds it gives the new buildkitd a fresh inode to lock, so two
+                # live daemons end up mutating one state root and corrupt it.
+                # (Both runs land on the same node with the same PVC, so their
+                # flocks are on the same kernel and do serialise -- if left alone.)
+                #
+                # Probe non-blocking instead: if the lock is free the run
+                # proceeds (stale files are harmless, buildkitd reuses them); if
+                # it is held, another run is live, so fail fast with a clear
+                # message rather than racing it. A PID-liveness check is not
+                # possible here -- pods have separate PID namespaces.
+                BUILDKIT_ROOT=/home/user/.local/share/buildkit
+                if command -v flock >/dev/null 2>&1; then
+                  if ! flock -n "${BUILDKIT_ROOT}/buildkitd.lock" -c true; then
+                    echo "Another PipelineRun holds ${BUILDKIT_ROOT}/buildkitd.lock;" >&2
+                    echo "refusing to run concurrently against the shared BuildKit" >&2
+                    echo "state root. Re-run once the in-flight build finishes." >&2
+                    exit 1
+                  fi
+                fi
+                rootlesskit buildkitd --oci-worker-no-process-sandbox &
+                BKPID=$!
+                # Reap buildkitd on every exit path, not just the success path.
+                # Without this a failed build leaves the daemon alive holding the
+                # flock, which is exactly the state that makes the next run fail.
+                cleanup() {
+                  status=$?
+                  kill "$BKPID" 2>/dev/null || true
+                  wait "$BKPID" 2>/dev/null || true
+                  exit "$status"
+                }
+                trap cleanup EXIT
+                retries=0
+                while [ ! -S /run/user/1000/buildkit/buildkitd.sock ] && [ "$retries" -lt 30 ]; do
+                  # Backstop for the probe's TOCTOU window: if a competing run
+                  # grabbed the lock between the probe and here, buildkitd exits
+                  # immediately rather than waiting out the full 30s timeout.
+                  if ! kill -0 "$BKPID" 2>/dev/null; then
+                    echo "buildkitd exited during startup; the shared BuildKit state" >&2
+                    echo "root is most likely locked by a concurrent PipelineRun." >&2
+                    exit 1
+                  fi
+                  sleep 1
+                  retries=$((retries + 1))
+                done
+                if [ ! -S /run/user/1000/buildkit/buildkitd.sock ]; then
+                  echo "BuildKit socket did not appear after 30 seconds" >&2
+                  exit 1
+                fi
+                buildctl build --frontend dockerfile.v0 \
+                  --local context="$SRC" --local dockerfile="$SRC" \
+                  --opt filename=homelab/strix.Dockerfile \
+                  --opt build-arg:BASE_IMAGE="${ROCM_BASE_IMAGE}" \
+                  --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
+                  --export-cache type=inline \
+                  --output "type=image,name=${IMAGE_REF},push=true"
+                buildctl build --frontend dockerfile.v0 \
+                  --local context="$SRC" --local dockerfile="$SRC" \
+                  --opt filename=homelab/strix.Dockerfile \
+                  --opt build-arg:BASE_IMAGE="${ROCM_BASE_IMAGE}" \
+                  --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
+                  --export-cache type=inline \
+                  --output "type=image,name=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest,push=true"
+                printf '%s' "$IMAGE_REF" > "$(results.IMAGE_REF.path)"
+                printf '%s' "$SHORT_SHA" > "$(results.IMAGE_TAG.path)"
+              volumeMounts:
+                - {name: dockerconfig, mountPath: /home/user/.docker}
+                - {name: buildkitd, mountPath: /home/user/.local/share/buildkit}
+          volumes:
+            - name: dockerconfig
+              secret:
+                secretName: "{{ docker_config_secret }}"
+                items: [{key: .dockerconfigjson, path: config.json}]
+            - name: buildkitd
+              # Persistent topolvm PVC survives build reschedules on the node.
+              persistentVolumeClaim: {claimName: "{{ strix_buildkit_pvc }}"}
+    finally:
+      - name: notify-failure
+        when:
+          - {input: $(tasks.status), operator: in, values: [Failed]}
+        taskSpec:
+          steps:
+            - name: notify
+              image: curlimages/curl:8.5.0
+              script: |
+                #!/bin/sh
+                if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+                  curl -sf -X POST "$GOOGLE_CHAT_WEBHOOK_URL" \
+                    -H 'Content-Type: application/json' \
+                    -d '{"text":"vllm-strix-runtime image build failed"}'
+                fi
+              env:
+                - name: GOOGLE_CHAT_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef: {name: "{{ notify_secret }}", key: url, optional: true}
+
+# Retrigger: push a commit touching this file (pathChanged) to rebuild at HEAD.

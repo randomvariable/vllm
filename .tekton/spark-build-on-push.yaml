@@ -1,0 +1,318 @@
+# Tekton build harness for the DGX Spark (CUDA sm_121a) vLLM runtime image.
+#
+# Lives in the public vllm fork so the pipeline travels with the source it
+# builds. Every infrastructure-specific value (harbor + ghcr registries, build
+# node, BuildKit cache PVC, pull secrets) is templated via PAC Repository
+# params resolved from the cluster-side Repository CRD -- the fork itself
+# carries no infra specifics (memory #3980).
+#
+# Builds the fork's own source at the pushed revision: PAC injects
+# repo_url/revision from the push event (always the event HEAD, never a
+# stale YAML literal), git-clone materialises it (shallow superproject,
+# full recursive submodules) into the source workspace, and buildctl builds
+# from there. The trigger is pathChanged on this file, so a "retrigger"
+# commit touching it rebuilds against the push HEAD.
+#
+# Cross-compiled on an x86_64 BuildKit node using NVIDIA's SBSA cross toolkit +
+# native nvcc with an aarch64 host compiler, then the aarch64 runtime stage
+# runs under qemu-aarch64 (binfmt_misc registered on the build node host). The
+# native arm64 build path (homelab/spark.Dockerfile on the Pi pool) is not
+# viable: the Pi CM5s are too memory-constrained for the vLLM CUDA compile.
+#
+# The built image is pushed to both harbor (<sha> and :latest) and ghcr
+# (<sha> and :latest); the dockerconfig secret carries auth entries for both.
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: vllm-build-on-push-spark
+  annotations:
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push" && target_branch == "homelabs-main" &&
+      ".tekton/spark-build-on-push.yaml".pathChanged()
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+    pipelinesascode.tekton.dev/task: "git-clone"
+spec:
+  timeouts:
+    pipeline: 8h0m0s
+  params:
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+  taskRunTemplate:
+    serviceAccountName: "{{ service_account }}"
+    podTemplate:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Dedicated x86_64 CI node for the sm_121a cross-compile; its
+                  # warm BuildKit cache is backed by a persistent PVC. qemu-aarch64
+                  # binfmt_misc is registered on the node host kernel.
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ build_node }}"]
+      imagePullSecrets: [{name: "{{ pull_secret }}"}]
+      securityContext: {fsGroup: 65532}
+  workspaces:
+    # Ephemeral per-run source; the warm cross-compile caches live on the
+    # buildkitd PVC below, not here.
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "{{ storage_class }}"
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+  pipelineSpec:
+    params:
+      - {name: repo_url, type: string}
+      - {name: revision, type: string}
+    workspaces:
+      - name: source
+    tasks:
+      - name: clone
+        taskRef:
+          name: git-clone
+        params:
+          - name: url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+          - name: depth
+            value: "1"
+          - name: submodules
+            value: "true"
+          - name: deleteExisting
+            value: "true"
+        workspaces:
+          - name: output
+            workspace: source
+      - name: build-and-push
+        runAfter: [clone]
+        timeout: 8h0m0s
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          results:
+            - name: IMAGE_REF
+            - name: IMAGE_TAG
+          steps:
+            - name: fix-permissions
+              image: ubuntu:24.04
+              securityContext: {runAsUser: 0, runAsGroup: 0}
+              volumeMounts: [{name: buildkitd, mountPath: /buildkit-cache}]
+              script: |
+                #!/bin/sh
+                set -eu
+                chown -R 1000:1000 /buildkit-cache
+            - name: buildctl-build
+              image: moby/buildkit:master-rootless
+              workingDir: $(workspaces.source.path)
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                seccompProfile: {type: Unconfined}
+                appArmorProfile: {type: Unconfined}
+              # Leave at least the kubelet eviction reserve plus the node's
+              # resident workload footprint. Parallelism is constrained in the
+              # Dockerfile; this cgroup limit converts any miss into a retained
+              # task failure rather than evicting the node's Pod.
+              computeResources:
+                requests:
+                  memory: 40Gi
+                limits:
+                  memory: 44Gi
+              env:
+                - {name: DOCKER_CONFIG, value: /tmp/docker}
+                - {name: HARBOR_REGISTRY, value: "{{ harbor_registry }}"}
+                - {name: IMAGE_NAME, value: "{{ spark_harbor_image }}"}
+                # Mirror pushes to GitHub Container Registry under the same
+                # repository namespace. The dockerconfig secret carries a
+                # ghcr.io auth entry (packages:write).
+                - {name: GHCR_REGISTRY, value: "{{ spark_ghcr_registry }}"}
+                - {name: GHCR_IMAGE_NAME, value: "{{ spark_ghcr_image }}"}
+              script: |
+                #!/bin/sh
+                set -eu
+                mkdir -p /tmp/docker
+                cp /home/user/.docker/config.json /tmp/docker/config.json
+                # git-clone already materialised the fork at the push revision
+                # (shallow superproject, recursive submodules) into the source
+                # workspace. Public repo: no token needed, and the Dockerfile
+                # COPYs the source (no secret mount).
+                SRC="$(workspaces.source.path)"
+                SHORT_SHA=$(git rev-parse --short HEAD)
+                # The Dockerfile excludes .git from the context so identical
+                # source yields an identical COPY layer across runs; the commit
+                # and the setuptools-scm version it can no longer derive are
+                # handed over explicitly. 0.1.dev1+g<9-char sha> reproduces what
+                # setuptools-scm produced from the shallow clone.
+                FULL_SHA=$(git rev-parse HEAD)
+                SCM_VERSION="0.1.dev1+g$(git rev-parse --short=9 HEAD)"
+                LOG_DIR=/home/user/.local/share/buildkit/logs
+                mkdir -p "$LOG_DIR"
+                LOG_FILE="$LOG_DIR/spark-${SHORT_SHA}.log"
+                LOG_PIPE="$LOG_DIR/.spark-${SHORT_SHA}.pipe"
+                rm -f "$LOG_PIPE"
+                mkfifo "$LOG_PIPE"
+                tee -a "$LOG_FILE" < "$LOG_PIPE" &
+                LOG_TEE_PID=$!
+                exec > "$LOG_PIPE" 2>&1
+                echo "Persisting build log to $LOG_FILE"
+                IMAGE_REF="${HARBOR_REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}"
+                # Concurrency guard on the shared PVC-backed BuildKit state root.
+                #
+                # buildkitd.lock is an flock, not a PID file: buildkitd holds it
+                # for its lifetime and the kernel releases it when the process
+                # dies, so a crashed build leaves a file but no held lock. The
+                # previous unconditional "rm -f" was therefore never needed for
+                # the stale case, and was actively dangerous in the overlapping
+                # case -- deleting the file while another PipelineRun's buildkitd
+                # holds it gives the new buildkitd a fresh inode to lock, so two
+                # live daemons end up mutating one state root and corrupt it.
+                # (Both runs land on the same node with the same PVC, so their
+                # flocks are on the same kernel and do serialise -- if left alone.)
+                #
+                # Probe non-blocking instead: if the lock is free the run
+                # proceeds (stale files are harmless, buildkitd reuses them); if
+                # it is held, another run is live, so fail fast with a clear
+                # message rather than racing it. A PID-liveness check is not
+                # possible here -- pods have separate PID namespaces.
+                BUILDKIT_ROOT=/home/user/.local/share/buildkit
+                if command -v flock >/dev/null 2>&1; then
+                  if ! flock -n "${BUILDKIT_ROOT}/buildkitd.lock" -c true; then
+                    echo "Another PipelineRun holds ${BUILDKIT_ROOT}/buildkitd.lock;" >&2
+                    echo "refusing to run concurrently against the shared BuildKit" >&2
+                    echo "state root. Re-run once the in-flight build finishes." >&2
+                    exit 1
+                  fi
+                fi
+                # buildkitd ran with no config at all, so it applied the default
+                # GC policy on every start. Measured across three consecutive
+                # runs: each executing step got a freshly created cache-mount
+                # record, ccache reported "Files: 0" at stage entry, and total
+                # BuildKit storage fell from 43.4GB to 33.5GB between runs. The
+                # only mount that survived (//root/.cache/uv, since July) belongs
+                # to a step whose layer is cached and therefore never re-runs.
+                #
+                # Net effect: the FlashInfer AOT and vLLM wheel stages recompiled
+                # from an empty ccache every single time -- roughly three hours
+                # of work whose whole purpose was to be cached.
+                #
+                # reservedSpace is what GC will not reclaim. 150GB of the 200GB
+                # PVC leaves headroom for the ~95GB working set plus a build's
+                # worth of new layers, while maxUsedSpace keeps a runaway build
+                # from filling the volume.
+                mkdir -p /home/user/.config/buildkit
+                cat > /home/user/.config/buildkit/buildkitd.toml <<'BKCONF'
+                root = "/home/user/.local/share/buildkit"
+
+                [worker.oci]
+                  enabled = true
+                  gc = true
+                  reservedSpace = "150GB"
+                  maxUsedSpace = "160GB"
+                  minFreeSpace = "10GB"
+                BKCONF
+                echo "== buildkitd config =="
+                cat /home/user/.config/buildkit/buildkitd.toml
+                # Verbose cross-compile output exceeds BuildKit's defaults (2MiB
+                # per step, 200KiB/s), which truncated the FlashInfer layer
+                # mid-build and hid everything after it. Read by buildkitd, not
+                # buildctl. Logs stream to the pod and are rotated by kubelet
+                # (256MiB x 10 here), never stored in etcd, so this does not
+                # affect Tekton object size.
+                #
+                # Size is raised to a bounded 128MiB rather than unlimited: this
+                # layer alone is ~3400 compile units and verbose output is the
+                # dominant term, so -1 risks a multi-hundred-MiB log that rotates
+                # its own early history away. The rate cap is disabled outright
+                # since parallel compiles are inherently bursty.
+                BUILDKIT_STEP_LOG_MAX_SIZE=134217728 \
+                BUILDKIT_STEP_LOG_MAX_SPEED=-1 \
+                rootlesskit buildkitd --oci-worker-no-process-sandbox \
+                  --config /home/user/.config/buildkit/buildkitd.toml &
+                BKPID=$!
+                cleanup() {
+                  status=$?
+                  kill "$BKPID" 2>/dev/null || true
+                  wait "$BKPID" 2>/dev/null || true
+                  exit "$status"
+                }
+                trap cleanup EXIT
+                retries=0
+                while [ ! -S /run/user/1000/buildkit/buildkitd.sock ] && [ "$retries" -lt 30 ]; do
+                  # Backstop for the probe's TOCTOU window: if a competing run
+                  # grabbed the lock between the probe and here, buildkitd exits
+                  # immediately rather than waiting out the full 30s timeout.
+                  if ! kill -0 "$BKPID" 2>/dev/null; then
+                    echo "buildkitd exited during startup; the shared BuildKit state" >&2
+                    echo "root is most likely locked by a concurrent PipelineRun." >&2
+                    exit 1
+                  fi
+                  sleep 1
+                  retries=$((retries + 1))
+                done
+                if [ ! -S /run/user/1000/buildkit/buildkitd.sock ]; then
+                  echo "BuildKit socket did not appear after 30 seconds" >&2
+                  exit 1
+                fi
+                buildctl build --frontend dockerfile.v0 \
+                  --local context="$SRC" --local dockerfile="$SRC" \
+                  --opt filename=homelab/spark-cross.Dockerfile \
+                  --opt platform=linux/arm64 \
+                  --opt build-arg:MAX_JOBS=4 \
+                  --opt build-arg:CMAKE_BUILD_PARALLEL_LEVEL=4 \
+                  --opt build-arg:NVCC_THREADS=1 \
+                  --opt build-arg:VLLM_BUILD_COMMIT="$FULL_SHA" \
+                  --opt build-arg:VLLM_SCM_VERSION="$SCM_VERSION" \
+                  --opt build-arg:VLLM_IMAGE_TAG="$IMAGE_REF" \
+                  --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
+                  --export-cache type=inline \
+                  --output "type=image,\"name=${IMAGE_REF},${HARBOR_REGISTRY}/${IMAGE_NAME}:latest,${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:${SHORT_SHA},${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:latest\",push=true"
+                printf '%s' "$IMAGE_REF" > "$(results.IMAGE_REF.path)"
+                printf '%s' "$SHORT_SHA" > "$(results.IMAGE_TAG.path)"
+              volumeMounts:
+                - {name: dockerconfig, mountPath: /home/user/.docker}
+                - {name: buildkitd, mountPath: /home/user/.local/share/buildkit}
+          volumes:
+            - name: dockerconfig
+              secret:
+                secretName: "{{ docker_config_secret }}"
+                items: [{key: .dockerconfigjson, path: config.json}]
+            - name: buildkitd
+              # Persistent PVC survives build reschedules on the node and holds
+              # the cross-compile ccache + BuildKit layer cache (arm64 runtime
+              # stage). Same PVC the manual cross-builds used, so the ccache is
+              # warm.
+              persistentVolumeClaim: {claimName: "{{ spark_buildkit_pvc }}"}
+    finally:
+      - name: notify-failure
+        when:
+          - {input: $(tasks.status), operator: in, values: [Failed]}
+        taskSpec:
+          steps:
+            - name: notify
+              image: curlimages/curl:8.5.0
+              script: |
+                #!/bin/sh
+                if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+                  curl -sf -X POST "$GOOGLE_CHAT_WEBHOOK_URL" \
+                    -H 'Content-Type: application/json' \
+                    -d '{"text":"vllm-spark-runtime image build failed"}'
+                fi
+              env:
+                - name: GOOGLE_CHAT_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef: {name: "{{ notify_secret }}", key: url, optional: true}
+
+# Retrigger: push a commit touching this file (pathChanged) to rebuild at HEAD.
