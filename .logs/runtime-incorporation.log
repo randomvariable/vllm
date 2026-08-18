@@ -469,3 +469,17 @@ cross-session state corruption (single-session deterministic; concurrent
 no-tool-loop deterministic; facts always correct). DSpark verification
 correctness remains formally unresolved pending the capacity-gated A/B.
 No further runtime reproduction attempts.
+
+## 2026-08-18 (correction) — Matrix summary corrected; single-session claim retracted
+
+The matrix above ("single session deterministic 3/3") is retracted: on
+review of the full run history, the corrected single-session B harness
+produced 4 distinct hashes across 4 temp=0 runs, and the tool-loop
+series showed run1 differing from later runs as well. Temp=0
+nondeterminism therefore occurs EVEN SINGLE-SESSION and is
+prompt-specific. What survives: all outputs remain factually correct
+(no soup, no leakage, no cross-session bleed), single-run internal
+consistency, and deterministic prefix-hit replay in the first
+discriminator (whose conversation shape differed). Attribution is
+UNRESOLVED across candidates: DSpark verification, batch-composition
+numerics in target kernels, and fusions (#50773) — pending the A/Bs.
