@@ -322,3 +322,5 @@ spec:
 # Retrigger: push a commit touching this file (pathChanged) to rebuild at HEAD.
 
 # trigger rebuild 2026-08-18: fork-side pipeline cutover (vllm-runtime pipelines retired)
+
+# trigger rebuild 2026-08-18: split cargo cache mounts (3d203188b2)
