@@ -427,3 +427,20 @@ earlier v4 anomalies (repeated tools / length-empty finals) are NOT
 reproducible at temp=0 with adequate budget — consistent with
 model/stochastic-draft behavior rather than deterministic state
 corruption, but not conclusive for the fusions axis, which stays open.
+
+## 2026-08-18 (correction) — temp=0 content variance is NOT "by design"
+
+The prior entry's attribution ("expected under DSpark probabilistic
+drafting ... legitimately lands on different-but-valid continuations") is
+retracted as technically wrong: correct speculative decoding must preserve
+the TARGET distribution; at temperature=0 the sampled token sequence must
+be deterministic regardless of which drafts were proposed or accepted.
+The observed between-run hash variance at temp=0 (session B: three
+different hashes across three runs; A: two) is evidence of
+NONDETERMINISM in the greedy decode path — candidate causes: batch
+composition-dependent numerics (kernel reduction order varying with
+concurrent batch shape) or a DSpark verification correctness bug. This
+cannot be dismissed as sampling variance. DSpark correctness remains
+UNRESOLVED pending the A/B; the determinism finding slightly ELEVATES the
+priority of the DSpark-off A/B because temp=0 nondeterminism across
+identical prompts is abnormal.
