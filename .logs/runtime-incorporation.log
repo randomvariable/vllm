@@ -400,3 +400,15 @@ statement: greedy determinism was observed across cold and warm prefix
 executions (0 vs 512 cached tokens); deep-restored-prefix equivalence and
 the fusions axis remain unverified; stochastic draft path remains
 untestable without the DSpark-off A/B.
+
+## 2026-08-18 (verified values) — Greedy discriminator re-executed with ground truth
+
+Re-executed the discriminator capturing per-replay cached_tokens directly
+from the response payloads: all six replays reported cached=512 (the
+server's prefix cache was already warm from the earlier run, so no cold
+rep0 appears this time). All six answers byte-identical, finish=stop, no
+tool calls. Combined with the earlier run (rep0 cached=0 -> rep5
+cached=512, identical output), the verified claim: greedy output is
+identical between a cold execution and warm prefix-hit executions at
+cached=512. Unverified remains: deep-restored-prefix block coverage
+equivalence, fusions axis, stochastic draft path.
