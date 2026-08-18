@@ -216,3 +216,12 @@ incidents remain distinct in severity (full token soup); parser fix is
 validated for leakage, and the semantic discriminator is now green 3/3,
 but confidence requires sustained real agentic traffic. Remaining
 contingencies (fusions A/B, DSpark/prefix A/B) stay open pending that.
+
+## 2026-08-18 (r29 cont.) — Correction on transient attribution
+
+The previous entry's parenthetical "(e.g. truncation at max_tokens in the
+reasoning channel)" for the single empty-answer event is unsupported — that
+response was not persisted by the older harness, so its finish_reason and
+reasoning channel were never observed. Accurate statement: one empty final
+answer occurred once in the pre-persisting harness; cause unknown; not
+reproduced in 72 persisted responses across 3 hardened-harness runs.
