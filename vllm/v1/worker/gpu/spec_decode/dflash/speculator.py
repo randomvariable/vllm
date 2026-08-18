@@ -378,20 +378,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             for block_size in self.block_tables.kernel_block_sizes
         )
 
-    def _has_cached_prefix(self, input_batch: InputBatch) -> bool:
-        """True if any request has a cache-restored prefix (aligned or not).
-
-        The draft block-table shift that hides restored slots from draft
-        attention is inconsistent with the query slot-mapping computed against
-        the unshifted table, so a shared-prefix hit makes the draft read the
-        wrong KV slots and corrupts output (repeated/echoed tokens that
-        accumulate). Fail closed on any restored prefix until the shift and
-        slot-mapping are made consistent.
-        """
-        req_state_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
-        cached = self.num_cached_tokens_np[req_state_indices]
-        return bool(np.any(cached > 0))
-
     def set_attn(
         self,
         model_state: ModelState,
@@ -621,15 +607,6 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
-        if not dummy_run and self._has_cached_prefix(input_batch):
-            logger.warning_once(
-                "DFlash/DSpark drafting is disabled for a batch containing a "
-                "cache-restored prefix because the draft block-table shift is "
-                "inconsistent with the query slot-mapping, which corrupts draft "
-                "KV on shared-prefix hits."
-            )
-            self.draft_tokens[:num_reqs].fill_(-1)
-            return self.draft_tokens[:num_reqs]
         if not dummy_run and self._has_unaligned_cached_prefix(input_batch):
             logger.warning_once(
                 "DFlash/DSpark drafting is disabled for a batch containing a "
