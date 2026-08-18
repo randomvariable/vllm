@@ -41,6 +41,24 @@ info = json.loads(
 cuda_home = cpp_extension.CUDA_HOME
 if cuda_home is None:
     sys.exit("CUDA_HOME not found; cannot build DeepGEMM _C")
+
+# Cross-compilation: the Makefile cross target sets these to the aarch64
+# torch tree and SBSA CUDA library dir. When unset, fall back to the host
+# torch/CUDA paths (native build).
+torch_root = os.environ.get("DEEPGEMM_TORCH_ROOT")
+cuda_lib_dir = os.environ.get("DEEPGEMM_CUDA_LIB_DIR")
+torch_include = (
+    f"{torch_root}/include"
+    if torch_root
+    else cpp_extension.include_paths(device_type="cuda")
+)
+torch_lib = (
+    f"{torch_root}/lib"
+    if torch_root
+    else cpp_extension.library_paths(device_type="cuda")
+)
+cuda_lib = cuda_lib_dir or f"{cuda_home}/lib64"
+
 # CCCL lives outside the standard CUDAToolkit search (mirrors DeepGEMM's setup.py).
 includes = [
     info["INCLUDEPY"],
@@ -51,7 +69,7 @@ includes = [
     str(src / "third-party/cutlass/include"),
     str(src / "third-party/cutlass/tools/util/include"),
     str(src / "third-party/fmt/include"),
-    *cpp_extension.include_paths(device_type="cuda"),
+    *torch_include,
 ]
 
 cmd = [
@@ -68,8 +86,8 @@ cmd = [
     f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
     *(f"-I{p}" for p in includes),
     str(src / "csrc/python_api.cpp"),
-    *(f"-L{p}" for p in cpp_extension.library_paths(device_type="cuda")),
-    f"-L{cuda_home}/lib64",
+    *(f"-L{p}" for p in torch_lib),
+    f"-L{cuda_lib}",
     "-ltorch",
     "-ltorch_python",
     "-ltorch_cpu",
