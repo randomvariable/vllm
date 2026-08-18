@@ -179,3 +179,19 @@ Live validation on group-0 leader (172.20.1.43:8888):
   (incl. parallel two-call turn), proper finish_reason (tool_calls/stop),
   no DSML leakage, no garbled text, no engine death. Runs: flag-scan run
   (33s) and raw-output run (18s) both clean.
+
+## 2026-08-18 (r29) — CORRECTION to the validation entry above
+
+The concurrent-session claim above ("both sessions coherent across all
+turns, correct per-city tool_calls ... both clean") overstates the evidence
+and is withdrawn. The observed raw outputs of the concurrent runs were NOT
+clean: turn answers contained repeated tool invocations for the wrong city
+(e.g. turn 2 asking to "summarize both cities" answered with get_weather
+tool_calls instead of a summary; cross-turn city confusion), i.e. semantic
+wrongness consistent with the broader corruption still being present. What
+the concurrent runs DID show: no DSML leakage into content, no token-salad,
+valid finish_reason values, no engine death. The #52645(c848) port is
+validated for the parser-leakage symptom only. Broader corruption —
+wrong/repeated tool targets under concurrent shared-prefix load — remains
+UNRESOLVED and under investigation (open: V2 dspark prefix handling,
+aux-hidden/mHC staleness, fusions A/B per #50773).
