@@ -271,3 +271,24 @@ Next step (when pursued): controlled A/B on an isolated endpoint — same
 v4 workload with DSpark OFF first — to separate model behavior from
 spec-decode corruption. Production pods stay on r29 (parser fix is a
 strict improvement).
+
+## 2026-08-18 (analysis) — Two suspects closed by code verification
+
+1. V2 DSpark cache-restored-prefix consistency (full trace):
+   _prepare_dflash_inputs_kernel computes query/context slots against the
+   UNshifted table (speculator.py:917-932); shift_draft_block_tables then
+   shifts rows left by whole restored blocks (:1111-1152) while the same
+   kernel shortens seq_lens by the identical block-aligned span (:959-969).
+   Absolute-position slot = unshifted[block pos + shift] = shifted[block
+   pos]: consistent. Unaligned residue fails closed via
+   _has_unaligned_cached_prefix + target recompute. No defect found.
+2. #49918 class (prefill misclassified as uniform decode -> FULL spec-verify
+   graph skips state writes): _is_uniform_decode in
+   vllm/v1/worker/gpu/model_runner.py:3908 ends with
+   np.all(num_computed_tokens_cpu >= num_prompt_tokens_cpu) — a
+   still-prefilling request can never classify as uniform decode. Guarded.
+
+Remaining discriminators (fusions A/B #50773, DSpark-off A/B, aux-hidden/mHC
+staleness) all require isolated GPU capacity that does not currently exist
+(server17/19 GPUs fully occupied by serving ranks; LWS template applies
+spec config to all replicas). Deferred to a maintenance window.
