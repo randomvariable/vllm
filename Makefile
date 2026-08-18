@@ -59,6 +59,10 @@ cross: FLASHINFER_NVCC_THREADS?=1
 cross: CUDA_HOME=/usr/local/cuda
 cross: CUDA_TOOLKIT_ROOT=/usr/local/cuda
 cross: DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++
+# FlashInfer's AOT .so link (flashinfer/jit/cpp_ext.py) reads CXX and defaults
+# to host c++, which links the aarch64 nvcc objects with the x86_64 linker
+# ("file in wrong format"). Point it at the cross compiler.
+cross: CXX=/usr/bin/aarch64-linux-gnu-g++
 cross: DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12
 cross: DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so
 cross: DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch
