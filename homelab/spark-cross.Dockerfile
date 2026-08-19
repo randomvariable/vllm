@@ -46,6 +46,15 @@ COPY homelab/install-uv.sh /usr/local/bin/install-uv
 COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
 RUN chmod 0755 /usr/local/bin/install-uv /usr/local/bin/install-system-packages
 
+# Ubuntu-derived images ship /etc/apt/apt.conf.d/docker-clean, whose
+# DPkg::Post-Invoke hook deletes every .deb as soon as it is installed. With it
+# in place the /var/cache/apt mount below can never hold anything, so every
+# rebuild of the apt layer re-downloaded the entire package set -- including the
+# ~544MB libcublas-cross-sbsa. Remove it and tell apt to keep its archives.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+      > /etc/apt/apt.conf.d/keep-downloaded-packages
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     /usr/local/bin/install-system-packages \
@@ -91,12 +100,21 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
       -r /tmp/build-requirements/cuda.txt -r /tmp/build-requirements/rust.txt && \
     rm -rf /tmp/build-requirements
 
-RUN curl --fail --silent --show-error --location \
-      -o /tmp/torch-aarch64.whl \
-      https://download.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl && \
-    mkdir -p /opt/torch-aarch64 && \
-    unzip -q /tmp/torch-aarch64.whl -d /opt/torch-aarch64 && \
-    rm -f /tmp/torch-aarch64.whl
+# The aarch64 torch wheel is ~2.5GB and was fetched to /tmp, so it was
+# re-downloaded in full every time this layer rebuilt. Stage it in a download
+# cache mount and only fetch when it is missing; the fetch is written to a temp
+# name and renamed so an interrupted download is never mistaken for a complete
+# one.
+RUN --mount=type=cache,target=/downloads,sharing=locked \
+    set -eux; \
+    whl=/downloads/torch-2.13.0+cu130-cp312-cp312-manylinux_2_28_aarch64.whl; \
+    if [ ! -s "$whl" ]; then \
+      curl --fail --silent --show-error --location -o "$whl.part" \
+        https://download.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl; \
+      mv "$whl.part" "$whl"; \
+    fi; \
+    mkdir -p /opt/torch-aarch64; \
+    unzip -q "$whl" -d /opt/torch-aarch64
 
 COPY homelab/sbsa-toolchain.cmake /opt/sbsa-toolchain.cmake
 
@@ -171,6 +189,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libmimalloc.so.3
 COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
 RUN chmod 0755 /usr/local/bin/install-system-packages
+# Same docker-clean removal as the builder stage. This one matters more: the
+# runtime stage runs under qemu-aarch64, so re-fetching and re-installing these
+# packages is emulated work.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+      > /etc/apt/apt.conf.d/keep-downloaded-packages
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     /usr/local/bin/install-system-packages \

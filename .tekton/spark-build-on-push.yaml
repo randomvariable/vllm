@@ -276,6 +276,14 @@ spec:
                   echo "BuildKit socket did not appear after 30 seconds" >&2
                   exit 1
                 fi
+                # `type=inline` could only ever carry the final image's own
+                # layers, so the expensive builder stages were never restorable
+                # from the registry and the only copy lived in buildkitd's local
+                # state on the PVC -- exactly what a cancelled or killed daemon
+                # loses. mode=max stores the builder stages too, so the
+                # FlashInfer AOT layer survives loss of that local state.
+                # ignore-error keeps a registry hiccup at the end of a
+                # multi-hour build from failing the build itself.
                 buildctl build --frontend dockerfile.v0 \
                   --local context="$SRC" --local dockerfile="$SRC" \
                   --opt filename=homelab/spark-cross.Dockerfile \
@@ -286,8 +294,9 @@ spec:
                   --opt build-arg:VLLM_BUILD_COMMIT="$FULL_SHA" \
                   --opt build-arg:VLLM_SCM_VERSION="$SCM_VERSION" \
                   --opt build-arg:VLLM_IMAGE_TAG="$IMAGE_REF" \
+                  --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:buildcache" \
                   --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
-                  --export-cache type=inline \
+                  --export-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:buildcache,mode=max,ignore-error=true" \
                   --output "type=image,\"name=${IMAGE_REF},${HARBOR_REGISTRY}/${IMAGE_NAME}:latest,${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:${SHORT_SHA},${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:latest\",push=true"
                 printf '%s' "$IMAGE_REF" > "$(results.IMAGE_REF.path)"
                 printf '%s' "$SHORT_SHA" > "$(results.IMAGE_TAG.path)"
