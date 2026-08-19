@@ -155,7 +155,7 @@ build-rust:
 
 build-wheel:
 	mkdir -p $(WHEEL_DIR)
-	$(UV) build --python $(PYTHON) --no-build-isolation --wheel \
+	_PYTHON_HOST_PLATFORM=$(PYTHON_HOST_PLATFORM) $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
 		--out-dir $(WHEEL_DIR) .
 
 SPARK_IMAGE ?= local/vllm-spark:dev
