@@ -320,21 +320,28 @@ for output in outputs:
 ## ReSET Entropy-Threshold Temperature
 
 Temperature is normally a single constant applied to every token of a
-generation. ReSET ([arXiv 2606.13233](https://arxiv.org/abs/2606.13233),
-reference implementation [aiha-lab/ReSET](https://github.com/aiha-lab/ReSET))
-instead picks each token's temperature from how uncertain that token is,
-recovering reasoning accuracy that a single temperature leaves on the table.
-Four per-request sampling parameters configure it:
+generation. ReSET ("ReSET: Accurate Latency-Critical NVFP4 Reasoning via
+Step-Aware Temperature Scaling",
+[arXiv 2606.13233](https://arxiv.org/abs/2606.13233), reference implementation
+[aiha-lab/ReSET](https://github.com/aiha-lab/ReSET)) instead picks each
+token's temperature from how uncertain that token is, relative to the
+uncertainty of the reasoning step it sits in. Four per-request sampling
+parameters configure it:
 
-- `temperature_low` (float) — temperature for a *confident* (low-entropy)
-  token. Reference default `0.1`.
-- `temperature_high` (float) — temperature for an *uncertain* token. Reference
-  default `1.0`.
+- `temperature_low` (float) — `T_low`, temperature for a *confident*
+  (low-entropy) token. Calibrated per model and task on a held-out split; the
+  paper's values are `0.1` (Qwen3-8B, Qwen3-32B), `0.3` (Qwen3-14B,
+  R1-Distill-Qwen-14B) and `0.4` (R1-Distill-Qwen-7B).
+- `temperature_high` (float) — `T_high`, temperature for an *uncertain* token.
+  `1.0` throughout the paper; it restores diversity that quantization removes
+  from high-entropy tokens.
 - `entropy_threshold` (float) — `tau_0`, the token-entropy threshold (in nats)
   separating the two, calibrated per model as the 80th-percentile token
-  entropy. Reference default `0.6349`.
+  entropy on the same split. The paper's values range `0.4863`-`0.6488`; the
+  reference implementation falls back to `0.6349` when unset, which is not
+  itself a calibrated value, so set this per model.
 - `reset_window` (int) — `w`, the sliding-window length used for the
-  step-entropy estimate. Reference default `32`.
+  step-entropy estimate. `32` throughout the paper.
 
 All four default to unset. A request that sets none of them is scaled by
 exactly the value it would have been scaled by before the feature existed, and
@@ -355,16 +362,25 @@ T_t   = temperature_low   if  H_t <  tau_t
 T_t   = temperature_high  if  H_t >= tau_t
 ```
 
-`H_bar` is the running mean of every token entropy so far; `H_step` is the
-within-step entropy estimate — the mean of a size-`w` sliding window for the
-first `w` tokens of a reasoning step, then the within-step running mean.
-Reasoning steps are split on `"\n\n"`. The whole policy runs on device with no
-per-token host synchronisation, so it is inexpensive relative to the forward
-pass.
+`H_bar` is the running mean of the token entropies seen *before* this token;
+`H_step` is the within-step entropy estimate — the mean of a size-`w` sliding
+window (which spans step boundaries) for the first `w` tokens of a reasoning
+step, then the within-step running mean. Reasoning steps are split on
+`"\n\n"`. The whole policy runs on device with no per-token host
+synchronisation, so it is inexpensive relative to the forward pass.
 
-Use it for reasoning models under aggressive quantization, where a single
-temperature either misfires on confident symbolic tokens (too high) or
-over-commits on genuinely uncertain steps (too low).
+Both averages exclude the current token. The paper's Eq. 2 and Eq. 3 define
+`H_bar` and `H_step` over ranges that *include* position `t`, but the authors'
+reference implementation evaluates both from state carried in before folding
+in the current entropy. This implementation follows the reference, so its
+decisions match the released code rather than the literal equations; the two
+differ by a one-token lag in the two averages.
+
+ReSET's published gains are measured on NVFP4 (W4A4) checkpoints of Qwen3-8B /
+14B / 32B and DeepSeek-R1-Distill-Qwen-7B / 14B, applied on top of round-to-
+nearest quantization, where a single temperature either misfires on confident
+symbolic tokens (too high) or over-commits on genuinely uncertain steps (too
+low). Its effect on unquantized weights is not characterised by the paper.
 
 ### Runners and limitations
 
