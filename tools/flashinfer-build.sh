@@ -88,7 +88,13 @@ pushd "${FLASHINFER_SOURCE_DIR}"
                 uv build --python /opt/venv/bin/python --no-build-isolation --wheel \
                 --out-dir "${FLASHINFER_DIST_DIR}" ./flashinfer-jit-cache
         fi
-        echo "✅ FlashInfer wheels built successfully in ${FLASHINFER_DIST_DIR}/"
+        # Fail closed on host-arch leakage: nvcc with no cross flags silently
+        # emits host objects inside an aarch64-tagged wheel.
+        OBJ=$(find build -name '*.cuda.o' | head -1)
+        [[ -n "$OBJ" ]] && readelf -h "$OBJ" | grep -q 'Machine:.*AArch64' || {
+            echo "❌ FlashInfer AOT object is not AArch64: $OBJ" >&2
+            exit 1
+        }
     else
         # Install directly (for Dockerfile)
         uv pip install --python /opt/venv/bin/python --no-build-isolation --force-reinstall .
