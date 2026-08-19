@@ -4,10 +4,8 @@
 from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
     AiterInt8ScaledMMLinearKernel,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
+from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
     B12xTensorFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (

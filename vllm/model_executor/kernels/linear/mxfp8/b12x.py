@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 import torch
+
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -11,7 +15,11 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit, reuse_packed_weight_storage
+from vllm.utils.b12x import (
+    B12xWarmupUnit,
+    b12x_warmup_token_counts,
+    reuse_packed_weight_storage,
+)
 from vllm.utils.b12x import (
     get_b12x_mxfp8_linear as _import_b12x_mxfp8,
 )
@@ -20,12 +28,8 @@ from vllm.utils.torch_utils import current_stream
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
-
 def _b12x_mxfp8_expected_m(tokens: int) -> int:
     return max(1, int(tokens))
-
-
-
 
 
 def _apply_b12x_mxfp8_packed_linear(
@@ -45,10 +49,8 @@ def _apply_b12x_mxfp8_packed_linear(
         packed_weight,
         bias=bias,
         expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
-
     )
     return output.view(*output_shape)
-
 
 
 def warmup_b12x_mxfp8_linear(
@@ -58,7 +60,6 @@ def warmup_b12x_mxfp8_linear(
     cudagraph_capture_sizes: Iterable[int] = (),
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> int:
-
     if not current_platform.is_cuda():
         return 0
     if not current_platform.is_device_capability_family(120):
@@ -116,7 +117,6 @@ def warmup_b12x_mxfp8_linear(
             torch.accelerator.synchronize(last_device)
 
     return warmed
-
 
 
 class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -226,5 +226,4 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-
         return _apply_b12x_mxfp8_packed_linear(layer, x, bias)

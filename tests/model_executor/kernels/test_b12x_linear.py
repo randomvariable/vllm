@@ -16,33 +16,29 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP4_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
-    init_fp8_linear_kernel,
-    init_mxfp8_linear_kernel,
-)
-from vllm.model_executor.kernels.linear.mxfp8.b12x import (
-    B12xMxfp8LinearKernel,
-    _b12x_mxfp8_expected_m,
-
-    warmup_b12x_mxfp8_linear,
-)
-from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
-    Mxfp8LinearLayerConfig,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
+    _POSSIBLE_NVFP4_KERNELS,
     B12xFp8BlockScaledMMKernel,
     B12xMxFp4LinearKernel,
-    B12xMxfp8LinearKernel,
     B12xNvFp4LinearKernel,
     B12xTensorFP8ScaledMMLinearKernel,
-    FP8ScaledMMLinearLayerConfig,
-    Mxfp8LinearLayerConfig,
     init_fp8_linear_kernel,
     init_mxfp4_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+    B12xMxfp8LinearKernel,
+    _b12x_mxfp8_expected_m,
+    warmup_b12x_mxfp8_linear,
+)
+from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+    Mxfp8LinearLayerConfig,
+)
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
@@ -51,16 +47,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
 )
 from vllm.platforms import PlatformEnum
-from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
-    B12xTensorFP8ScaledMMLinearKernel,
-    _b12x_tensor_fp8_linear,
-    warmup_b12x_tensor_fp8_linear,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
-    FP8ScaledMMLinearLayerConfig,
-)
-from vllm.platforms import PlatformEnum, current_platform
-from vllm.utils.b12x import b12x_warmup_token_counts
 
 
 def test_b12x_backend_maps_mxfp8_kernel() -> None:
@@ -181,7 +167,6 @@ def test_b12x_module_lookup_is_dynamo_safe(monkeypatch) -> None:
 
     x = torch.ones(1)
     torch.testing.assert_close(forward(x), x + 1)
-
 def test_b12x_tensor_fp8_can_implement_supported_config() -> None:
     config = FP8ScaledMMLinearLayerConfig(
         activation_quant_key=kFp8StaticTensorSym,
@@ -390,6 +375,8 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
     assert called_bias is bias
     assert out_dtype == torch.bfloat16
     assert expected_m == 6
+
+
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
 
@@ -429,7 +416,6 @@ def test_b12x_mxfp8_expected_m_uses_live_m() -> None:
     assert _b12x_mxfp8_expected_m(128) == 128
     assert _b12x_mxfp8_expected_m(129) == 129
     assert _b12x_mxfp8_expected_m(2048) == 2048
-
 
 
 def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
