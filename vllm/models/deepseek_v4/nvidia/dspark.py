@@ -59,6 +59,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
     _use_sequence_parallel,
+    e8m0_expert_weight_for_param,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -534,13 +535,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     self.quant_config, name, loaded_weight
                 )
 
-            # E8M0 expert scales: keep raw exponent bytes.
+            # E8M0 expert scales: raw exponent bytes for a uint8 (FP4)
+            # parameter, decoded float32 for a block-fp8 one. Same reasoning as
+            # DeepseekV4Model.load_weights -- the representation depends on the
+            # destination, not on the checkpoint tensor.
             if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
                 for param_name, weight_name, expert_id, shard_id in expert_mapping:
                     if weight_name not in name:
                         continue
@@ -548,7 +547,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     param = params_dict[name_mapped]
                     success = param.weight_loader(
                         param,
-                        loaded_weight,
+                        e8m0_expert_weight_for_param(loaded_weight, param.dtype),
                         name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,

@@ -243,6 +243,40 @@ def make_deepseek_v4_expert_params_mapping(
     ]
 
 
+def ue8m0_uint8_to_float(sf: torch.Tensor) -> torch.Tensor:
+    """Decode raw ue8m0 exponent bytes into the float32 scales they denote.
+
+    A ue8m0 byte ``v`` denotes ``2 ** (v - 127)``. Placing ``v`` in the
+    IEEE-754 exponent field (bits 23..30) reproduces that exactly, with no
+    rounding.
+    """
+    return (sf.to(torch.int32) << 23).view(torch.float32)
+
+
+def e8m0_expert_weight_for_param(
+    loaded_weight: torch.Tensor, param_dtype: torch.dtype
+) -> torch.Tensor:
+    """Represent a checkpoint expert scale for its destination parameter.
+
+    ``float8_e8m0fnu`` scales reach two kinds of parameter, and the right
+    representation depends on the destination rather than the checkpoint:
+
+    * FP4 experts keep the raw exponent bytes in a ``uint8`` parameter, where a
+      numeric ``copy_()`` would destroy them (``2 ** -7`` becomes ``0``).
+    * Block-fp8 experts hold float32 scales and need the decoded value; the raw
+      byte would be stored as a float there (``2 ** -7`` becomes ``120.0``),
+      scaling every expert block by roughly ``1e40``.
+
+    Tensors that are not e8m0 scales are returned unchanged.
+    """
+    if loaded_weight.dtype != torch.float8_e8m0fnu:
+        return loaded_weight
+    raw_bytes = loaded_weight.view(torch.uint8)
+    if param_dtype == torch.uint8:
+        return raw_bytes
+    return ue8m0_uint8_to_float(raw_bytes)
+
+
 class DeepseekV4MegaMoEExperts(nn.Module):
     _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 
@@ -396,7 +430,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     @staticmethod
     def _ue8m0_uint8_to_float(sf: torch.Tensor) -> torch.Tensor:
-        return (sf.to(torch.int32) << 23).view(torch.float32)
+        return ue8m0_uint8_to_float(sf)
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
@@ -2030,15 +2064,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 break
             else:
                 if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
+                    # E8M0 scales are stored as float8_e8m0fnu in the
+                    # checkpoint, but the representation the weight loader
+                    # needs depends on the DESTINATION parameter, so it is
+                    # chosen per parameter below rather than once here. See
+                    # e8m0_expert_weight_for_param.
                     for mapping in expert_mapping:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
@@ -2055,7 +2085,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                         success = weight_loader(
                             param,
-                            loaded_weight,
+                            e8m0_expert_weight_for_param(loaded_weight, param.dtype),
                             name_mapped,
                             shard_id=expert_shard_id,
                             expert_id=expert_id,
