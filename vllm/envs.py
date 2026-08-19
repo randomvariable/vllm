@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_NVFP4_MLA_DYNAMIC_SCALE: bool = False
+    VLLM_NVFP4_KV_VOSPLIT: bool = True
+    VLLM_FLASHINFER_MM_PREFIX: bool = True
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
@@ -1205,6 +1207,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
         int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
     ),
+    # NVFP4 KV cache VO-split on consumer Blackwell (CC 12.x): route
+    # Gemma-4 heterogeneous-head full-attention layers (head_dim_qk=512,
+    # head_dim_vo=256) through the FlashInfer FA2 asymmetric paged kernel
+    # instead of forcing TRITON_ATTN. Default-on for nvfp4 KV; "0" is the
+    # escape hatch back to the Triton fallback.
+    "VLLM_NVFP4_KV_VOSPLIT": lambda: bool(int(os.getenv("VLLM_NVFP4_KV_VOSPLIT", "1"))),
+    # Let the FlashInfer backend serve mm-prefix LMs (Gemma 3 / Gemma 4
+    # multimodal): image-token spans attend bidirectionally via FA2
+    # packed custom masks on a second prefill wrapper; text requests
+    # stay on the fast causal path. Default-on so multimodal Gemma 3/4
+    # masks image spans correctly out of the box; "0" restores the
+    # is_mm_prefix_lm backend rejection.
+    "VLLM_FLASHINFER_MM_PREFIX": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_MM_PREFIX", "1"))
+    ),
     "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
         "VLLM_NVFP4_MLA_SCALES_FILE", ""
     ).strip(),
@@ -1638,9 +1655,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     "VLLM_DISABLE_MMAP": lambda: bool(int(os.getenv("VLLM_DISABLE_MMAP", "0"))),
-    "VLLM_LOADER_NUM_THREADS": lambda: int(
-        os.getenv("VLLM_LOADER_NUM_THREADS", "1")
-    ),
+    "VLLM_LOADER_NUM_THREADS": lambda: int(os.getenv("VLLM_LOADER_NUM_THREADS", "1")),
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.
     "VLLM_USE_LAYERNAME": lambda: bool(int(os.getenv("VLLM_USE_LAYERNAME", "1"))),
