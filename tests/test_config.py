@@ -97,7 +97,6 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
-
     if env_value is None:
         monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     else:
@@ -148,9 +147,55 @@ def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
 def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
     monkeypatch, model, architecture, with_mtp
 ):
-    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from vllm.compilation.breakable_cudagraph import (
+        is_breakable_cudagraph_enabled,
+    )
     from vllm.config.vllm import default_breakable_cudagraph_architectures
     from vllm.platforms import current_platform
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    default_breakable_cudagraph_architectures.cache_clear()
+
+    model_config = SimpleNamespace(
+        model=model,
+        architectures=[architecture],
+        runner_type="generate",
+        is_moe=True,
+        is_hybrid=False,
+        is_attention_free=False,
+        is_diffusion=False,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        speculative_config=SimpleNamespace(method="mtp") if with_mtp else None,
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    config._dflash_needs_multi_kv_group = lambda: False
+    config._get_v2_model_runner_unsupported_features = lambda: []
+    config._uses_breakable_cudagraph_by_default = lambda: (
+        VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+
+    try:
+        assert VllmConfig.use_v2_model_runner.fget(config)
+        assert VllmConfig._maybe_enable_breakable_cudagraph(config)
+        assert is_breakable_cudagraph_enabled()
+        assert config.compilation_config.mode == CompilationMode.NONE
+        assert config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+    finally:
+        os.environ.pop("VLLM_USE_BREAKABLE_CUDAGRAPH", None)
+        default_breakable_cudagraph_architectures.cache_clear()
+
+
+def test_auto_breakable_cudagraph_takes_precedence_over_aot(monkeypatch):
+    minimax_model_config = SimpleNamespace(architectures=["MiniMaxM3SparseForCausalLM"])
+    regular_model_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
 
     monkeypatch.delenv("VLLM_USE_AOT_COMPILE", raising=False)
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
