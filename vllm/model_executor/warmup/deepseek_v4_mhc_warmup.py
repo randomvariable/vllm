@@ -131,6 +131,8 @@ def _warmup_layer_mhc(
     layer: torch.nn.Module,
     token_sizes: list[int],
 ) -> None:
+    from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
+
     max_tokens = max(token_sizes)
     hidden_size = int(layer.hidden_size)
     hc_mult = int(layer.hc_mult)
@@ -197,6 +199,10 @@ def _warmup_layer_mhc(
                 norm_weight=norm.weight.data,
                 norm_eps=norm.variance_epsilon,
             )
+        # The nvidia decoder layer calls mhc_post_tilelang directly from
+        # forward() instead of exposing an hc_post wrapper, so the sweep above
+        # never reaches it and the first request pays its tilelang compile.
+        mhc_post_tilelang(layer_input, residual_work, post_mix, comb_mix)
 
 
 def _warmup_hc_head(
