@@ -109,6 +109,85 @@ LONG_WAIT_TIME_LOG_MSG = (
     "weight/kv cache quantization)."
 )
 
+_WRITE_PARK_MAX_S = 0.001
+# ^ Ceiling for the writer-side park step (see acquire_write): once the
+# adaptive grace expires, the writer polls in doubling sleep steps up to this
+# bound instead of yielding indefinitely while readers lag.
+
+
+class _AdaptiveSpinGrace:
+    """Adaptive spin-grace policy: how long to busy-loop before parking.
+
+    An EMA of observed inter-event intervals (``T_ema``) sets the grace via
+    ``grace = clamp(B * B / max(T_ema, eps), MIN, MAX)`` with ``T_ema``
+    seeded at the pivot ``B``. Faster traffic lengthens the spin toward
+    ``MAX`` (arrivals become near-certain within the grace); slower traffic
+    parks within ``MIN``. Monotonically decreasing in ``T_ema``, so slower
+    traffic never increases spin, and the grace is bounded regardless of
+    estimate staleness.
+
+    ``fixed_s`` pins the grace and disables training (a float pin restores
+    historical fixed-grace behavior).
+    """
+
+    def __init__(self, fixed_s: float | None = None):
+        if fixed_s is not None and (not math.isfinite(fixed_s) or fixed_s < 0):
+            raise ValueError(
+                "busy_loop_s must be a finite non-negative number, got {value}".format(
+                    value=fixed_s
+                )
+            )
+        if fixed_s is not None:
+            self.mode = "fixed"
+            self.fixed_s = fixed_s
+            return
+        self.mode = "adaptive"
+        self.fixed_s = 0.0
+        self.min_s = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS) / 1000.0
+        self.max_s = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS) / 1000.0
+        self.budget_s = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS) / 1000.0
+        self.alpha = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA)
+        for name, value in (
+            ("VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS", self.min_s),
+            ("VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS", self.max_s),
+            ("VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS", self.budget_s),
+            ("VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA", self.alpha),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    "{name} must be a finite positive number, got {value}".format(
+                        name=name, value=value
+                    )
+                )
+        if not 0.0 < self.alpha <= 1.0:
+            raise ValueError(
+                "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA must be in "
+                "(0, 1], got {alpha}".format(alpha=self.alpha)
+            )
+        if self.min_s > self.max_s:
+            raise ValueError(
+                "VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS must not "
+                "exceed VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS"
+            )
+        # Seed the interval EMA at the pivot; eps keeps the divide
+        # well-defined for zero-length intervals (back-to-back burst reads).
+        self._interval_ema_s = self.budget_s
+        self._interval_ema_eps_s = 1e-9
+
+    def current(self) -> float:
+        """Current spin grace in seconds."""
+        if self.mode == "fixed":
+            return self.fixed_s
+        t = max(self._interval_ema_s, self._interval_ema_eps_s)
+        return min(self.max_s, max(self.min_s, self.budget_s**2 / t))
+
+    def train(self, interval_s: float) -> None:
+        """Fold one observed inter-event interval into the grace policy."""
+        if self.mode != "adaptive":
+            return
+        a = self.alpha
+        self._interval_ema_s = (1 - a) * self._interval_ema_s + a * interval_s
+
 
 class SpinCondition:
     """
@@ -136,75 +215,17 @@ class SpinCondition:
     ):
         self.is_reader = is_reader
 
-        # Busy-loop wait policy.
-        #
-        # fixed: busy_loop_s pins the spin grace (the writer always uses
-        #   fixed 0; a float pin restores historical behavior).
-        # adaptive (readers, default): an EMA of observed inter-read
-        #   intervals (T_ema) sets the grace via
-        #       grace = clamp(B * B / max(T_ema, eps), MIN, MAX)
-        #   with T_ema seeded at B (the pivot). Faster traffic lengthens
-        #   the spin toward MAX (arrivals become near-certain within the
-        #   grace); slower traffic parks readers within MIN. Monotonically
-        #   decreasing in T_ema, so slower traffic never increases spin,
-        #   and the grace is bounded regardless of estimate staleness.
-        if busy_loop_s is not None and (
-            not math.isfinite(busy_loop_s) or busy_loop_s < 0
-        ):
-            raise ValueError(
-                "busy_loop_s must be a finite non-negative number, "
-                "got {busy_loop_s}".format(busy_loop_s=busy_loop_s)
-            )
+        # Busy-loop wait policy: readers default to the adaptive grace (see
+        # _AdaptiveSpinGrace); a float busy_loop_s pins a fixed grace. The
+        # writer always uses fixed 0 for its notify side.
+        self._grace = _AdaptiveSpinGrace(fixed_s=busy_loop_s)
 
         if is_reader:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
 
-            if busy_loop_s is not None:
-                self._grace_mode = "fixed"
-                self._grace_fixed_s = busy_loop_s
-            else:
-                self._grace_mode = "adaptive"
-                self._grace_fixed_s = 0.0
-                self._grace_min_s = (
-                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS) / 1000.0
-                )
-                self._grace_max_s = (
-                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS) / 1000.0
-                )
-                self._grace_budget_s = (
-                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS) / 1000.0
-                )
-                self._grace_alpha = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA)
-                for name, value in (
-                    ("VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS", self._grace_min_s),
-                    ("VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS", self._grace_max_s),
-                    ("VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS", self._grace_budget_s),
-                    ("VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA", self._grace_alpha),
-                ):
-                    if not math.isfinite(value) or value <= 0:
-                        raise ValueError(
-                            "{name} must be a finite positive number, "
-                            "got {value}".format(name=name, value=value)
-                        )
-                if not 0.0 < self._grace_alpha <= 1.0:
-                    raise ValueError(
-                        "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA must be in "
-                        "(0, 1], got {alpha}".format(alpha=self._grace_alpha)
-                    )
-                if self._grace_min_s > self._grace_max_s:
-                    raise ValueError(
-                        "VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS must not "
-                        "exceed VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS"
-                    )
-                # Seed the interval EMA at the pivot; eps keeps the divide
-                # well-defined for zero-length intervals (back-to-back
-                # burst reads).
-                self._interval_ema_s = self._grace_budget_s
-                self._interval_ema_eps_s = 1e-9
-
             # Time to keep busy-looping on the shm buffer before going idle
-            self.busy_loop_s: float = self._current_grace()
+            self.busy_loop_s: float = self._grace.current()
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)
@@ -242,27 +263,14 @@ class SpinCondition:
             self.write_cancel_socket = None
             self.poller = None
 
-    def _current_grace(self) -> float:
-        """Current spin grace in seconds."""
-        if self._grace_mode == "fixed":
-            return self._grace_fixed_s
-        t = max(self._interval_ema_s, self._interval_ema_eps_s)
-        return min(
-            self._grace_max_s,
-            max(self._grace_min_s, self._grace_budget_s**2 / t),
-        )
-
     def _train_interval_ema(self, interval_s: float) -> None:
         """Fold one observed inter-read interval into the grace policy."""
-        if self._grace_mode != "adaptive":
-            return
-        a = self._grace_alpha
-        self._interval_ema_s = (1 - a) * self._interval_ema_s + a * interval_s
-        self.busy_loop_s = self._current_grace()
+        self._grace.train(interval_s)
+        self.busy_loop_s = self._grace.current()
 
     def record_read(self):
         now = time.monotonic()
-        if self._grace_mode == "adaptive":
+        if self._grace.mode == "adaptive":
             self._train_interval_ema(now - self.last_read)
         self.last_read = now
 
@@ -599,6 +607,10 @@ class MessageQueue:
             self._spin_condition = SpinCondition(
                 is_reader=False, context=context, notify_address=local_notify_addr
             )
+            # Adaptive grace for the writer's wait-on-readers loop
+            # (acquire_write): mirrors the reader policy but trains on
+            # block-wait intervals.
+            self._write_grace = _AdaptiveSpinGrace()
         else:
             self.buffer = None  # type: ignore
             local_subscribe_addr = None
@@ -740,6 +752,8 @@ class MessageQueue:
         assert self._is_writer, "Only writers can acquire write"
         start_time = time.monotonic()
         n_warning = 1
+        wait_start = time.monotonic()
+        park_s = 0.0
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
 
@@ -758,8 +772,16 @@ class MessageQueue:
                     # if this block is not ready to write,
                     # we need to wait until it is read by all readers
 
-                    # Release the processor to other threads
-                    sched_yield()
+                    # Spin only while within the adaptive grace; once it
+                    # expires, poll in doubling sleep steps (capped at
+                    # _WRITE_PARK_MAX_S) instead of yielding indefinitely
+                    # while a slow reader lags.
+                    elapsed_wait = time.monotonic() - wait_start
+                    if elapsed_wait < self._write_grace.current():
+                        sched_yield()
+                    else:
+                        park_s = min(park_s * 2 or 50e-6, _WRITE_PARK_MAX_S)
+                        time.sleep(park_s)
 
                     # if we time out, raise an exception
                     elapsed = time.monotonic() - start_time
@@ -800,6 +822,11 @@ class MessageQueue:
                 memory_fence()
                 # mark the block as written
                 metadata_buffer[0] = 1
+                # Train the writer grace on the observed block-wait interval:
+                # fast reader turnover keeps the writer spinning (cheap, and
+                # the block is near-certain to free soon); slow readers park
+                # the writer within the grace floor.
+                self._write_grace.train(time.monotonic() - wait_start)
                 # Memory fence ensures the write is visible to readers on other cores
                 # before we proceed. Without this, readers may spin indefinitely
                 # waiting for a write that's stuck in our CPU's store buffer.
