@@ -3,6 +3,7 @@
 import copyreg
 import functools
 import io
+import math
 import os
 import pickle
 import shutil
@@ -131,16 +132,79 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 1,
+        busy_loop_s: float | None = None,
     ):
         self.is_reader = is_reader
+
+        # Busy-loop wait policy.
+        #
+        # fixed: busy_loop_s pins the spin grace (the writer always uses
+        #   fixed 0; a float pin restores historical behavior).
+        # adaptive (readers, default): an EMA of observed inter-read
+        #   intervals (T_ema) sets the grace via
+        #       grace = clamp(B * B / max(T_ema, eps), MIN, MAX)
+        #   with T_ema seeded at B (the pivot). Faster traffic lengthens
+        #   the spin toward MAX (arrivals become near-certain within the
+        #   grace); slower traffic parks readers within MIN. Monotonically
+        #   decreasing in T_ema, so slower traffic never increases spin,
+        #   and the grace is bounded regardless of estimate staleness.
+        if busy_loop_s is not None and (
+            not math.isfinite(busy_loop_s) or busy_loop_s < 0
+        ):
+            raise ValueError(
+                "busy_loop_s must be a finite non-negative number, "
+                "got {busy_loop_s}".format(busy_loop_s=busy_loop_s)
+            )
 
         if is_reader:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
 
+            if busy_loop_s is not None:
+                self._grace_mode = "fixed"
+                self._grace_fixed_s = busy_loop_s
+            else:
+                self._grace_mode = "adaptive"
+                self._grace_fixed_s = 0.0
+                self._grace_min_s = (
+                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS) / 1000.0
+                )
+                self._grace_max_s = (
+                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS) / 1000.0
+                )
+                self._grace_budget_s = (
+                    float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS) / 1000.0
+                )
+                self._grace_alpha = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA)
+                for name, value in (
+                    ("VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS", self._grace_min_s),
+                    ("VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS", self._grace_max_s),
+                    ("VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS", self._grace_budget_s),
+                    ("VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA", self._grace_alpha),
+                ):
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError(
+                            "{name} must be a finite positive number, "
+                            "got {value}".format(name=name, value=value)
+                        )
+                if not 0.0 < self._grace_alpha <= 1.0:
+                    raise ValueError(
+                        "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA must be in "
+                        "(0, 1], got {alpha}".format(alpha=self._grace_alpha)
+                    )
+                if self._grace_min_s > self._grace_max_s:
+                    raise ValueError(
+                        "VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS must not "
+                        "exceed VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS"
+                    )
+                # Seed the interval EMA at the pivot; eps keeps the divide
+                # well-defined for zero-length intervals (back-to-back
+                # burst reads).
+                self._interval_ema_s = self._grace_budget_s
+                self._interval_ema_eps_s = 1e-9
+
             # Time to keep busy-looping on the shm buffer before going idle
-            self.busy_loop_s = busy_loop_s
+            self.busy_loop_s: float = self._current_grace()
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)
@@ -178,8 +242,36 @@ class SpinCondition:
             self.write_cancel_socket = None
             self.poller = None
 
+    def _current_grace(self) -> float:
+        """Current spin grace in seconds."""
+        if self._grace_mode == "fixed":
+            return self._grace_fixed_s
+        t = max(self._interval_ema_s, self._interval_ema_eps_s)
+        return min(
+            self._grace_max_s,
+            max(self._grace_min_s, self._grace_budget_s**2 / t),
+        )
+
+    def _train_interval_ema(self, interval_s: float) -> None:
+        """Fold one observed inter-read interval into the grace policy."""
+        if self._grace_mode != "adaptive":
+            return
+        a = self._grace_alpha
+        self._interval_ema_s = (1 - a) * self._interval_ema_s + a * interval_s
+        self.busy_loop_s = self._current_grace()
+
     def record_read(self):
-        self.last_read = time.monotonic()
+        now = time.monotonic()
+        if self._grace_mode == "adaptive":
+            self._train_interval_ema(now - self.last_read)
+        self.last_read = now
+
+    def remaining_grace_s(self, now: float | None = None) -> float:
+        """Spin grace left before an idle reader should park (>= 0)."""
+        if now is None:
+            now = time.monotonic()
+        remaining = self.last_read + self.busy_loop_s - now
+        return remaining if remaining > 0.0 else 0.0
 
     def cancel(self):
         # Sends cancellation ping that will cause the reader to wake up.
@@ -199,8 +291,7 @@ class SpinCondition:
         """
         assert self.is_reader, "Only readers can wait"
 
-        current_time = time.monotonic()
-        if current_time <= self.last_read + self.busy_loop_s:
+        if self.remaining_grace_s() > 0.0:
             sched_yield()
         else:
             events = dict(self.poller.poll(timeout=timeout_ms))
@@ -776,33 +867,42 @@ class MessageQueue:
                     written_flag = metadata_buffer[0]
                     return not (not written_flag or read_flag)
 
-                if SPINLOOP_EXT_ENABLED and not check():
-                    spinloop(
-                        metadata_buffer[0 : self.local_reader_rank + 1],
-                        check,
-                        timeout=SPINLOOP_TIMEOUT_SECONDS,
-                    )
-
                 if not check():
                     # this block is either
                     # (1) not written
                     # (2) already read by this reader
 
-                    # for readers, `self.current_idx` is the next block to read
-                    # if this block is not ready,
-                    # we need to wait until it is written
-                    self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
-
-                    if self.shutting_down:
-                        raise RuntimeError("cancelled")
-
-                    # if we wait for a long time, log a message
-                    if read_timeout.should_warn():
-                        logger.info(
-                            LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL
+                    # for readers, `self.current_idx` is the next block to
+                    # read; if this block is not ready, we need to wait
+                    # until it is written. The native spin wait runs only
+                    # for the remaining spin grace (capped by the ext
+                    # ceiling) and, on success, skips parking.
+                    if SPINLOOP_EXT_ENABLED:
+                        native_timeout_s = min(
+                            self._spin_condition.remaining_grace_s(),
+                            SPINLOOP_TIMEOUT_SECONDS,
                         )
+                        if native_timeout_s > 0.0:
+                            spinloop(
+                                metadata_buffer[0 : self.local_reader_rank + 1],
+                                check,
+                                timeout=native_timeout_s,
+                            )
 
-                    continue
+                    if not check():
+                        self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
+
+                        if self.shutting_down:
+                            raise RuntimeError("cancelled")
+
+                        # if we wait for a long time, log a message
+                        if read_timeout.should_warn():
+                            logger.info(
+                                LONG_WAIT_TIME_LOG_MSG,
+                                VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            )
+
+                        continue
                 # found a block that is not read by this reader
                 # let caller read from the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
