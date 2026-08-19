@@ -14,7 +14,6 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.kernels.linear.mxfp4.b12x import (
     B12xMxFp4LinearKernel,
-    warmup_b12x_mxfp4_linear,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
@@ -36,6 +35,7 @@ def test_b12x_mxfp4_fallback_priority() -> None:
         < names.index("B12xMxFp4LinearKernel")
         < names.index("EmulationMxfp4LinearKernel")
     )
+
 
 def test_b12x_mxfp4_explicit_backend_selects_native_kernel(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
@@ -94,7 +94,9 @@ def test_b12x_mxfp4_processes_scale_and_preserves_loader(monkeypatch) -> None:
 
     assert layer.weight_scale.data_ptr() == swizzled_scale.data_ptr()
     assert layer.weight_scale.weight_loader is weight_loader
-    assert layer.b12x_mxfp4_linear
+    # #52368 replaced the b12x_mxfp4_linear marker with the warmup provider
+    # that b12x_warmup discovers.
+    assert layer.b12x_warmup_provider is kernel
 
 
 def test_b12x_mxfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
@@ -143,7 +145,13 @@ def test_b12x_mxfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
     assert kwargs == {"out_dtype": torch.bfloat16}
 
 
-def test_warmup_b12x_mxfp4_dedupes_weight_signatures(monkeypatch) -> None:
+def test_b12x_mxfp4_warmup_units_dedupe_weight_signatures(monkeypatch) -> None:
+    """Upstream #52368 replaced the standalone warmup with a unit provider.
+
+    ``b12x_warmup`` keys units by ``unit.key`` and compiles each once, so the
+    dedupe contract now lives in the key: two layers with the same weight
+    signature must produce equal keys, and a different one must not.
+    """
     import vllm.model_executor.kernels.linear.mxfp4.b12x as b12x_mod
 
     calls = []
@@ -152,16 +160,6 @@ def test_warmup_b12x_mxfp4_dedupes_weight_signatures(monkeypatch) -> None:
         calls.append((source.shape, weight, weight_scale, bias))
         return source.new_empty((source.shape[0], weight.shape[0]))
 
-    platform = types.SimpleNamespace(
-        is_cuda=lambda: True,
-        is_device_capability_family=lambda family: family == 120,
-    )
-    monkeypatch.setattr(b12x_mod, "current_platform", platform)
-    monkeypatch.setattr(
-        b12x_mod,
-        "_import_b12x_blockscaled",
-        lambda: types.SimpleNamespace(),
-    )
     monkeypatch.setattr(b12x_mod, "_apply_b12x_mxfp4_linear", apply)
 
     def layer(n: int):
@@ -174,17 +172,22 @@ def test_warmup_b12x_mxfp4_dedupes_weight_signatures(monkeypatch) -> None:
     layer_a = layer(48)
     layer_b = layer(48)
     layer_c = layer(96)
-    model = types.SimpleNamespace(
-        modules=lambda: iter([layer_a, layer_b, layer_c, types.SimpleNamespace()])
-    )
 
-    warmed = warmup_b12x_mxfp4_linear(
-        model,
-        max_tokens=8,
-        cudagraph_capture_sizes=[1, 2],
-    )
+    kernel = object.__new__(B12xMxFp4LinearKernel)
+    token_counts = (1, 2, 8)
+    units = {
+        name: kernel.get_b12x_warmup_unit(obj, token_counts, torch.bfloat16)
+        for name, obj in (("a", layer_a), ("b", layer_b), ("c", layer_c))
+    }
 
-    assert warmed == 6
+    assert units["a"].key == units["b"].key
+    assert units["a"].key != units["c"].key
+    assert {unit.name for unit in units.values()} == {"MXFP4"}
+
+    # b12x_warmup compiles one unit per distinct key: a (== b) and c.
+    units["a"].compile()
+    units["c"].compile()
+
     assert [call[0] for call in calls] == [
         torch.Size([1, 128]),
         torch.Size([2, 128]),
