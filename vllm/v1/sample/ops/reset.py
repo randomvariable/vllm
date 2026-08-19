@@ -17,17 +17,27 @@ Per decoded token, for each request with token-distribution entropy ``H_t``:
 * ``H_t`` is the Shannon entropy (nats) of ``softmax(logits)`` at temperature
   1.0 -- the *raw* logits, never a previously resolved temperature. There is
   no temperature feedback and no base temperature.
-* ``H_bar`` is the running mean of every token entropy seen so far.
-* ``H_step`` is the within-step entropy estimate: the mean of a size-``w``
-  sliding window (which spans steps) for the first ``w`` tokens of a step,
-  then the within-step running mean.
+* ``H_bar`` is the running mean of the token entropies seen *before* this
+  token (paper Eq. 2).
+* ``H_step`` is the within-step entropy estimate (paper Eq. 3): the mean of a
+  size-``w`` sliding window (which spans steps) for the first ``w`` tokens of
+  a step, then the within-step running mean.
 * A reasoning step ends on ``"\\n\\n"``: a boundary is hit when the last output
   token decodes to text containing a double newline, or the last two output
   tokens are each a single newline. The within-step buffer resets at a
   boundary; the sliding window and ``H_bar`` do not.
 
-``T_high`` defaults to 1.0 and ``w`` to 32; ``T_low`` and ``tau_0`` (the
-80th-percentile token entropy) are calibrated per model.
+Paper vs reference: Eq. 2 defines ``H_bar`` over ``i = 0..t`` and Eq. 3 sums
+the within-step average to ``t`` inclusive, both *including* the current
+token's entropy. The reference implementation instead evaluates both from
+state carried in and appends the current entropy afterwards, so its averages
+lag the equations by one token. This module reproduces the reference, because
+that is what the released results were produced with.
+
+``T_high`` is 1.0 and ``w`` is 32 throughout the paper. ``T_low`` and ``tau_0``
+(the 80th-percentile token entropy) are calibrated per (model, task); the
+``T_LOW``/``TAU0`` constants below are the reference implementation's fallbacks
+rather than calibrated values for any particular model.
 """
 
 from __future__ import annotations
