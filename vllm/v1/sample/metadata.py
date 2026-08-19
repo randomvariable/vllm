@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.ops.temperature import TemperatureSchedule
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
 
@@ -53,3 +55,11 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+
+    # Answer-phase temperature schedule, written by the MRV1 input-batch
+    # refresh and consumed by the sampler's temperature resolution.
+    temperature_schedule: TemperatureSchedule | None = None
+
+    # Re-stages the per-step inputs of `temperature_schedule` in place. Called
+    # by `_refresh_sampling_params` before every sampling step.
+    refresh_temperature_schedule: Callable[[], None] | None = None
