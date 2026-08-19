@@ -83,7 +83,74 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
-DSparkCapacityVerificationMode = Literal["varlen", "mask"]
+
+
+def _architectures(hf_config: "PretrainedConfig") -> list[str]:
+    return getattr(hf_config, "architectures", None) or []
+
+
+def _is_deepseek_v4_dspark(hf_config: "PretrainedConfig") -> bool:
+    """Whether a DeepSeek-V4 config's ``mtp.*`` weights are a DSpark drafter.
+
+    Every DeepSeek-V4 config declares ``num_nextn_predict_layers``, but the
+    ``mtp.*`` tensors behind it are an MTP head in some checkpoints and a
+    multi-stage DSpark drafter in others. Only the latter carry the ``dspark_*``
+    keys, and their ``mtp.*`` weights have no ``enorm``/``hnorm``/``e_proj``/
+    ``h_proj``, so ``DeepSeekV4MTPModel`` cannot load them.
+    """
+    if not getattr(hf_config, "dspark_target_layer_ids", None):
+        return False
+    # ``hf_config_override`` rewrites model_type to ``deepseek_mtp`` and pins
+    # the MTP architecture, so accept the raw and overridden shapes alike.
+    return getattr(hf_config, "model_type", None) == "deepseek_v4" or (
+        "DeepSeekV4MTPModel" in _architectures(hf_config)
+    )
+
+
+def _is_dspark_draft(model: str, hf_config: "PretrainedConfig") -> bool:
+    """Whether a draft checkpoint ships a DSpark drafter.
+
+    The repo name is only a fallback: DeepSeek-V4 DSpark checkpoints are not
+    reliably named ``*dspark*`` (e.g. DeepSeek-V4-Flash-0731, whose config
+    carries ``dspark_*`` keys while its architectures name the target model),
+    so ask the config first. Without this they fall through to the MTP branch
+    and die in the weight loader on a missing ``mtp_block.main_norm.weight``.
+    """
+    declared = _architectures(hf_config)
+    if any(
+        arch in declared
+        for arch in (
+            "Qwen3DSparkModel",
+            "Gemma4DSparkModel",
+            _QWEN3_OMNI_DSPARK_ARCHITECTURE,
+        )
+    ) or (
+        "DSparkDraftModel" in declared
+        and getattr(hf_config, "model_type", None) == "qwen3"
+    ):
+        return True
+    if _is_deepseek_v4_dspark(hf_config):
+        return True
+    return "dspark" in model.lower()
+
+
+def reject_mtp_on_dspark(
+    *, method: str | None, model: str, hf_config: "PretrainedConfig"
+) -> None:
+    """Refuse ``method="mtp"`` on a DeepSeek-V4 DSpark checkpoint.
+
+    Without this the drafter is handed to ``DeepSeekV4MTPModel``, which fails
+    deep in the weight loader on a missing ``mtp_block.main_norm.weight``
+    instead of saying what to pass instead.
+    """
+    if method != "mtp" or not _is_deepseek_v4_dspark(hf_config):
+        return
+    block_size = getattr(hf_config, "dspark_block_size", None)
+    raise ValueError(
+        f"{model} ships a DSpark drafter rather than an MTP head, so "
+        "method='mtp' cannot load its weights. Use method='dspark' with "
+        f"num_speculative_tokens >= dspark_block_size ({block_size})."
+    )
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
@@ -1193,6 +1260,11 @@ class SpeculativeConfig:
             if self.method == "mtp":
                 if self.target_model_config is None:
                     raise ValueError("target_model_config must be present for mtp")
+                reject_mtp_on_dspark(
+                    method=self.method,
+                    model=self.target_model_config.model,
+                    hf_config=self.target_model_config.hf_config,
+                )
                 # use the draft model from the same model:
                 # Use model_weights if set (e.g. runai_streamer replaces
                 # model with a local cache dir but keeps the original path
@@ -1410,16 +1482,9 @@ class SpeculativeConfig:
                     in self.draft_model_config.architectures
                 ):
                     self.method = "dflash"
-                elif (
-                    "dspark" in self.draft_model_config.model.lower()
-                    or "Qwen3DSparkModel" in self.draft_model_config.architectures
-                    or _QWEN3_OMNI_DSPARK_ARCHITECTURE
-                    in self.draft_model_config.architectures
-                    or "Gemma4DSparkModel" in self.draft_model_config.architectures
-                    or (
-                        "DSparkDraftModel" in self.draft_model_config.architectures
-                        and self.draft_model_config.hf_config.model_type == "qwen3"
-                    )
+                elif _is_dspark_draft(
+                    self.draft_model_config.model,
+                    self.draft_model_config.hf_config,
                 ):
                     self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
