@@ -52,46 +52,62 @@ UV ?= uv
 # Dockerfile. Concurrency uses ?= so an exported MAX_JOBS /
 # CMAKE_BUILD_PARALLEL_LEVEL / NVCC_THREADS (e.g. from the spark-cross
 # Dockerfile build-arg ENV) can raise it, defaulting to the memory-safe 4/4/1.
-cross: MAX_JOBS?=4
-cross: CMAKE_BUILD_PARALLEL_LEVEL?=4
-cross: NVCC_THREADS?=1
-cross: FLASHINFER_MAX_JOBS?=2
-cross: FLASHINFER_NVCC_THREADS?=1
-cross: CUDA_HOME=/usr/local/cuda
-cross: CUDA_TOOLKIT_ROOT=/usr/local/cuda
-cross: DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++
+#
+# Make propagates target-specific variables to prerequisites, which is how this
+# block reaches build-flashinfer/build-wheel. It is therefore attached to one
+# shared target list rather than to `cross` alone: the image build invokes the
+# split entry points below as separate layers, and any setting that failed to
+# reach them -- CXX or NVCC_PREPEND_FLAGS above all -- would silently produce a
+# host-arch link instead of an aarch64 one.
+CROSS_TARGETS := cross cross-flashinfer cross-rest
+$(CROSS_TARGETS): MAX_JOBS?=4
+$(CROSS_TARGETS): CMAKE_BUILD_PARALLEL_LEVEL?=4
+$(CROSS_TARGETS): NVCC_THREADS?=1
+$(CROSS_TARGETS): FLASHINFER_MAX_JOBS?=2
+$(CROSS_TARGETS): FLASHINFER_NVCC_THREADS?=1
+$(CROSS_TARGETS): CUDA_HOME=/usr/local/cuda
+$(CROSS_TARGETS): CUDA_TOOLKIT_ROOT=/usr/local/cuda
+$(CROSS_TARGETS): DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++
 # FlashInfer's AOT .so link (flashinfer/jit/cpp_ext.py) reads CXX and defaults
 # to host c++, which links the aarch64 nvcc objects with the x86_64 linker
 # ("file in wrong format"). Point it at the cross compiler.
-cross: CXX=/usr/bin/aarch64-linux-gnu-g++
-cross: DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12
-cross: DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so
-cross: DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch
-cross: DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda/targets/sbsa-linux/lib
-cross: DEEPGEMM_TORCH_CXX11_ABI=1
-cross: DEEPGEMM_SRC_DIR=$(CURDIR)/third_party/deep_gemm
-cross: VLLM_TARGET_DEVICE=cuda
-cross: TORCH_CUDA_ARCH_LIST=12.0f
-cross: NVCC_PREPEND_FLAGS=-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++
-cross: CMAKE_ARGS=-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda -DCUDA_CUDART=/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so -DVLLM_CUBLAS_LIBRARY=/usr/local/cuda/targets/sbsa-linux/lib/libcublas.so -DVLLM_CUTLASS_SRC_DIR=$(CURDIR)/third_party/flashinfer/3rdparty/cutlass
-cross: CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
-cross: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-cross: CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-cross: CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-cross: AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
-cross: PYO3_CROSS_PYTHON_VERSION=3.12
-cross: PYTHON=/opt/venv/bin/python
-cross: PYTHON_HOST_PLATFORM=linux-aarch64
-cross: WHEEL_EXPECTED_ELF_MACHINE=AArch64
-cross: WHEEL_BUILD_ENV=_PYTHON_HOST_PLATFORM=$(PYTHON_HOST_PLATFORM) CXX=$(CXX) CUDA_HOME=$(CUDA_HOME) CUDA_TOOLKIT_ROOT=$(CUDA_TOOLKIT_ROOT) VLLM_TARGET_DEVICE=$(VLLM_TARGET_DEVICE) TORCH_CUDA_ARCH_LIST=$(TORCH_CUDA_ARCH_LIST) NVCC_PREPEND_FLAGS='$(NVCC_PREPEND_FLAGS)' CMAKE_ARGS='$(CMAKE_ARGS)'
-cross: WHEEL_DIR=/wheels
-cross: B12X_WHEEL_DIR=/wheels-b12x
-cross: FLASHINFER_DIST_DIR=/wheels-flashinfer
-cross: FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64
-cross: FLASHINFER_EXPECTED_ELF_MACHINE=AArch64
-cross: FLASHINFER_CUDA_ARCH_LIST=12.0f 12.1a
-cross: FLASHINFER_EXTRA_LDFLAGS=-L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda/targets/sbsa-linux/lib
+$(CROSS_TARGETS): CXX=/usr/bin/aarch64-linux-gnu-g++
+$(CROSS_TARGETS): DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12
+$(CROSS_TARGETS): DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so
+$(CROSS_TARGETS): DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch
+$(CROSS_TARGETS): DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda/targets/sbsa-linux/lib
+$(CROSS_TARGETS): DEEPGEMM_TORCH_CXX11_ABI=1
+$(CROSS_TARGETS): DEEPGEMM_SRC_DIR=$(CURDIR)/third_party/deep_gemm
+$(CROSS_TARGETS): VLLM_TARGET_DEVICE=cuda
+$(CROSS_TARGETS): TORCH_CUDA_ARCH_LIST=12.0f
+$(CROSS_TARGETS): NVCC_PREPEND_FLAGS=-target-dir sbsa-linux -ccbin /usr/bin/aarch64-linux-gnu-g++
+$(CROSS_TARGETS): CMAKE_ARGS=-DCMAKE_TOOLCHAIN_FILE=/opt/sbsa-toolchain.cmake -DTorch_DIR=/opt/torch-aarch64/torch/share/cmake/Torch -DCUDAToolkit_ROOT=/usr/local/cuda -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda -DCUDA_CUDART=/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so -DVLLM_CUBLAS_LIBRARY=/usr/local/cuda/targets/sbsa-linux/lib/libcublas.so -DVLLM_CUTLASS_SRC_DIR=$(CURDIR)/third_party/flashinfer/3rdparty/cutlass
+$(CROSS_TARGETS): CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+$(CROSS_TARGETS): CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+$(CROSS_TARGETS): CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+$(CROSS_TARGETS): CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+$(CROSS_TARGETS): AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+$(CROSS_TARGETS): PYO3_CROSS_PYTHON_VERSION=3.12
+$(CROSS_TARGETS): PYTHON=/opt/venv/bin/python
+$(CROSS_TARGETS): PYTHON_HOST_PLATFORM=linux-aarch64
+$(CROSS_TARGETS): WHEEL_EXPECTED_ELF_MACHINE=AArch64
+$(CROSS_TARGETS): WHEEL_BUILD_ENV=_PYTHON_HOST_PLATFORM=$(PYTHON_HOST_PLATFORM) CXX=$(CXX) CUDA_HOME=$(CUDA_HOME) CUDA_TOOLKIT_ROOT=$(CUDA_TOOLKIT_ROOT) VLLM_TARGET_DEVICE=$(VLLM_TARGET_DEVICE) TORCH_CUDA_ARCH_LIST=$(TORCH_CUDA_ARCH_LIST) NVCC_PREPEND_FLAGS='$(NVCC_PREPEND_FLAGS)' CMAKE_ARGS='$(CMAKE_ARGS)'
+$(CROSS_TARGETS): WHEEL_DIR=/wheels
+$(CROSS_TARGETS): B12X_WHEEL_DIR=/wheels-b12x
+$(CROSS_TARGETS): FLASHINFER_DIST_DIR=/wheels-flashinfer
+$(CROSS_TARGETS): FLASHINFER_WHEEL_PLATFORM_TAG=manylinux_2_28_aarch64
+$(CROSS_TARGETS): FLASHINFER_EXPECTED_ELF_MACHINE=AArch64
+$(CROSS_TARGETS): FLASHINFER_CUDA_ARCH_LIST=12.0f 12.1a
+$(CROSS_TARGETS): FLASHINFER_EXTRA_LDFLAGS=-L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/targets/sbsa-linux/lib/stubs -Wl,-rpath-link,/usr/local/cuda/targets/sbsa-linux/lib
 cross: sync
+
+# Split halves of `sync`, for the staged image build. The FlashInfer AOT objects
+# depend on third_party/flashinfer, the build script and the installed build deps
+# -- never on vLLM's Python source or the release version -- so this half can be
+# reused across source commits as a cached layer.
+cross-flashinfer: build-flashinfer
+
+cross-rest: sync-b12x build-rust build-wheel
 
 strix: VLLM_TARGET_DEVICE=rocm
 strix: MAX_JOBS=8

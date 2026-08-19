@@ -107,21 +107,43 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
       sh -s -- -y --default-toolchain none && \
     rustup toolchain install 1.95 && \
     rustup target add --toolchain 1.95 aarch64-unknown-linux-gnu
-COPY . /src/vllm
+# The FlashInfer AOT compile is ~3423 CUDA units and several hours, and it reads
+# none of vLLM's Python source. Give it only the inputs it actually consumes so
+# its layer is keyed on those alone: a source-only or version-only commit then
+# reuses this layer instead of recompiling it. ccache cannot substitute for this
+# -- measured on run z7hpr, the AOT dep-generation ran at 2.25s/unit with a warm
+# cache directory present, because the generated build tree it keys on is
+# recreated from scratch every build.
+COPY Makefile ccache.conf pyproject.toml uv.lock /src/vllm/
+COPY requirements /src/vllm/requirements
+COPY tools /src/vllm/tools
+COPY third_party/flashinfer /src/vllm/third_party/flashinfer
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,id=vllm-spark-flashinfer-cubins-cross,target=/src/vllm/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins,sharing=locked \
     --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.cache/ccache,sharing=locked \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     mkdir -p /root/.cache/ccache && \
     cp /src/vllm/ccache.conf /root/.cache/ccache/ccache.conf && \
-    echo "== ccache state at stage entry ==" && ccache -sv && ccache -z && \
-    cd /src/vllm && \
-    VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} make cross; \
+    echo "== ccache at flashinfer entry ==" && ccache -sv && ccache -z && \
+    cd /src/vllm && make cross-flashinfer; \
     rc=$?; \
-    echo "== ccache state at stage exit (rc=$rc) ==" && ccache -sv; \
+    echo "== ccache at flashinfer exit (rc=$rc) ==" && ccache -sv; \
+    exit $rc
+
+# Everything that genuinely depends on the full source and the release version:
+# the b12x wheel, the rust frontend and the vLLM wheel itself.
+COPY . /src/vllm
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/root/.rustup,sharing=locked \
+    --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.cache/ccache,sharing=locked \
+    --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
+    echo "== ccache at wheel entry ==" && ccache -sv && ccache -z && \
+    cd /src/vllm && \
+    VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} make cross-rest; \
+    rc=$?; \
+    echo "== ccache at wheel exit (rc=$rc) ==" && ccache -sv; \
     exit $rc
 
 RUN mkdir -p /runtime-requirements
