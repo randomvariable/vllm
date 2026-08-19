@@ -10,8 +10,15 @@
 # repo_url/revision from the push event (always the event HEAD, never a
 # stale YAML literal), git-clone materialises it (shallow superproject,
 # full recursive submodules) into the source workspace, and buildctl builds
-# from there. The trigger is pathChanged on this file, so a "retrigger"
-# commit touching it rebuilds against the push HEAD.
+# from there.
+#
+# The trigger fires on any push to homelabs-main that touches something the
+# image is actually built from. The exclusion list mirrors .dockerignore: those
+# paths are not in the build context, so a change to one cannot alter the image
+# and must not spend three hours proving it. `!files.all.all(...)` reads as "not
+# every changed file is excluded", i.e. at least one real input moved. Touching
+# this file still forces a build on its own, which is the manual retrigger
+# (useful when only a base image or a Repository param changed).
 #
 # Cross-compiled on an x86_64 BuildKit node using NVIDIA's SBSA cross toolkit +
 # native nvcc with an aarch64 host compiler, then the aarch64 runtime stage
@@ -30,9 +37,22 @@ metadata:
     pipelinesascode.tekton.dev/on-cel-expression: |
       event == "push" && target_branch == "homelabs-main" && (
         ".tekton/spark-build-on-push.yaml".pathChanged() ||
-        "homelab/spark-cross.Dockerfile".pathChanged() ||
-        ".dockerignore".pathChanged()
+        !files.all.all(x,
+          x.matches('^docs/') ||
+          x.matches('^tests/') ||
+          x.matches('^examples/') ||
+          x.matches('^benchmarks/') ||
+          x.matches('^\\.github/') ||
+          x.matches('^\\.tekton/') ||
+          x.matches('\\.md$')
+        )
       )
+    # A newer push to homelabs-main makes an in-flight build obsolete: it targets
+    # the same moving tag from an older commit, and the two contend for the same
+    # BuildKit state root (the build step's flock makes the loser fail outright).
+    # Scope is per-branch for push events. Mutually exclusive with a
+    # concurrency_limit on the Repository CR, which this one does not set.
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "10"
     pipelinesascode.tekton.dev/task: "git-clone"
 spec:
@@ -336,7 +356,9 @@ spec:
                   valueFrom:
                     secretKeyRef: {name: "{{ notify_secret }}", key: url, optional: true}
 
-# Retrigger: push a commit touching this file (pathChanged) to rebuild at HEAD.
+# Manual retrigger: push a commit touching this file (pathChanged) to rebuild at
+# HEAD. Source changes now trigger on their own; this is for the cases they do
+# not cover, e.g. a moved base image or a changed Repository param.
 
 # trigger rebuild 2026-08-18: fork-side pipeline cutover (vllm-runtime pipelines retired)
 
