@@ -157,6 +157,18 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 
 # Everything that genuinely depends on the full source and the release version:
 # the b12x wheel, the rust frontend and the vLLM wheel itself.
+#
+# `COPY .` puts every Python file in this layer's cache key, so a Python-only
+# commit re-runs the whole compile. VLLM_BUILD_TEMP (/vllm-build) is the CMake
+# binary dir, and without a mount it lives in the layer, so the re-run starts
+# from a parent state that has none: ninja rebuilds all ~410 objects, including
+# the vllm-flash-attn FA2 kernel matrix, and only ccache stands between that and
+# a multi-hour stage. ccache is itself a mutable cache ref, which a cancelled or
+# evicted run loses at the next buildkitd start, so that floor is not reliable.
+# Mounting the binary dir lets ninja see the objects as up-to-date and skip them
+# outright, which is both faster than a ccache hit and independent of the layer
+# cache key. CMake regenerates torch_patched_headers inside it, so nothing from
+# an earlier layer is masked.
 COPY . /src/vllm
 # Declared here, after the FlashInfer AOT layer, so its per-commit value only
 # participates in the cache key of the wheel layer below.
@@ -167,6 +179,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,target=/root/.rustup,sharing=locked \
     --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.cache/ccache,sharing=locked \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
+    --mount=type=cache,id=vllm-spark-cmake-cross,target=/vllm-build,sharing=locked \
     echo "== ccache at wheel entry ==" && ccache -sv && ccache -z && \
     cd /src/vllm && \
     VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} make cross-rest; \
