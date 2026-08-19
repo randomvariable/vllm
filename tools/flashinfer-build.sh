@@ -89,12 +89,23 @@ pushd "${FLASHINFER_SOURCE_DIR}"
                 --out-dir "${FLASHINFER_DIST_DIR}" ./flashinfer-jit-cache
         fi
         # Fail closed on host-arch leakage: nvcc with no cross flags silently
-        # emits host objects inside an aarch64-tagged wheel.
-        OBJ=$(find build -name '*.cuda.o' | head -1)
-        [[ -n "$OBJ" ]] && readelf -h "$OBJ" | grep -q 'Machine:.*AArch64' || {
-            echo "❌ FlashInfer AOT object is not AArch64: $OBJ" >&2
-            exit 1
-        }
+        # emits host objects inside an aarch64-tagged wheel. Runs only when the
+        # caller declares the expected machine (cross builds); native builds
+        # skip it.
+        if [[ -n "${FLASHINFER_EXPECTED_ELF_MACHINE:-}" ]]; then
+            mapfile -t AOT_OBJS < <(find build -name '*.cuda.o')
+            if [[ ${#AOT_OBJS[@]} -eq 0 ]]; then
+                echo "❌ no AOT objects found under build/" >&2
+                exit 1
+            fi
+            for OBJ in "${AOT_OBJS[@]}"; do
+                if ! readelf -h "$OBJ" | grep -q "Machine:.*${FLASHINFER_EXPECTED_ELF_MACHINE}"; then
+                    echo "❌ $OBJ is not ${FLASHINFER_EXPECTED_ELF_MACHINE} ELF" >&2
+                    exit 1
+                fi
+            done
+        fi
+        echo "✅ FlashInfer wheels built successfully in ${FLASHINFER_DIST_DIR}/"
     else
         # Install directly (for Dockerfile)
         uv pip install --python /opt/venv/bin/python --no-build-isolation --force-reinstall .
