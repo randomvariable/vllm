@@ -373,6 +373,33 @@ def _validate_qwen3_omni_dspark(
         )
 
 
+def speculative_batch_invariance_unsupported_reason(
+    method: str | None,
+) -> str | None:
+    """Why ``VLLM_BATCH_INVARIANT`` cannot hold for a speculative method.
+
+    Returns ``None`` when there is no speculative decoding to worry about.
+
+    Speculative decoding draws its acceptance coin from the same RNG stream as
+    proposal sampling -- ``rejection_sampler_utils`` uses ``tl_rand32(seed,
+    pos)`` while ``gumbel`` uses ``tl.randint(seed, pos)``, separated only by a
+    position offset -- and a preempted request discards its proposal without
+    reconstructing it. A seeded request can therefore change its output when
+    batch size, request order or scheduling changes, which is exactly what the
+    flag is meant to rule out.
+    """
+    if method is None:
+        return None
+    return (
+        f"VLLM_BATCH_INVARIANT does not yet hold for speculative decoding "
+        f"(method={method!r}): proposal and acceptance sampling share one RNG "
+        "stream, and preempted proposals are not reconstructed. Upstream "
+        "vllm-project/vllm#52522 adds per-domain RNG streams and preemption "
+        "recovery; until it is incorporated, disable speculative decoding for "
+        "batch-invariant runs."
+    )
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""

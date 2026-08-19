@@ -47,7 +47,12 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
-from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .speculative import (
+    EagleModelTypes,
+    NgramGPUTypes,
+    SpeculativeConfig,
+    speculative_batch_invariance_unsupported_reason,
+)
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -631,7 +636,6 @@ class VllmConfig:
         ):
             return self.diffusion_config.canvas_length
         return 0
-
 
     @property
     def num_lookahead_tokens(self) -> int:
@@ -1789,6 +1793,13 @@ class VllmConfig:
             logger.warning_once(
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
+
+        if envs.VLLM_BATCH_INVARIANT and self.speculative_config is not None:
+            reason = speculative_batch_invariance_unsupported_reason(
+                self.speculative_config.method
+            )
+            if reason:
+                logger.warning_once(reason)
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
