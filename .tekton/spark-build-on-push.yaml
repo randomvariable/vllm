@@ -354,3 +354,5 @@ spec:
 
 # trigger rebuild 2026-08-19: SM120 correctness trio, GB10 capability epic, NVFP4 KV,
 # LSE base fix, DSpark config detection, b12x import repair, ReSET temperature policy
+
+# trigger rebuild 2026-08-19: repair rebase-stale module imports
