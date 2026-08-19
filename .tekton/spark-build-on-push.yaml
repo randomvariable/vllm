@@ -351,3 +351,6 @@ spec:
 # trigger rebuild 2026-08-19: wheel platform tag + ELF guard
 
 # trigger rebuild 2026-08-19: spinloop resync with PR — drop static 2ms knob, carry EMA+WFET
+
+# trigger rebuild 2026-08-19: SM120 correctness trio, GB10 capability epic, NVFP4 KV,
+# LSE base fix, DSpark config detection, b12x import repair, ReSET temperature policy
