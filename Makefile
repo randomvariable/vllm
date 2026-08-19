@@ -122,7 +122,7 @@ sync-strix-deps:
 	$(UV) pip install -r requirements/build/rocm.txt -r requirements/build/rust.txt
 	$(UV) pip install -r requirements/rocm.txt
 
-build-strix-wheel:
+build-strix-wheel: ccache-keyfile
 	mkdir -p /wheels
 	_PYTHON_HOST_PLATFORM= $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
 		--out-dir /wheels .
@@ -142,9 +142,20 @@ sync-b12x:
 	mkdir -p $(B12X_WHEEL_DIR)
 	$(UV) build --wheel --out-dir $(B12X_WHEEL_DIR) ./third_party/b12x
 
-build-flashinfer: sync-deps
-	mkdir -p $(FLASHINFER_DIST_DIR) "$(dir $(CCACHE_EXTRAFILES))"
+# ccache.conf sets `extra_files` to this path unconditionally, and ccache treats
+# an unreadable extra file as an error that bypasses the cache -- "Error hashing
+# extra file", counted as neither hit nor miss. It exists because ccache does not
+# hash NVCC_PREPEND_FLAGS, so without it a cross build could reuse host-arch
+# objects (see also CCACHE_EXTRAFILES in the cross env). Every compiling target
+# must therefore write it, not just the FlashInfer one: the FlashInfer layer is
+# usually restored from the layer cache and never re-runs, so a wheel stage that
+# relied on it left the file absent and compiled all ~412 objects uncached.
+ccache-keyfile:
+	mkdir -p "$(dir $(CCACHE_EXTRAFILES))"
 	printf '%s\n' "$(NVCC_PREPEND_FLAGS)" "$(TORCH_CUDA_ARCH_LIST)" > "$(CCACHE_EXTRAFILES)"
+
+build-flashinfer: sync-deps ccache-keyfile
+	mkdir -p $(FLASHINFER_DIST_DIR)
 	CUDA_VERSION=$(CUDA_VERSION) \
 	FLASHINFER_SOURCE_DIR=$(CURDIR)/third_party/flashinfer \
 	FLASHINFER_DIST_DIR=$(FLASHINFER_DIST_DIR) \
@@ -173,7 +184,7 @@ build-rust:
 	rustup toolchain install $(RUST_TOOLCHAIN)
 	rustup default $(RUST_TOOLCHAIN)
 
-build-wheel:
+build-wheel: ccache-keyfile
 	mkdir -p $(WHEEL_DIR)
 	$(WHEEL_BUILD_ENV) $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
 		--out-dir $(WHEEL_DIR) .
