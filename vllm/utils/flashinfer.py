@@ -989,6 +989,45 @@ def flashinfer_scaled_fp4_mm_out(
     return out
 
 
+def presize_flashinfer_gemm_workspaces(
+    device: torch.device | None, size: int = 64 * 1024 * 1024
+) -> None:
+    """Grow FlashInfer's shared GEMM workspace before any CUDA graph capture.
+
+    FlashInfer's cuDNN GEMM execute paths grow their shared cache workspace
+    with ``tensor.resize_()`` whenever an execution plan asks for more than the
+    current buffer (32 MiB by default). ``resize_()`` frees the old storage and
+    moves the buffer to a new device address, but launches already captured
+    into CUDA graphs keep the old raw pointer, so a post-capture grow turns
+    every subsequent replay into a use-after-free: cuDNN kernels read scratch
+    from, and write scratch over, whatever tensors the allocator hands the
+    freed block to. It surfaces as an illegal memory access or misaligned
+    address, or a wedged GPU, minutes into serving rather than at capture.
+
+    Pre-growing the shared buffer past any plan's realistic demand keeps the
+    address stable for the process lifetime. Needed until a FlashInfer release
+    ships the allocation fix (flashinfer-ai/flashinfer#4553); cheap (one buffer
+    per device) and a no-op when FlashInfer is absent.
+    """
+    if device is None or not has_flashinfer():
+        return
+    try:
+        from flashinfer.utils import _get_cache_buf
+    except ImportError:
+        return
+    # Workspace names used by the GEMM lanes vLLM routes through FlashInfer's
+    # autotuner, which may select the cuDNN runner. zero_init matters: cuDNN
+    # split-K plans keep completion semaphores in the workspace and spin
+    # forever on garbage values. A fresh cudaMalloc happens to hand back
+    # zeroed pages, but that is luck, not a contract.
+    for name in ("bmm_fp8_workspace",):
+        try:
+            _get_cache_buf(name, size, device, zero_init=True)
+        except TypeError:
+            # Older FlashInfer without the zero_init parameter.
+            _get_cache_buf(name, size, device)
+
+
 def flashinfer_scaled_fp8_mm(
     a: torch.Tensor,
     b: torch.Tensor,

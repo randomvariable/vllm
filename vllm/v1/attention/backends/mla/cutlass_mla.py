@@ -71,6 +71,11 @@ class SM100Workspace:
         self._workspace_buf = torch.empty(
             initial_workspace_size, device="cuda", dtype=torch.uint8
         )
+        # Retired workspace generations. A CUDA graph captures the raw device
+        # pointer of whichever buffer was current at capture time, so a buffer
+        # may never be freed once a graph could have captured it; growing the
+        # workspace must keep every older generation alive.
+        self._retired_bufs: list[torch.Tensor] = []
 
         self._block_size = 128  # Forced to 128
 
@@ -93,7 +98,27 @@ class SM100Workspace:
         )
 
         if self._workspace_buf.shape[0] < workspace_size:
-            self._workspace_buf.resize_(workspace_size)
+            self._grow_to(workspace_size)
+
+    def _grow_to(self, workspace_size: int) -> None:
+        """Replace the workspace with a larger one, retiring the old buffer.
+
+        Never ``resize_()``: that frees the old storage while launches already
+        enqueued, and CUDA graphs captured against the old device address, keep
+        dereferencing it. Replays would then read and write memory the
+        allocator has reused for unrelated tensors. Graphs captured against a
+        retired buffer stay correct because its capture-time size was
+        sufficient for the shapes baked into those graphs.
+
+        Allocates zeroed, not ``empty``: split-KV workspaces carry semaphore
+        and accumulator regions that kernels expect to start zeroed, and a
+        recycled dirty block from the caching allocator can hang or corrupt
+        them.
+        """
+        self._retired_bufs.append(self._workspace_buf)
+        self._workspace_buf = torch.zeros(
+            workspace_size, device=self._workspace_buf.device, dtype=torch.uint8
+        )
 
 
 g_sm100_workspace = SM100Workspace(128 * 1024 * 1024)  # 128MB

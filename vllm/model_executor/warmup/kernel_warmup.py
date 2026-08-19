@@ -16,7 +16,6 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
     warmup_b12x_mla_mxfp8_bmm,
     warmup_fused_mla_query,
@@ -28,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynami
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
     warmup_b12x_sparse_indexer,
 )
+from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
@@ -423,6 +423,15 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     minimax_m3_msa_warmup(worker)
 
+    # Grow FlashInfer's shared GEMM workspace to its high-water mark now, while
+    # no CUDA graph has been captured: growing it later moves the buffer and
+    # leaves captured graphs replaying against freed memory (see
+    # presize_flashinfer_gemm_workspaces).
+    if has_flashinfer() and current_platform.has_device_capability(90):
+        from vllm.utils.flashinfer import presize_flashinfer_gemm_workspaces
+
+        presize_flashinfer_gemm_workspaces(worker.device)
+
     if not hasattr(worker.model_runner, "block_tables"):
         logger.info_once(
             "Deferring runtime-dependent kernel warmup until KV cache initialization."
@@ -461,8 +470,7 @@ def runtime_kernel_warmup(worker: "Worker") -> None:
         # warmup is also invoked during memory profiling, before the KV cache
         # is sized, so autotuning here would fail on a missing block table.
         logger.info(
-            "Skipping FlashInfer autotune because the KV cache is not "
-            "initialized yet."
+            "Skipping FlashInfer autotune because the KV cache is not initialized yet."
         )
     else:
         flashinfer_autotune(worker.model_runner)
