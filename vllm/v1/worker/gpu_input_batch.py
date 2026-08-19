@@ -24,11 +24,76 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.temperature import TemperatureSchedule
 from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
+
+_ScheduleBuffer = tuple[torch.Tensor, torch.Tensor]
+
+
+@dataclass(eq=False)
+class _TemperatureScheduleBuffers:
+    """Persistent GPU buffers plus their pinned staging tensors.
+
+    Each field is a `(gpu, cpu)` pair. The CPU side is written per request and
+    flushed with `copy_slice`, mirroring how `InputBatch` stages `temperature`.
+    `base` is not held here: it aliases the existing `temperature` buffer.
+
+    This backs only the reasoning answer-phase temperature override. Per-step
+    entropy temperature control (ReSET) is applied by its own logits processor
+    and does not use these buffers.
+    """
+
+    answer_temperature: _ScheduleBuffer
+    answer_enabled: _ScheduleBuffer
+    reasoning_phase: _ScheduleBuffer
+    entered_reasoning: _ScheduleBuffer
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _TemperatureScheduleBuffers):
+            return NotImplemented
+        return all(
+            torch.equal(a_gpu, b_gpu) and torch.equal(a_cpu, b_cpu)
+            for (a_gpu, a_cpu), (b_gpu, b_cpu) in zip(self.fields(), other.fields())
+        )
+
+    def fields(self) -> tuple[_ScheduleBuffer, ...]:
+        return (
+            self.answer_temperature,
+            self.answer_enabled,
+            self.reasoning_phase,
+            self.entered_reasoning,
+        )
+
+    def clear_row(self, index: int) -> None:
+        for _, cpu in self.fields():
+            cpu[index] = 0
+
+    def swap_rows(self, i1: int, i2: int) -> None:
+        for _, cpu in self.fields():
+            tmp = cpu[i1].item()
+            cpu[i1] = cpu[i2]
+            cpu[i2] = tmp
+
+    def move_row(self, dst: int, src: int) -> None:
+        for _, cpu in self.fields():
+            cpu[dst] = cpu[src]
+
+    def as_schedule(
+        self, base: torch.Tensor, num_reqs: int, reset_active: bool = False
+    ) -> TemperatureSchedule:
+        """Device-side view over the first `num_reqs` rows."""
+        return TemperatureSchedule(
+            base=base[:num_reqs],
+            answer_temperature=self.answer_temperature[0][:num_reqs],
+            answer_enabled=self.answer_enabled[0][:num_reqs],
+            reasoning_phase=self.reasoning_phase[0][:num_reqs],
+            entered_reasoning=self.entered_reasoning[0][:num_reqs],
+            reset_active=reset_active,
+        )
 
 
 @dataclass
@@ -206,6 +271,16 @@ class InputBatch:
         self.greedy_reqs: set[str] = set()
         self.random_reqs: set[str] = set()
 
+        # Answer-phase temperature: immutable per-request config plus the
+        # per-step signals the device-side primitive consumes. Allocated once
+        # at max_num_reqs and only ever written in place, so pointer identity
+        # survives CUDA graph capture.
+        self.temperature_schedule = self._make_temperature_schedule(
+            max_num_reqs, device
+        )
+        self.dynamic_temperature_reqs: set[str] = set()
+        self.reset_reqs: set[str] = set()
+
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
@@ -314,6 +389,90 @@ class InputBatch:
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def _set_temperature_schedule(
+        self, req_id: str, req_index: int, sampling_params: SamplingParams
+    ) -> None:
+        """Stage a request's immutable step-aware temperature config.
+
+        Only the configuration is staged. Step count, reasoning phase and the
+        resulting temperature are all resolved device-side.
+        """
+        sched = self.temperature_schedule
+        sched.clear_row(req_index)
+        self.dynamic_temperature_reqs.discard(req_id)
+        self.reset_reqs.discard(req_id)
+        if not sampling_params.has_dynamic_temperature:
+            return
+
+        # ReSET (arXiv 2606.13233) is applied by the batched ReSET logits
+        # processor, not this schedule, so a ReSET-only request stages nothing
+        # here and never enters `dynamic_temperature_reqs`. It is still
+        # recorded so the schedule can report ReSET to the rejection sampler,
+        # which refuses to run ReSET under speculative decoding.
+        if sampling_params.has_temperature_schedule:
+            self.reset_reqs.add(req_id)
+
+        answer_temp = sampling_params.reasoning_answer_temperature
+        if answer_temp is not None:
+            sched.answer_temperature[1][req_index] = answer_temp
+            sched.answer_enabled[1][req_index] = 1
+            self.dynamic_temperature_reqs.add(req_id)
+
+    def refresh_temperature_steps(self) -> None:
+        """Refresh the per-step schedule inputs, in place, before sampling.
+
+        `refresh_metadata` only runs after a structural batch change, but the
+        step counter and reasoning phase move every decode step, so they are
+        re-staged here. Writes land in the buffers the cached
+        `SamplingMetadata` already points at, so no tensor is reallocated.
+        """
+        if not self.dynamic_temperature_reqs:
+            return
+        num_reqs = self.num_reqs
+        if num_reqs == 0:
+            return
+
+        sched = self.temperature_schedule
+        phase_cpu = sched.reasoning_phase[1]
+        entered_cpu = sched.entered_reasoning[1]
+        holder = self.thinking_budget_state_holder
+        if holder is not None:
+            holder.export_phase(phase_cpu, num_reqs)
+            # Latch: once a request has left thinking it stays in the answer
+            # phase, and a request that never entered reasoning never latches.
+            entered_cpu[:num_reqs] |= phase_cpu[:num_reqs]
+        else:
+            phase_cpu[:num_reqs] = 0
+
+        # These two flags are re-staged into the same slot every decode step,
+        # so a non-blocking copy can still be draining when the next step
+        # overwrites the pinned source -- the kernel then reads a newer value
+        # and the phase runs a step ahead. The buffers are num_reqs bools, so
+        # a blocking copy costs nothing measurable against a forward pass.
+        for buffers in (sched.reasoning_phase, sched.entered_reasoning):
+            buffers[0][:num_reqs].copy_(buffers[1][:num_reqs], non_blocking=False)
+
+    @staticmethod
+    def _make_temperature_schedule(
+        max_num_reqs: int, device: torch.device
+    ) -> _TemperatureScheduleBuffers:
+        """Allocate the persistent answer-phase temperature buffers."""
+
+        def alloc(dtype: torch.dtype) -> _ScheduleBuffer:
+            gpu = torch.zeros((max_num_reqs,), dtype=dtype, device=device)
+            cpu = torch.zeros(
+                (max_num_reqs,), dtype=dtype, device="cpu", pin_memory=PIN_MEMORY
+            )
+            return gpu, cpu
+
+        f32, i32 = torch.float32, torch.int32
+        return _TemperatureScheduleBuffers(
+            answer_temperature=alloc(f32),
+            answer_enabled=alloc(i32),
+            reasoning_phase=alloc(i32),
+            entered_reasoning=alloc(i32),
+        )
 
     @property
     def req_ids(self) -> list[str]:
@@ -857,12 +1016,29 @@ class InputBatch:
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
-        if not self.all_greedy:
+        # A schedule can move a statically-greedy request off 0.0 later, so the
+        # base temperature must be uploaded even when `all_greedy` holds now.
+        has_schedule = bool(self.dynamic_temperature_reqs)
+        if not self.all_greedy or has_schedule:
             temperature = copy_slice(
                 self.temperature_cpu_tensor, self.temperature, num_reqs
             )
         else:
             temperature = None
+
+        temperature_schedule = None
+        # ReSET-only rows stage nothing in the schedule, but the schedule is
+        # still built for them so the rejection sampler can see `reset_active`
+        # and refuse to run ReSET under speculative decoding. Their rows have
+        # `answer_enabled == 0`, so temperature resolution returns the base.
+        reset_active = bool(self.reset_reqs)
+        if has_schedule or reset_active:
+            sched = self.temperature_schedule
+            for gpu, cpu in sched.fields():
+                copy_slice(cpu, gpu, num_reqs)
+            temperature_schedule = sched.as_schedule(
+                self.temperature, num_reqs, reset_active
+            )
         if not self.no_top_p:
             copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
         if not self.no_top_k:
@@ -940,8 +1116,9 @@ class InputBatch:
 
         return SamplingMetadata(
             temperature=temperature,
-            all_greedy=self.all_greedy,
-            all_random=self.all_random,
+            temperature_schedule=temperature_schedule,
+            all_greedy=self.all_greedy and not has_schedule,
+            all_random=self.all_random and not has_schedule,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -958,6 +1135,9 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            refresh_temperature_schedule=(
+                self.refresh_temperature_steps if has_schedule else None
+            ),
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

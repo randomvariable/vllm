@@ -26,6 +26,7 @@ from vllm.v1.sample.logits_processor.interface import (
     LogitsProcessor,
     MoveDirectionality,
 )
+from vllm.v1.sample.logits_processor.reset import ReSETLogitsProcessor
 from vllm.v1.sample.logits_processor.state import BatchUpdateBuilder, LogitsProcessors
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    ReSETLogitsProcessor,
 ]
 
 

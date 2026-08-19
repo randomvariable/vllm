@@ -80,6 +80,25 @@ class ThinkingBudgetStateHolder:
         """
         return bool(self._state)
 
+    def export_phase(self, out: torch.Tensor, num_reqs: int) -> None:
+        """Write the per-request answer-phase flag into ``out[:num_reqs]``.
+
+        A row is in the answer phase once it has both entered and left a
+        reasoning block, so a request that never started thinking never
+        latches. Rows without tracked state are cleared.
+
+        Args:
+            out: Destination bool tensor, at least ``num_reqs`` long.
+            num_reqs: Number of active request rows to export.
+        """
+        out[:num_reqs] = False
+        if not self.is_enabled:
+            return
+        for index, state in self._state.items():
+            if index >= num_reqs:
+                continue
+            out[index] = not state["in_think"] and state["end_thinking"] >= 0
+
     def sync_batch(self, batch_update: BatchUpdate | None) -> None:
         """Add/remove/move per-request state only (no _update_think_state)."""
         if not self.is_enabled or not batch_update:

@@ -317,6 +317,105 @@ for output in outputs:
     print("text:", output.outputs[0].text)
 ```
 
+## ReSET Entropy-Threshold Temperature
+
+Temperature is normally a single constant applied to every token of a
+generation. ReSET ([arXiv 2606.13233](https://arxiv.org/abs/2606.13233),
+reference implementation [aiha-lab/ReSET](https://github.com/aiha-lab/ReSET))
+instead picks each token's temperature from how uncertain that token is,
+recovering reasoning accuracy that a single temperature leaves on the table.
+Four per-request sampling parameters configure it:
+
+- `temperature_low` (float) — temperature for a *confident* (low-entropy)
+  token. Reference default `0.1`.
+- `temperature_high` (float) — temperature for an *uncertain* token. Reference
+  default `1.0`.
+- `entropy_threshold` (float) — `tau_0`, the token-entropy threshold (in nats)
+  separating the two, calibrated per model as the 80th-percentile token
+  entropy. Reference default `0.6349`.
+- `reset_window` (int) — `w`, the sliding-window length used for the
+  step-entropy estimate. Reference default `32`.
+
+All four default to unset. A request that sets none of them is scaled by
+exactly the value it would have been scaled by before the feature existed, and
+takes no extra work in the sampling path. Setting any of them enables ReSET.
+
+### Policy
+
+ReSET *replaces* the static temperature, so a ReSET request **must** set
+`temperature = 1.0`; any other value is rejected at request validation, because
+it would scale the logits a second time. For each decoded token with
+full-vocabulary Shannon entropy `H_t` (computed from the raw logits at
+temperature 1.0):
+
+```text
+tau_t = tau_0     if  H_step <= H_bar      # a confident reasoning step
+tau_t = H_step    if  H_step >  H_bar      # an uncertain reasoning step
+T_t   = temperature_low   if  H_t <  tau_t
+T_t   = temperature_high  if  H_t >= tau_t
+```
+
+`H_bar` is the running mean of every token entropy so far; `H_step` is the
+within-step entropy estimate — the mean of a size-`w` sliding window for the
+first `w` tokens of a reasoning step, then the within-step running mean.
+Reasoning steps are split on `"\n\n"`. The whole policy runs on device with no
+per-token host synchronisation, so it is inexpensive relative to the forward
+pass.
+
+Use it for reasoning models under aggressive quantization, where a single
+temperature either misfires on confident symbolic tokens (too high) or
+over-commits on genuinely uncertain steps (too low).
+
+### Runners and limitations
+
+ReSET is applied by a batched logits processor on the V1 model runner and by an
+equivalent on-device step in the V2 model runner's sampler; both produce the
+same decisions. It is **not** supported together with speculative decoding: the
+per-token temperature depends on the previous token's sampled entropy, which a
+speculator cannot resolve ahead over draft positions, so the combination is
+rejected at request admission rather than silently applying a wrong policy.
+
+### Validation
+
+`temperature_low` and `temperature_high` must be finite and within the range
+accepted for `temperature`. `entropy_threshold` must be a finite float greater
+than 0 — it is an entropy in nats and is **not** capped at 1. `reset_window`
+must be a positive integer; `0`, negative values, booleans and non-integer
+floats are rejected rather than coerced, and `-1` is the sentinel that leaves
+the field unset. A ReSET request whose `temperature` is not 1.0 is rejected.
+Every one of these failures is raised at request validation rather than
+adjusted at sample time.
+
+### Online Serving
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      { "role": "user", "content": "9.11 and 9.8, which is greater?" }
+    ],
+    "temperature": 1.0,
+    "temperature_low": 0.1,
+    "temperature_high": 1.0,
+    "entropy_threshold": 0.5505,
+    "reset_window": 32
+  }'
+```
+
+### Offline Inference
+
+```python
+sampling_params = SamplingParams(
+    temperature=1.0,
+    temperature_low=0.1,
+    temperature_high=1.0,
+    entropy_threshold=0.5505,
+    reset_window=32,
+)
+```
+
 ## Automatic `enable_thinking` Activation
 
 Some models (such as Gemma 4, DeepSeek-V4-Pro and IBM Granite 3.2) require `enable_thinking: true` in their chat template kwargs to activate thinking mode — without it, reasoning tokens are never generated regardless of other settings.

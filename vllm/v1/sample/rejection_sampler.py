@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -18,6 +19,7 @@ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.temperature import TemperatureSchedule
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -563,6 +565,56 @@ def apply_sampling_constraints(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
+
+
+def expand_scheduled_temperature(
+    schedule: TemperatureSchedule,
+    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
+    num_tokens: int,
+) -> torch.Tensor:
+    """Expand a per-request temperature across that request's draft rows.
+
+    ReSET is rejected here rather than approximated. It resolves each token's
+    temperature from the entropy of that token's own distribution and feeds
+    the result forward as the next step's ``T_prev`` (arXiv 2606.13233), so
+    the chain depends on which draft tokens are accepted -- which is unknown
+    when the draft rows are scored. Expanding one temperature per draft
+    position ahead of acceptance would sample from a different policy than the
+    one requested, so the combination fails closed.
+
+    The answer-phase override has no such dependency: it is a single value per
+    request, so it expands normally.
+
+    Args:
+        schedule: Persistent per-request configuration and phase signals.
+        cu_num_draft_tokens: Cumulative draft-token counts per request.
+        num_tokens: Total number of expanded rows.
+
+    Returns:
+        A `[num_tokens]` tensor of temperatures, with greedy rows already
+        replaced by 1.0 so the caller can divide directly.
+
+    Raises:
+        VLLMValidationError: If any request in the batch enables ReSET.
+    """
+    if schedule.reset_active:
+        raise VLLMValidationError(
+            "The ReSET entropy-threshold temperature policy is not supported "
+            "with speculative decoding: the per-token temperature depends on "
+            "which draft tokens are accepted, so it cannot be resolved for "
+            "unverified draft positions. Disable one of the two.",
+            parameter="base_temperature",
+        )
+
+    in_answer = (schedule.entered_reasoning != 0) & (schedule.reasoning_phase == 0)
+    per_req = torch.where(
+        (schedule.answer_enabled != 0) & in_answer,
+        schedule.answer_temperature,
+        schedule.base,
+    )
+    # A resolved zero still means greedy; substitute only the divisor.
+    per_req = torch.where(per_req < 1e-5, 1.0, per_req)
+    return expand_batch_to_tokens(per_req, cu_num_draft_tokens, num_tokens)
 
 
 def expand_batch_to_tokens(

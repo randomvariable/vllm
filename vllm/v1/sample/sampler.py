@@ -13,6 +13,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.temperature import (
+    divide_by_temperature,
+    resolve_temperature,
+)
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
@@ -273,9 +277,16 @@ class Sampler(nn.Module):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        # Apply the reasoning answer-phase temperature override, resolved
+        # device-side per row. ReSET's per-step temperature is applied earlier
+        # by its logits processor, so this only reflects the answer phase.
+        effective_temperature = sampling_metadata.temperature
+        if sampling_metadata.temperature_schedule is not None:
+            effective_temperature = resolve_temperature(
+                sampling_metadata.temperature_schedule
+            )
+        logits = divide_by_temperature(
+            logits, effective_temperature, sampling_metadata.all_random
         )
 
         # Apply logits processors that only apply to random sampling
@@ -416,6 +427,10 @@ class Sampler(nn.Module):
                 predict_bonus_token,
                 sampling_metadata.spec_token_ids,
             )
+        # Re-stage step count and reasoning phase only once the thinking-budget
+        # state for this step has been advanced above.
+        if sampling_metadata.refresh_temperature_schedule is not None:
+            sampling_metadata.refresh_temperature_schedule()
         return logits
 
     @staticmethod

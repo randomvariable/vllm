@@ -64,6 +64,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -518,6 +519,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 reasoning_config=self.vllm_config.reasoning_config,
                 return_sampling_mask=self.model_config.return_sampling_mask,
                 seed=self.model_config.seed,
+                model_config=self.model_config,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -2265,9 +2267,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with (
                 use_workspace_lane(self._draft_workspace_lane),
-                record_function_or_nullcontext(
-                    f"vllm:v2/speculator/{phase}/propose"
-                ),
+                record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"),
             ):
                 draft_tokens = self.speculator.propose(
                     input_batch,

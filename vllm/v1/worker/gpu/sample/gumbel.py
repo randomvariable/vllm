@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import NamedTuple
+
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
@@ -16,6 +18,81 @@ _FP64_ONE_MINUS_EPS = (
     tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
 )
 
+
+class TemperatureSchedule(NamedTuple):
+    """Persistent device buffers for the answer-phase temperature override.
+
+    Every member is a buffer owned by `SamplingStates` or `ThinkingBudgetState`
+    and allocated once at `max_num_reqs`. The kernels derive the reasoning
+    phase from the committed markers, so the resolved temperature is never
+    computed on the host. Per-step entropy temperature control (ReSET) is
+    applied separately and does not use these buffers.
+    """
+
+    answer_temperature: torch.Tensor
+    """[max_num_reqs] f32 — temperature to use in the answer phase."""
+    answer_enabled: torch.Tensor
+    """[max_num_reqs] i32 — non-zero if the phase override applies."""
+    cached_last_start: torch.Tensor
+    """[max_num_reqs] i32 — last committed reasoning start marker."""
+    cached_last_end: torch.Tensor
+    """[max_num_reqs] i32 — last committed natural end marker."""
+
+
+_NUM_SCHEDULE_ARGS = len(TemperatureSchedule._fields)
+
+
+def schedule_args(
+    schedule: "TemperatureSchedule | None", fallback: torch.Tensor
+) -> tuple:
+    """Positional kernel arguments for `schedule`, or valid filler pointers.
+
+    Triton needs a real pointer for every argument, including ones on branches
+    its `HAS_SCHEDULE` constexpr eliminates, so the static path repeats
+    `fallback` instead of passing `None`.
+
+    Args:
+        schedule: Schedule buffers, or `None` for static temperature.
+        fallback: Any live tensor to use as an unread placeholder pointer.
+
+    Returns:
+        A tuple of `len(TemperatureSchedule._fields)` tensors.
+    """
+    if schedule is None:
+        return (fallback,) * _NUM_SCHEDULE_ARGS
+    return tuple(schedule)
+
+
+@triton.jit
+def resolve_temperature(
+    req_state_idx,
+    temperature_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
+    HAS_SCHEDULE: tl.constexpr,
+):
+    """Resolve the temperature for one logits row, entirely on device.
+
+    With `HAS_SCHEDULE` false this is exactly `temperature_ptr[req]`, which
+    keeps the unscheduled path byte-for-byte identical to the static kernel.
+    """
+    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    if HAS_SCHEDULE:  # noqa: SIM102 - constexpr gate must stay outside the load
+        if tl.load(answer_enabled_ptr + req_state_idx) != 0:
+            # The answer phase starts only once a natural end marker has fully
+            # committed with no later start marker. A request that never
+            # entered reasoning has last_end < 0 and keeps its static value.
+            last_start = tl.load(cached_last_start_ptr + req_state_idx).to(tl.int32)
+            last_end = tl.load(cached_last_end_ptr + req_state_idx).to(tl.int32)
+            if last_end >= 0 and last_start <= last_end:
+                temperature = tl.load(answer_temperature_ptr + req_state_idx).to(
+                    tl.float32
+                )
+    return temperature
+
+
 # Offset salt keeping the draft's Gumbel noise disjoint from the target's.
 # Verification is a probability-ratio test, not a Gumbel coupling, so a proposal
 # and the residual it is resampled from must not share a noise vector.
@@ -29,12 +106,25 @@ def _temperature_kernel(
     logits_stride,
     expanded_idx_mapping_ptr,
     temperature_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
     vocab_size,
+    HAS_SCHEDULE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    temperature = resolve_temperature(
+        req_state_idx,
+        temperature_ptr,
+        answer_temperature_ptr,
+        answer_enabled_ptr,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
+        HAS_SCHEDULE=HAS_SCHEDULE,
+    )
     if temperature == 0.0 or temperature == 1.0:
         # Early return to avoid loading logits.
         return
@@ -152,17 +242,38 @@ def gumbel_block_argmax(
     logits_cache_col_ptr,
     logits_cache_active_rows_ptr,
     vocab_size,
-    IS_DRAFTING: tl.constexpr,
-    APPLY_TEMPERATURE: tl.constexpr,
-    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
-    USE_FP64: tl.constexpr,
+    answer_temperature_ptr=None,
+    answer_enabled_ptr=None,
+    cached_last_start_ptr=None,
+    cached_last_end_ptr=None,
+    IS_DRAFTING: tl.constexpr = False,
+    APPLY_TEMPERATURE: tl.constexpr = False,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr = False,
+    USE_FP64: tl.constexpr = False,
     PER_TOKEN_COL: tl.constexpr = False,
+    HAS_SCHEDULE: tl.constexpr = False,
 ):
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
         tl.float32
     )
+    if HAS_SCHEDULE:
+        # `resolve_temperature` loads unmasked, so clamp padded rows (which
+        # carry a negative req_state_idx) to a valid offset and discard the
+        # result below rather than indexing out of bounds.
+        safe_req_idx = tl.where(is_valid_req, req_state_idx, 0)
+        resolved = resolve_temperature(
+            safe_req_idx,
+            temp_ptr,
+            answer_temperature_ptr,
+            answer_enabled_ptr,
+            cached_last_start_ptr,
+            cached_last_end_ptr,
+            HAS_SCHEDULE=True,
+        )
+        temp = tl.where(is_valid_req, resolved, 0.0)
+
     if logits_cache_ptr is not None:
         # Store the logits *before* temperature. Dividing first would produce a
         # value that is generally not representable in the cache's dtype, forcing
@@ -221,13 +332,17 @@ def _gumbel_sample_kernel(
     seeds_ptr,
     pos_ptr,
     temp_ptr,
+    answer_temperature_ptr,
+    answer_enabled_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
-    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
+    HAS_SCHEDULE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
@@ -255,13 +370,17 @@ def _gumbel_sample_kernel(
         logits_cache_col_ptr,
         logits_cache_active_rows_ptr,
         vocab_size,
+        answer_temperature_ptr,
+        answer_enabled_ptr,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
         IS_DRAFTING=IS_DRAFTING,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
-        HAS_ACTIVE_ROW_LIMIT=HAS_ACTIVE_ROW_LIMIT,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
+        HAS_SCHEDULE=HAS_SCHEDULE,
     )
-    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+    token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
@@ -278,6 +397,7 @@ def gumbel_sample(
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     logits_cache_active_rows: torch.Tensor | None = None,
     use_fp64: bool = False,
+    schedule: TemperatureSchedule | None = None,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -313,6 +433,7 @@ def gumbel_sample(
         seed,
         pos,
         temperature,
+        *schedule_args(schedule, temperature),
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         IS_DRAFTING=is_drafting,
@@ -320,6 +441,7 @@ def gumbel_sample(
         HAS_ACTIVE_ROW_LIMIT=logits_cache_active_rows is not None,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
+        HAS_SCHEDULE=schedule is not None,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)

@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import numpy as np
 import torch
 
 import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.config.reasoning import ReasoningConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -44,13 +47,14 @@ class Sampler:
         reasoning_config: ReasoningConfig | None = None,
         return_sampling_mask: bool = False,
         seed: int | None = None,
+        model_config: Any = None,
     ):
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, seed)
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)
@@ -62,6 +66,15 @@ class Sampler:
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
+        # The temperature schedule derives its step count and reasoning phase
+        # from these persistent buffers, device side.
+        self.sampling_states.bind_reasoning_state(
+            req_states,
+            getattr(self.thinking_budget_state, "cached_last_start", None),
+            getattr(self.thinking_budget_state, "cached_last_end", None),
+            device,
+            model_config,
+        )
         self.use_flashinfer = (
             not return_sampling_mask and flashinfer_sampler_supported()
         )
@@ -69,6 +82,16 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        if self.num_speculative_tokens > 1 and sampling_params.has_temperature_schedule:
+            raise VLLMValidationError(
+                "The ReSET entropy-threshold temperature policy (arXiv "
+                "2606.13233) is sequential per token and cannot be resolved "
+                "ahead over speculative draft positions; it is not supported "
+                "with speculative decoding. Disable speculative decoding for "
+                "ReSET requests.",
+                parameter="temperature_low",
+                value=sampling_params.temperature_low,
+            )
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -216,7 +239,7 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
     ) -> torch.Tensor:
-        if not np.any(self.needs_logits_processing[idx_mapping_np]):
+        if not self._requires_logits_processing(idx_mapping_np):
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -256,7 +279,14 @@ class Sampler:
             expanded_local_pos,
         )
 
-        # Apply temperature in place.
+        # Apply the ReSET entropy-threshold temperature (arXiv 2606.13233) to
+        # ReSET rows before the static divide. ReSET rows carry temperature
+        # 1.0, so `apply_temperature` below is a no-op for them.
+        self.sampling_states.apply_reset(logits, idx_mapping, idx_mapping_np)
+
+        # Apply temperature in place. The kernel resolves the per-row step,
+        # anneal progress and reasoning phase itself, reading the marker cache
+        # `thinking_budget_state.apply` refreshed just above.
         self.sampling_states.apply_temperature(
             logits, expanded_idx_mapping, idx_mapping_np
         )
@@ -271,6 +301,37 @@ class Sampler:
         return self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+
+    def _requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
+        if np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np]):
+            return True
+        if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
+            return True
+        if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
+            return True
+        # Reasoning controls are the only signal for a request that sets no
+        # other logits processor -- without this, a greedy or temperature-1.0
+        # request returns early and the budget never applies.
+        if self.thinking_budget_state.enabled and np.any(
+            self.thinking_budget_state.use_thinking_budget[idx_mapping_np]
+        ):
+            return True
+        if np.any(self.sampling_states.use_reset[idx_mapping_np]):
+            return True
+
+        states = self.sampling_states
+        temperatures = states.temperature.np[idx_mapping_np]
+        if np.any((temperatures != 0.0) & (temperatures != 1.0)):
+            return True
+        # A base of 0.0/1.0 says nothing about a request that anneals to some
+        # other value, or overrides its temperature in the answer phase.
+        if states.any_dynamic_temperature(idx_mapping_np):
+            return True
+        if np.any(states.min_p.np[idx_mapping_np] != 0.0):
+            return True
+        if np.any(states.top_k.np[idx_mapping_np] != states.vocab_size):
+            return True
+        return bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
 
     def sample(
         self,
@@ -302,6 +363,8 @@ class Sampler:
             # logprobs need to be returned for any requests.
             (top_k is None and top_p is None)
             or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            # `any_greedy` covers schedules that can resolve to zero on a later
+            # step; FlashInfer decides greedy statically and cannot see them.
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
@@ -320,5 +383,8 @@ class Sampler:
                 apply_temperature=False,
                 is_drafting=False,
                 use_fp64=self.use_fp64_gumbel,
+                # Temperature is already applied above; the schedule is passed
+                # so the greedy branch tests the resolved value, not the base.
+                schedule=self.sampling_states.temperature_schedule(idx_mapping_np),
             )
         return sampled, processed_logits

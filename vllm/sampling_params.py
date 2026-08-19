@@ -26,6 +26,7 @@ logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
+_MAX_TEMPERATURE = 2.0
 
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
@@ -71,9 +72,153 @@ def validate_thinking_token_budget(value: int | float | bool | None) -> int | No
     return value
 
 
+def validate_temperature_low(value: float | int | bool | None) -> float | None:
+    """Validate ``temperature_low``; return ``None`` if unset.
+
+    The ReSET low temperature (arXiv 2606.13233) is applied when a decoded
+    token's entropy is below the threshold, i.e. the model is confident. It
+    must be a finite float in (0, 2]; ``0`` is rejected because dividing
+    logits by zero would produce a degenerate softmax.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`temperature_low` must be a finite float in (0, 2].",
+            parameter="temperature_low",
+            value=value,
+        )
+    if not math.isfinite(value) or not 0.0 < value <= _MAX_TEMPERATURE:
+        raise VLLMValidationError(
+            "`temperature_low` must be a finite float in (0, 2].",
+            parameter="temperature_low",
+            value=value,
+        )
+    return float(value)
+
+
+def validate_temperature_high(value: float | int | bool | None) -> float | None:
+    """Validate ``temperature_high``; return ``None`` if unset.
+
+    The ReSET high temperature (arXiv 2606.13233) is applied when a decoded
+    token's entropy is above the threshold, i.e. the model is uncertain. It
+    must be a finite float in (0, 2]; ``0`` is rejected because dividing
+    logits by zero would produce a degenerate softmax.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`temperature_high` must be a finite float in (0, 2].",
+            parameter="temperature_high",
+            value=value,
+        )
+    if not math.isfinite(value) or not 0.0 < value <= _MAX_TEMPERATURE:
+        raise VLLMValidationError(
+            "`temperature_high` must be a finite float in (0, 2].",
+            parameter="temperature_high",
+            value=value,
+        )
+    return float(value)
+
+
+def validate_entropy_threshold(value: float | int | bool | None) -> float | None:
+    """Validate ``entropy_threshold`` (``tau0``); return ``None`` if unset.
+
+    The ReSET entropy threshold (arXiv 2606.13233) is the per-token Shannon
+    entropy bound, in nats, separating confident tokens (below threshold,
+    sampled at ``temperature_low``) from uncertain ones (at or above the
+    threshold, sampled at ``temperature_high``). It is the 80th-percentile
+    token entropy on a calibration split -- reference values are around
+    ``0.5``-``0.65`` -- and must be a finite float greater than 0. It is not
+    capped at 1: full-vocabulary entropy in nats ranges up to ``log(vocab)``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`entropy_threshold` must be a finite float greater than 0.",
+            parameter="entropy_threshold",
+            value=value,
+        )
+    if not math.isfinite(value) or value <= 0.0:
+        raise VLLMValidationError(
+            "`entropy_threshold` must be a finite float greater than 0.",
+            parameter="entropy_threshold",
+            value=value,
+        )
+    return float(value)
+
+
+def validate_reset_window(value: int | float | bool | None) -> int | None:
+    """Validate ``reset_window`` (``w``); return ``None`` if unset.
+
+    The ReSET sliding-window width (arXiv 2606.13233) used for the step
+    entropy estimate until a step has enough tokens to switch to its
+    within-step running mean. It must be a positive integer; ``0`` is
+    rejected because an empty window cannot hold a running entropy estimate.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)) or not isinstance(value, int):
+        raise VLLMValidationError(
+            "`reset_window` must be a positive integer.",
+            parameter="reset_window",
+            value=value,
+        )
+    if value < 1:
+        raise VLLMValidationError(
+            "`reset_window` must be a positive integer.",
+            parameter="reset_window",
+            value=value,
+        )
+    return value
+
+
+def validate_reasoning_answer_temperature(
+    value: float | int | bool | None,
+) -> float | None:
+    """Validate ``reasoning_answer_temperature``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`reasoning_answer_temperature` must be a finite float in [0, 2].",
+            parameter="reasoning_answer_temperature",
+            value=value,
+        )
+    if not math.isfinite(value) or not 0.0 <= value <= _MAX_TEMPERATURE:
+        raise VLLMValidationError(
+            "`reasoning_answer_temperature` must be a finite float in [0, 2].",
+            parameter="reasoning_answer_temperature",
+            value=value,
+        )
+    return float(value)
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
+]
+TemperatureLow = Annotated[
+    float | None,
+    BeforeValidator(validate_temperature_low),
+]
+TemperatureHigh = Annotated[
+    float | None,
+    BeforeValidator(validate_temperature_high),
+]
+EntropyThreshold = Annotated[
+    float | None,
+    BeforeValidator(validate_entropy_threshold),
+]
+ResetWindow = Annotated[
+    int | None,
+    BeforeValidator(validate_reset_window),
+]
+ReasoningAnswerTemperature = Annotated[
+    float | None,
+    BeforeValidator(validate_reasoning_answer_temperature),
 ]
 
 
@@ -357,6 +502,47 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
+    temperature_low: TemperatureLow = None
+    """ReSET temperature when the token's entropy is below the threshold
+    (arXiv 2606.13233).
+
+    A confident, low-entropy token is sampled at ``temperature_low``. Must be
+    a finite float in ``(0, 2]``.
+    """
+    temperature_high: TemperatureHigh = None
+    """ReSET temperature when the token's entropy is above the threshold
+    (arXiv 2606.13233).
+
+    An uncertain token is sampled at ``temperature_high``. Must be a finite
+    float in ``(0, 2]``.
+    """
+    entropy_threshold: EntropyThreshold = None
+    """ReSET entropy threshold ``tau0`` (arXiv 2606.13233).
+
+    A confident reasoning step falls back to ``tau0``, the per-token Shannon
+    entropy (in nats) separating confident tokens from uncertain ones,
+    calibrated per model as the 80th-percentile token entropy. Must be a
+    finite float greater than 0; it is not capped at 1.
+    """
+    reset_window: ResetWindow = None
+    """ReSET sliding-window width ``w`` (arXiv 2606.13233).
+
+    Used for the step-entropy estimate until a step has enough tokens to
+    switch to its within-step running mean. Must be a positive integer.
+    """
+    reasoning_answer_temperature: ReasoningAnswerTemperature = None
+    """Temperature used once the reasoning block has closed.
+
+    Overrides both ``temperature`` and any ReSET decision for rows sampled
+    after a natural end-of-thinking marker has fully completed, letting a
+    request explore while thinking and then commit to a low temperature for the
+    answer. A request that never enters a reasoning block never takes the
+    override.
+
+    Requires reasoning to be configured on the request via
+    ``thinking_token_budget``, because the phase is only tracked for
+    requests the reasoning path already follows.
+    """
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -393,6 +579,11 @@ class SamplingParams(
         stop_token_ids: list[int] | None = None,
         bad_words: list[str] | None = None,
         thinking_token_budget: int | None = None,
+        temperature_low: float | None = None,
+        temperature_high: float | None = None,
+        entropy_threshold: float | None = None,
+        reset_window: int | None = None,
+        reasoning_answer_temperature: float | None = None,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
@@ -458,6 +649,11 @@ class SamplingParams(
             stop_token_ids=stop_token_ids,
             bad_words=bad_words,
             thinking_token_budget=thinking_token_budget,
+            temperature_low=temperature_low,
+            temperature_high=temperature_high,
+            entropy_threshold=entropy_threshold,
+            reset_window=reset_window,
+            reasoning_answer_temperature=reasoning_answer_temperature,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -497,6 +693,21 @@ class SamplingParams(
         self.thinking_token_budget = validate_thinking_token_budget(
             self.thinking_token_budget
         )
+        self.temperature_low = validate_temperature_low(self.temperature_low)
+        self.temperature_high = validate_temperature_high(self.temperature_high)
+        self.entropy_threshold = validate_entropy_threshold(self.entropy_threshold)
+        self.reset_window = validate_reset_window(self.reset_window)
+        self.reasoning_answer_temperature = validate_reasoning_answer_temperature(
+            self.reasoning_answer_temperature
+        )
+        # The ReSET temps are validated in (0, 2] so no low-value floor is
+        # needed; a positive value below the epsilon would have divided logits
+        # by ~0 device-side, matching the static ``temperature`` floor.
+        if (
+            self.reasoning_answer_temperature is not None
+            and 0 < self.reasoning_answer_temperature < _MAX_TEMP
+        ):
+            self.reasoning_answer_temperature = _MAX_TEMP
 
         if self.stop is None:
             self.stop = []
@@ -580,6 +791,14 @@ class SamplingParams(
                 parameter="temperature",
                 value=self.temperature,
             )
+        if self.has_temperature_schedule and abs(self.temperature - 1.0) > 1e-3:
+            raise VLLMValidationError(
+                "ReSET temperature scaling requires temperature=1.0 so the "
+                "per-token temperature is applied once by the ReSET logits "
+                f"processor; got {self.temperature}.",
+                parameter="temperature",
+                value=self.temperature,
+            )
         if not 0.0 < self.top_p <= 1.0:
             raise VLLMValidationError(
                 f"top_p must be in (0, 1], got {self.top_p}.",
@@ -611,6 +830,18 @@ class SamplingParams(
             raise VLLMValidationError(
                 f"min_tokens must be less than or equal to "
                 f"max_tokens={self.max_tokens}, got {self.min_tokens}."
+            )
+        if (
+            self.reasoning_answer_temperature is not None
+            and self.thinking_token_budget is None
+        ):
+            raise VLLMValidationError(
+                "`reasoning_answer_temperature` requires reasoning to be "
+                "configured on the request via `thinking_token_budget`; "
+                "without it the answer phase is never tracked and the "
+                "override could never fire.",
+                parameter="reasoning_answer_temperature",
+                value=self.reasoning_answer_temperature,
             )
         if self.stream_interval is not None and self.stream_interval < 1:
             raise VLLMValidationError(
@@ -740,6 +971,53 @@ class SamplingParams(
                 parameter="bad_words",
                 value=self.bad_words,
             )
+
+    @property
+    def has_temperature_schedule(self) -> bool:
+        """Whether a ReSET entropy-threshold temperature policy is configured.
+
+        True when any ReSET knob is set; once the user overrides any of the
+        paper defaults (arXiv 2606.13233) we treat the policy as active even
+        if the remaining knobs keep their internal constants.
+        """
+        return (
+            self.temperature_low is not None
+            or self.temperature_high is not None
+            or self.entropy_threshold is not None
+            or self.reset_window is not None
+        )
+
+    @property
+    def has_dynamic_temperature(self) -> bool:
+        """Whether the sampling temperature can change during generation."""
+        return (
+            self.has_temperature_schedule
+            or self.reasoning_answer_temperature is not None
+        )
+
+    @property
+    def max_effective_temperature(self) -> float:
+        """Largest temperature this request can ever sample at."""
+        temp = self.temperature
+        if self.has_temperature_schedule:
+            # ReSET replaces the static temperature: an uncertain token is
+            # sampled at temperature_high (reference default 1.0).
+            temp = self.temperature_high if self.temperature_high is not None else 1.0
+        if self.reasoning_answer_temperature is not None:
+            temp = max(temp, self.reasoning_answer_temperature)
+        return temp
+
+    @property
+    def min_effective_temperature(self) -> float:
+        """Smallest temperature this request can ever sample at."""
+        temp = self.temperature
+        if self.has_temperature_schedule:
+            # A confident token is sampled at temperature_low (reference
+            # default 0.1); the static temperature no longer applies.
+            temp = self.temperature_low if self.temperature_low is not None else 0.1
+        if self.reasoning_answer_temperature is not None:
+            temp = min(temp, self.reasoning_answer_temperature)
+        return temp
 
     @cached_property
     def sampling_type(self) -> SamplingType:
