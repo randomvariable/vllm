@@ -42,6 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
     --mount=type=cache,id=vllm-spark-flashinfer-cubins,target=/app/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins,sharing=locked \
     --mount=type=cache,target=/app/.deps,sharing=locked \
+    --mount=type=cache,id=vllm-spark-cmake-native,target=/vllm-build,sharing=locked \
     cp /tmp/ccache.conf /root/.cache/ccache/ccache.conf && \
     make sync && ccache --show-stats --verbose
 
