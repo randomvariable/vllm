@@ -114,7 +114,7 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
 # -- measured on run z7hpr, the AOT dep-generation ran at 2.25s/unit with a warm
 # cache directory present, because the generated build tree it keys on is
 # recreated from scratch every build.
-COPY Makefile ccache.conf pyproject.toml uv.lock /src/vllm/
+COPY Makefile common.mk ccache.conf pyproject.toml uv.lock /src/vllm/
 COPY requirements /src/vllm/requirements
 COPY tools /src/vllm/tools
 COPY third_party/flashinfer /src/vllm/third_party/flashinfer
