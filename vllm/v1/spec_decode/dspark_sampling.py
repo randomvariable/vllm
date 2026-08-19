@@ -221,19 +221,23 @@ def sample_dspark_markov_block_fused(
     full-vocab ``w2`` weight is read exactly once per step.
 
     Falls back to :func:`sample_dspark_markov_block` (bit-identical reference)
-    whenever the fused path's assumptions do not hold: non-CUDA tensors,
-    all-greedy batches, fp64 Gumbel noise, or per-request seeded generators
-    (reproducibility). Top-k/top-p constrained batches stay on the fused
-    softmax/sample/probs writer after pre-masking the step logits with the
-    shared sampler helper, preserving the reference distribution without
-    duplicating its sort-based top-p logic.
+    whenever the fused path's assumptions do not hold: the fused kernel module
+    is absent from the build, non-CUDA tensors, all-greedy batches, fp64 Gumbel
+    noise, or per-request seeded generators (reproducibility). Top-k/top-p
+    constrained batches stay on the fused softmax/sample/probs writer after
+    pre-masking the step logits with the shared sampler helper, preserving the
+    reference distribution without duplicating its sort-based top-p logic.
     """
-    from vllm.models.deepseek_v4.nvidia.dspark_triton import (
-        dspark_markov_probs_sample,
-    )
+    try:
+        from vllm.models.deepseek_v4.nvidia.dspark_triton import (
+            dspark_markov_probs_sample,
+        )
+    except ImportError:
+        dspark_markov_probs_sample = None
 
     if (
-        not base_logits.is_cuda
+        dspark_markov_probs_sample is None
+        or not base_logits.is_cuda
         or sampling_metadata.all_greedy
         or use_fp64_gumbel
         or len(sampling_metadata.generators) > 0
@@ -297,9 +301,7 @@ def sample_dspark_markov_block_fused(
     tokens = (
         tokens_out[:batch_size, :block_size]
         if tokens_out is not None
-        else torch.empty(
-            (batch_size, block_size), dtype=torch.int64, device=device
-        )
+        else torch.empty((batch_size, block_size), dtype=torch.int64, device=device)
     )
     if draft_probs_out is not None and (
         draft_probs_out.shape[0] < batch_size
@@ -320,11 +322,21 @@ def sample_dspark_markov_block_fused(
     )
     num_blocks = (vocab_size + block_v - 1) // block_v
     scratch = {
-        "block_max": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_sumexp": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_gval": torch.empty((batch_size, num_blocks), dtype=torch.float32, device=device),
-        "block_maxid": torch.empty((batch_size, num_blocks), dtype=torch.int32, device=device),
-        "block_gid": torch.empty((batch_size, num_blocks), dtype=torch.int32, device=device),
+        "block_max": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_sumexp": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_gval": torch.empty(
+            (batch_size, num_blocks), dtype=torch.float32, device=device
+        ),
+        "block_maxid": torch.empty(
+            (batch_size, num_blocks), dtype=torch.int32, device=device
+        ),
+        "block_gid": torch.empty(
+            (batch_size, num_blocks), dtype=torch.int32, device=device
+        ),
         "row_max": torch.empty((batch_size,), dtype=torch.float32, device=device),
         "row_invz": torch.empty((batch_size,), dtype=torch.float32, device=device),
     }

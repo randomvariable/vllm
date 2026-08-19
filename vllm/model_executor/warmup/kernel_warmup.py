@@ -54,9 +54,6 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
-from vllm.model_executor.warmup.v1_block_table_warmup import (
-    warm_v1_block_table_kernels,
-)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -278,9 +275,6 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if not worker.use_v2_model_runner:
-        # Pooling models do not use the generation slot-mapping path.
-        if not worker.model_runner.is_pooling_model:
-            warm_v1_block_table_kernels(worker.model_runner)
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
