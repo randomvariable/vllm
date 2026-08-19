@@ -28,8 +28,11 @@ metadata:
   name: vllm-build-on-push-spark
   annotations:
     pipelinesascode.tekton.dev/on-cel-expression: |
-      event == "push" && target_branch == "homelabs-main" &&
-      ".tekton/spark-build-on-push.yaml".pathChanged()
+      event == "push" && target_branch == "homelabs-main" && (
+        ".tekton/spark-build-on-push.yaml".pathChanged() ||
+        "homelab/spark-cross.Dockerfile".pathChanged() ||
+        ".dockerignore".pathChanged()
+      )
     pipelinesascode.tekton.dev/max-keep-runs: "10"
     pipelinesascode.tekton.dev/task: "git-clone"
 spec:
@@ -212,10 +215,13 @@ spec:
                 # from an empty ccache every single time -- roughly three hours
                 # of work whose whole purpose was to be cached.
                 #
-                # reservedSpace is what GC will not reclaim. 150GB of the 200GB
-                # PVC leaves headroom for the ~95GB working set plus a build's
-                # worth of new layers, while maxUsedSpace keeps a runaway build
-                # from filling the volume.
+                # reservedSpace is what GC will not reclaim. The PVC is 400Gi, not
+                # the 200GB this comment previously assumed, so the old
+                # 150GB/160GB pair capped BuildKit at 40% of the volume and made
+                # GC reclaim layers and cache mounts that there was room to keep.
+                # The working set is the ~95GB layer store plus a 100G ccache
+                # (CCACHE_MAXSIZE in the builder stage), so reserve 280GB and cap
+                # at 320GB, leaving the volume's own headroom.
                 mkdir -p /home/user/.config/buildkit
                 cat > /home/user/.config/buildkit/buildkitd.toml <<'BKCONF'
                 root = "/home/user/.local/share/buildkit"
@@ -223,9 +229,9 @@ spec:
                 [worker.oci]
                   enabled = true
                   gc = true
-                  reservedSpace = "150GB"
-                  maxUsedSpace = "160GB"
-                  minFreeSpace = "10GB"
+                  reservedSpace = "280GB"
+                  maxUsedSpace = "320GB"
+                  minFreeSpace = "20GB"
                 BKCONF
                 echo "== buildkitd config =="
                 cat /home/user/.config/buildkit/buildkitd.toml

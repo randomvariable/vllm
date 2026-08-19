@@ -53,8 +53,17 @@ rust/target/
 .git
 .github
 
-# Never read by the wheel build (packages are vllm* only), but large enough
-# to slow the context upload and to invalidate layers on doc-only commits.
+# CI definitions are never read by the build, and the sanctioned way to force a
+# rebuild is a comment bump in .tekton/spark-build-on-push.yaml (pathChanged is
+# the PAC trigger). With .tekton in the context that bump changed the
+# `COPY . /src/vllm` digest, so every deliberate retrigger threw away the whole
+# ~3h CUDA compile -- the exact opposite of what a retrigger should cost.
+.tekton
+
+# Never read by the wheel build (packaging is `include = ["vllm*"]`), but large
+# enough to slow the context upload and to invalidate the CUDA compile layers on
+# doc-only or test-only commits.
+tests
 docs
 examples
 benchmarks

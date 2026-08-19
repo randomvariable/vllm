@@ -20,13 +20,28 @@ ARG MAX_JOBS=4
 ARG CMAKE_BUILD_PARALLEL_LEVEL=4
 ARG NVCC_THREADS=1
 
+# Nothing in this ENV may depend on the commit being built. VLLM_VERSION_OVERRIDE
+# used to live here, and because setuptools-scm derives a new version for every
+# commit, the layer changed on every build and invalidated everything below it --
+# apt, the SBSA cross toolkit, uv, the aarch64 torch download, rustup and the
+# whole `make cross` compile. Measured effect: exactly one CACHED layer per run.
+# The version is passed to `make cross` inline instead, so only the compile layer
+# is commit-sensitive.
+#
+# CCACHE_MAXSIZE is set here because the checked-in ccache.conf cannot carry it
+# (ccache rejects storage options in a directory config) and nothing else set it,
+# so the build ran at the 5 GiB default. FlashInfer AOT alone is ~3400 CUDA units
+# of multi-MB objects, so the cache evicted its own output mid-stage and every
+# stage re-entered effectively empty. Env beats the config file. 100G against the
+# 400Gi PVC leaves room for the BuildKit layer store.
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:${PATH} \
     VLLM_BUILD_TEMP=/vllm-build \
-    VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
-    NVCC_THREADS=${NVCC_THREADS}
+    NVCC_THREADS=${NVCC_THREADS} \
+    CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_MAXSIZE=100G
 COPY homelab/install-uv.sh /usr/local/bin/install-uv
 COPY homelab/install-system-packages.sh /usr/local/bin/install-system-packages
 RUN chmod 0755 /usr/local/bin/install-uv /usr/local/bin/install-system-packages
@@ -102,7 +117,12 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
     mkdir -p /root/.cache/ccache && \
     cp /src/vllm/ccache.conf /root/.cache/ccache/ccache.conf && \
-    cd /src/vllm && make cross
+    echo "== ccache state at stage entry ==" && ccache -sv && ccache -z && \
+    cd /src/vllm && \
+    VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} make cross; \
+    rc=$?; \
+    echo "== ccache state at stage exit (rc=$rc) ==" && ccache -sv; \
+    exit $rc
 
 RUN mkdir -p /runtime-requirements
 COPY requirements/cuda.txt /runtime-requirements/cuda.txt
