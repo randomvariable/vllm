@@ -28,6 +28,8 @@ USE_CUDSS ?= 1
 USE_CUFILE ?= 1
 VLLM_VERSION_OVERRIDE ?= 0.23.0
 PYTHON_HOST_PLATFORM ?=
+WHEEL_BUILD_ENV ?=
+WHEEL_EXPECTED_ELF_MACHINE ?=
 CUDA_VERSION ?= 13.3
 WHEEL_DIR ?= /wheels
 B12X_WHEEL_DIR ?= /wheels-b12x
@@ -80,6 +82,8 @@ cross: AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 cross: PYO3_CROSS_PYTHON_VERSION=3.12
 cross: PYTHON=/opt/venv/bin/python
 cross: PYTHON_HOST_PLATFORM=linux-aarch64
+cross: WHEEL_EXPECTED_ELF_MACHINE=AArch64
+cross: WHEEL_BUILD_ENV=_PYTHON_HOST_PLATFORM=$(PYTHON_HOST_PLATFORM) CXX=$(CXX) CUDA_HOME=$(CUDA_HOME) CUDA_TOOLKIT_ROOT=$(CUDA_TOOLKIT_ROOT) VLLM_TARGET_DEVICE=$(VLLM_TARGET_DEVICE) TORCH_CUDA_ARCH_LIST=$(TORCH_CUDA_ARCH_LIST) NVCC_PREPEND_FLAGS='$(NVCC_PREPEND_FLAGS)' CMAKE_ARGS='$(CMAKE_ARGS)'
 cross: WHEEL_DIR=/wheels
 cross: B12X_WHEEL_DIR=/wheels-b12x
 cross: FLASHINFER_DIST_DIR=/wheels-flashinfer
@@ -155,8 +159,14 @@ build-rust:
 
 build-wheel:
 	mkdir -p $(WHEEL_DIR)
-	_PYTHON_HOST_PLATFORM=$(PYTHON_HOST_PLATFORM) $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
+	$(WHEEL_BUILD_ENV) $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
 		--out-dir $(WHEEL_DIR) .
+	if [ -n "$(WHEEL_EXPECTED_ELF_MACHINE)" ]; then \
+		set -e; \
+		for whl in $(WHEEL_DIR)/vllm-*.whl; do \
+			$(PYTHON) tools/check_wheel_elf.py "$$whl" "$(WHEEL_EXPECTED_ELF_MACHINE)"; \
+		done; \
+	fi
 
 SPARK_IMAGE ?= local/vllm-spark:dev
 SPARK_CROSS_IMAGE ?= local/vllm-spark-cross:dev
