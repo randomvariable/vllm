@@ -1,7 +1,7 @@
 # Tekton build harness for the DGX Spark (CUDA sm_121a) vLLM runtime image.
 #
 # Lives in the public vllm fork so the pipeline travels with the source it
-# builds. Every infrastructure-specific value (harbor + ghcr registries, build
+# builds. Every infrastructure-specific value (registry, build
 # node, BuildKit cache PVC, pull secrets) is templated via PAC Repository
 # params resolved from the cluster-side Repository CRD -- the fork itself
 # carries no infra specifics (memory #3980).
@@ -19,8 +19,8 @@
 # native arm64 build path (homelab/spark.Dockerfile on the Pi pool) is not
 # viable: the Pi CM5s are too memory-constrained for the vLLM CUDA compile.
 #
-# The built image is pushed to both harbor (<sha> and :latest) and ghcr
-# (<sha> and :latest); the dockerconfig secret carries auth entries for both.
+# The built image is pushed to harbor (<sha> and :latest). The GHCR mirror is
+# currently disabled -- see the note on the buildctl step's env block.
 ---
 apiVersion: tekton.dev/v1
 kind: PipelineRun
@@ -138,11 +138,13 @@ spec:
                 - {name: DOCKER_CONFIG, value: /tmp/docker}
                 - {name: HARBOR_REGISTRY, value: "{{ harbor_registry }}"}
                 - {name: IMAGE_NAME, value: "{{ spark_harbor_image }}"}
-                # Mirror pushes to GitHub Container Registry under the same
-                # repository namespace. The dockerconfig secret carries a
-                # ghcr.io auth entry (packages:write).
-                - {name: GHCR_REGISTRY, value: "{{ spark_ghcr_registry }}"}
-                - {name: GHCR_IMAGE_NAME, value: "{{ spark_ghcr_image }}"}
+                # GHCR mirror is disabled: the ghcr.io auth entry in the
+                # dockerconfig secret is a fine-grained PAT, which GitHub does
+                # not accept for container-registry writes ("token provided does
+                # not match expected scopes"). Because buildctl pushes every
+                # --output name in a single solve, that rejection also cancelled
+                # the registry cache export. Restore by adding a classic PAT with
+                # write:packages and re-adding the two ghcr names to --output.
               script: |
                 #!/bin/sh
                 set -eu
@@ -297,7 +299,7 @@ spec:
                   --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:buildcache" \
                   --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
                   --export-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:buildcache,mode=max,ignore-error=true" \
-                  --output "type=image,\"name=${IMAGE_REF},${HARBOR_REGISTRY}/${IMAGE_NAME}:latest,${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:${SHORT_SHA},${GHCR_REGISTRY}/${GHCR_IMAGE_NAME}:latest\",push=true"
+                  --output "type=image,\"name=${IMAGE_REF},${HARBOR_REGISTRY}/${IMAGE_NAME}:latest\",push=true"
                 printf '%s' "$IMAGE_REF" > "$(results.IMAGE_REF.path)"
                 printf '%s' "$SHORT_SHA" > "$(results.IMAGE_TAG.path)"
               volumeMounts:
