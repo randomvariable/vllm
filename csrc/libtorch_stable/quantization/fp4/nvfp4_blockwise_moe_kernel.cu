@@ -18,6 +18,8 @@
 #include <torch/csrc/stable/tensor.h>
 #include "libtorch_stable/torch_utils.h"
 
+#include <type_traits>
+
 #include <cutlass/arch/arch.h>
 
 #include "libtorch_stable/cutlass_extensions/common.hpp"
@@ -416,6 +418,12 @@ void run_fp4_blockwise_scaled_group_mm_sm100(
   STD_TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
+// UsePingpong selects the pingpong PtrArray schedule (faster at large
+// per-expert M / prefill); the default (false) keeps
+// KernelScheduleAuto == cooperative (faster at small M / decode, and the
+// schedule the batch-invariance contract is pinned to). See the dispatch in
+// run_fp4_blockwise_scaled_group_mm.
+template <bool UsePingpong = false>
 void run_fp4_blockwise_scaled_group_mm_sm120(
     torch::stable::Tensor& output, const torch::stable::Tensor& a,
     const torch::stable::Tensor& b, const torch::stable::Tensor& a_blockscale,
@@ -475,18 +483,29 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
           LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+          std::conditional_t<
+              UsePingpong,
+              cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
+              cutlass::gemm::collective::KernelScheduleAuto>>::CollectiveOp;
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
                                            CollectiveEpilogue>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  static_assert(!UsePingpong ||
+                    cute::is_base_of_v<
+                        cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
+                        typename Gemm::GemmKernel::CollectiveMainloop::
+                            DispatchPolicy::Schedule>,
+                "pingpong instantiation must select the pingpong schedule");
   static_assert(
-      cute::is_base_of_v<
-          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative,
-          typename Gemm::GemmKernel::CollectiveMainloop::DispatchPolicy::
-              Schedule>,
+      UsePingpong ||
+          cute::is_base_of_v<
+              cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative,
+              typename Gemm::GemmKernel::CollectiveMainloop::DispatchPolicy::
+                  Schedule>,
       "SM120 NVFP4 grouped GEMM must use a cooperative ptr-array mainloop "
       "schedule for batch invariance (VLLM_BATCH_INVARIANT=1). "
       "If you want to change this, add a dedicated config/code path "
@@ -635,9 +654,32 @@ void run_fp4_blockwise_scaled_group_mm(
   int32_t version_num = get_sm_version_num();
 #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
   if (version_num >= 120 && version_num < 130) {
-    run_fp4_blockwise_scaled_group_mm_sm120(
-        output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+    // Schedule selection: pingpong is faster at large per-expert M (prefill),
+    // cooperative (KernelScheduleAuto) at small per-expert M (decode).
+    // Measured on RTX PRO 6000 (sm120, NVFP4 grouped GEMM): pingpong is +6%
+    // at per-expert M=512, +13% at 1024, +19% at 2048; cooperative wins at
+    // <=256. Grouped-GEMM kernel deltas; the fused-MoE-op speedup is smaller
+    // (~+1-3% on sm120, diluted by routing/finalize). 512 is the
+    // conservative crossover (where pingpong first pulls ahead). We key on
+    // the average per-expert M (= total rows / num_experts): the grouped
+    // kernel tiles each expert's GEMM independently, so schedule efficiency
+    // is governed by per-expert M. This is the mean, so skewed routing may
+    // mispredict the schedule -- perf only, never a correctness issue.
+    // Batch invariance (VLLM_BATCH_INVARIANT) is verified on the cooperative
+    // schedule only; the static_asserts in the sm120 entry pin each
+    // instantiation. Decode-sized batches (< 512 per expert) stay cooperative.
+    int const num_experts = static_cast<int>(expert_offsets.size(0));
+    int const per_expert_m = num_experts > 0 ? M / num_experts : M;
+    constexpr int kPingpongMinPerExpertM = 512;
+    if (per_expert_m >= kPingpongMinPerExpertM) {
+      run_fp4_blockwise_scaled_group_mm_sm120<true>(
+          output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
+          expert_offsets, sf_offsets, M, N, K);
+    } else {
+      run_fp4_blockwise_scaled_group_mm_sm120<false>(
+          output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
+          expert_offsets, sf_offsets, M, N, K);
+    }
     return;
   }
 #endif
