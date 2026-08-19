@@ -332,3 +332,5 @@ spec:
 # trigger rebuild 2026-08-19: transient cubin download failure retry
 
 # trigger rebuild 2026-08-19: wheel platform tag + ELF guard
+
+# trigger rebuild 2026-08-19: spinloop resync with PR — drop static 2ms knob, carry EMA+WFET
