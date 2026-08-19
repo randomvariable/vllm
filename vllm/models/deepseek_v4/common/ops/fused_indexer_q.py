@@ -347,23 +347,16 @@ def fused_indexer_q_rope_quant(
             f"size {MXFP4_BLOCK_SIZE}"
         )
         num_scale_blocks = index_q_head_dim // MXFP4_BLOCK_SIZE
-        packed_shape = (num_tokens, num_index_q_heads, index_q_head_dim // 2)
-        scale_shape = (num_tokens, num_index_q_heads, num_scale_blocks)
-        if output_buffers is None:
-            index_q_packed = torch.empty(
-                packed_shape,
-                dtype=torch.uint8,
-                device=index_q.device,
-            )
-            index_q_scale = torch.empty(
-                scale_shape,
-                dtype=torch.uint8,
-                device=index_q.device,
-            )
-        else:
-            index_q_packed, index_q_scale, _ = output_buffers
-        assert index_q_packed.shape == packed_shape
-        assert index_q_scale.shape == scale_shape
+        index_q_packed = torch.empty(
+            (num_tokens, num_index_q_heads, index_q_head_dim // 2),
+            dtype=torch.uint8,
+            device=index_q.device,
+        )
+        index_q_scale = torch.empty(
+            (num_tokens, num_index_q_heads, num_scale_blocks),
+            dtype=torch.uint8,
+            device=index_q.device,
+        )
         if HAS_CUTEDSL and not torch.compiler.is_compiling():
 
             # lazily import, otherwise some tests fail due to CUDA driver init failure.

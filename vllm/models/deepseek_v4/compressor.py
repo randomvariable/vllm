@@ -422,10 +422,6 @@ class DeepseekCompressor(nn.Module):
                     store_full_fp8=store_full_fp8,
                     fp8_scale=fp8_scale,
                 )
-                if not self.overlap and self.eager_scratch_pool is not None:
-                    extra_kwargs["compress_scratch"] = (
-                        self.eager_scratch_pool.compressor_scratch(num_actual)
-                    )
             else:
                 # Indexer path (head_dim == 128), and the DCP main-compressor
                 # path where the CuTe kernel's raw state lookup is not valid.

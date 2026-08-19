@@ -30,7 +30,6 @@ from vllm.models.deepseek_v4.common.ops import (
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 
 if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -219,7 +218,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
         topk_scores_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -350,7 +348,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
-                eager_scratch_pool=eager_scratch_pool,
                 topk_scores_buffer=topk_scores_buffer,
             )
 
@@ -1234,7 +1231,6 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
         topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()

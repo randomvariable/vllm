@@ -81,7 +81,6 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xMLAAttention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -1175,7 +1174,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
-        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
         topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
@@ -1202,7 +1200,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
-            eager_scratch_pool=eager_scratch_pool,
             topk_scores_buffer=topk_scores_buffer,
         )
         if self.use_sequence_parallel:
@@ -1828,7 +1825,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
-                eager_scratch_pool=self.eager_scratch_pool,
                 topk_scores_buffer=self.topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
