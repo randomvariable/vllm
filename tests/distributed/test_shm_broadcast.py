@@ -265,8 +265,8 @@ def worker_fn_test_idle_to_busy():
     cond = message_queue._spin_condition
     with ExitStack() as stack:
         if not message_queue._is_writer:
-            stack.enter_context(mock.patch.object(cond, "_grace_mode", "fixed"))
-            stack.enter_context(mock.patch.object(cond, "_grace_fixed_s", 1.0))
+            stack.enter_context(mock.patch.object(cond._grace, "mode", "fixed"))
+            stack.enter_context(mock.patch.object(cond._grace, "fixed_s", 1.0))
         with mock.patch.object(cond, "wait", wraps=cond.wait) as wrapped_wait:
             if not message_queue._is_writer:
                 # Put into idle mode
@@ -819,8 +819,8 @@ def _make_adaptive_reader():
 def test_adaptive_grace_direction(interval_s, expect):
     """Adaptive grace moves inverse to observed inter-read intervals."""
     cond = _make_adaptive_reader()
-    assert cond._grace_mode == "adaptive"
-    budget = cond._grace_budget_s
+    assert cond._grace.mode == "adaptive"
+    budget = cond._grace.budget_s
     t0, times = 100.0, [100.0 + interval_s * (i + 1) for i in range(20)]
     with mock.patch.object(shm_broadcast.time, "monotonic", side_effect=times):
         cond.last_read = t0
@@ -828,7 +828,7 @@ def test_adaptive_grace_direction(interval_s, expect):
             cond.record_read()
 
     g = cond.busy_loop_s
-    assert cond._grace_min_s <= g <= cond._grace_max_s
+    assert cond._grace.min_s <= g <= cond._grace.max_s
     if expect == "high":
         assert g > budget
     elif expect == "low":
@@ -848,7 +848,7 @@ def test_adaptive_grace_fixed_pin_supersedes():
         notify_address="inproc://unused",
         busy_loop_s=0.5,
     )
-    assert fixed_cond._grace_mode == "fixed"
+    assert fixed_cond._grace.mode == "fixed"
     for dt in (0.0001, 0.050):
         fixed_cond._train_interval_ema(dt)
     assert fixed_cond.busy_loop_s == 0.5
@@ -864,7 +864,7 @@ def test_grace_always_within_bounds(intervals):
     cond = _make_adaptive_reader()
     for dt in intervals:
         cond._train_interval_ema(dt)
-        assert cond._grace_min_s <= cond.busy_loop_s <= cond._grace_max_s
+        assert cond._grace.min_s <= cond.busy_loop_s <= cond._grace.max_s
 
 
 def test_remaining_grace_s_counts_down_and_clamps():
@@ -892,8 +892,8 @@ def test_acquire_read_native_wait_policy():
         writer.wait_until_ready()
         reader.wait_until_ready()
         cond = reader._spin_condition
-        cond._grace_mode = "fixed"
-        cond._grace_fixed_s = 1.0
+        cond._grace.mode = "fixed"
+        cond._grace.fixed_s = 1.0
         cond.busy_loop_s = 1.0
         cond.last_read = time.monotonic()
 
@@ -956,3 +956,58 @@ def test_acquire_read_native_wait_policy():
             reader._spin_condition.write_cancel_socket,
         ):
             s.close(linger=0)
+
+
+def test_acquire_write_parks_in_bounded_doubling_steps():
+    """Writer parks in doubling sleep steps (capped at _WRITE_PARK_MAX_S)
+    once the grace expires, instead of yielding indefinitely."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        # Force fixed-0 grace so the first failed check goes straight to the
+        # park path; deterministic without mocking the clock.
+        writer._write_grace.mode = "fixed"
+        writer._write_grace.fixed_s = 0.0
+
+        # Occupy the single block so the next acquire must wait for readers.
+        with writer.acquire_write():
+            pass
+
+        sleeps: list[float] = []
+
+        clock = {"now": 100.0}
+
+        def fake_sleep(s):
+            sleeps.append(s)
+            clock["now"] += s
+
+        def fake_monotonic():
+            return clock["now"]
+
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", False),
+            mock.patch.object(shm_broadcast.time, "monotonic", fake_monotonic),
+            mock.patch.object(shm_broadcast.time, "sleep", fake_sleep),
+            pytest.raises(TimeoutError),
+            writer.acquire_write(timeout=0.05),
+        ):
+            pass
+
+        # Park steps grow from the 50us floor and cap at _WRITE_PARK_MAX_S.
+        assert sleeps, "writer never parked"
+        assert sleeps[0] == pytest.approx(50e-6)
+        assert max(sleeps) <= shm_broadcast._WRITE_PARK_MAX_S
+        assert sleeps == sorted(sleeps)
+        # Doubling until the cap.
+        for prev, nxt in zip(sleeps, sleeps[1:]):
+            if nxt < shm_broadcast._WRITE_PARK_MAX_S:
+                assert nxt == pytest.approx(prev * 2)
+    finally:
+        writer.shutting_down = True
