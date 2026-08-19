@@ -25,6 +25,14 @@ extern "C" {
 #define CPU_SUPPORT_NONE 0
 #define CPU_SUPPORT_MONITORX 1
 #define CPU_SUPPORT_WFET 2
+#define CPU_SUPPORT_WAITPKG 3
+
+#if defined(__i386__) || defined(__x86_64__)
+  // Bounded wait budget per iteration, in microseconds. umwait is a bounded
+  // monitor/timeout wait; the caller's callback re-checks the predicate
+  // between waits, so a short budget bounds the worst-case re-check latency.
+  #define UMWAIT_BUDGET_US 50
+#endif
 
 #if defined(__aarch64__)
   // Bit 31 per the arm64 ELF hwcaps ABI (FEAT_WFxT).
@@ -68,6 +76,10 @@ static void determine_cpu_support(spinloop_state_t* state) {
     if (__get_cpuid(5, &eax, &ebx, &ecx, &edx) == 1) {
       state->max_monitor_line_size = ebx & 0xff;
     }
+  } else if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 1 &&
+             (edx & (1 << 5)) != 0) {
+    // Intel WAITPKG (umonitor/umwait/tpause), CPUID.(EAX=7,ECX=0):EDX[5].
+    state->cpu_support = CPU_SUPPORT_WAITPKG;
   }
 #endif
 
@@ -81,16 +93,18 @@ static void determine_cpu_support(spinloop_state_t* state) {
 #endif
 }
 
+// Bounded-wait status shared by the arch helpers (wfet / umwait). Pure C:
+// no Python API is touched (caller holds no GIL). WAIT_OK, WAIT_SPUN_OUT
+// when the overall timeout expired, or WAIT_CLOCK_ERR when clock_gettime
+// fails (caller defers the PyErr).
+enum bounded_wait_status { WAIT_OK, WAIT_SPUN_OUT, WAIT_CLOCK_ERR };
+
 #if defined(__aarch64__)
 // Bounded WFET wait for the fallback path. Computes the absolute CNTVCT
 // deadline from the remaining caller timeout and the per-wait budget, then
-// waits once. Pure C: no Python API is touched (caller holds no GIL).
-// Returns WAIT_OK, WAIT_SPUN_OUT when the overall timeout expired, or
-// WAIT_CLOCK_ERR when clock_gettime fails (caller defers the PyErr).
-enum wfet_status { WAIT_OK, WAIT_SPUN_OUT, WAIT_CLOCK_ERR };
-
-static enum wfet_status wfet_bounded_wait(double timeout,
-                                          const struct timespec* t_start) {
+// waits once.
+static enum bounded_wait_status wfet_bounded_wait(
+    double timeout, const struct timespec* t_start) {
   double remaining_s = INFINITY;
   if (timeout > 1e-9) {
     struct timespec t_now;
@@ -132,6 +146,77 @@ static enum wfet_status wfet_bounded_wait(double timeout,
 }
 #endif
 
+#if defined(__i386__) || defined(__x86_64__)
+// Bounded umwait for the fallback path on WAITPKG parts: umonitor arms the
+// address range, then umwait sleeps until a store there (or a zero-extend of
+// the counter deadline in TSC ticks, or an interrupt) wakes us. The deadline
+// is capped by the remaining caller timeout and the per-wait budget, matching
+// wfet_bounded_wait. Pure C: no Python API is touched (caller holds no GIL).
+// Returns WAIT_OK, WAIT_SPUN_OUT when the overall timeout expired, or
+// WAIT_CLOCK_ERR when clock_gettime fails (caller defers the PyErr).
+static enum bounded_wait_status umwait_bounded_wait(
+    const void* addr, double timeout, const struct timespec* t_start) {
+  double remaining_s = INFINITY;
+  if (timeout > 1e-9) {
+    struct timespec t_now;
+    if (clock_gettime(TIMEOUT_CLOCK, &t_now) != 0) {
+      return WAIT_CLOCK_ERR;
+    }
+    const double elapsed = (double)(t_now.tv_sec - t_start->tv_sec) +
+                           (t_now.tv_nsec - t_start->tv_nsec) * 1e-9;
+    remaining_s = timeout - elapsed;
+    if (remaining_s <= 0) {
+      return WAIT_SPUN_OUT;
+    }
+  }
+  const double budget_s = (double)UMWAIT_BUDGET_US * 1e-6;
+  const double wait_s = remaining_s < budget_s ? remaining_s : budget_s;
+  // umwait's counter deadline is in TSC ticks. Determine the TSC frequency
+  // once per call from the invariant-TSC leaf when present; fall back to
+  // rdtsc/rdtscp only if the leaf is missing (never on WAITPKG parts, which
+  // are all post-Skylake invariant-TSC).
+  unsigned int eax, ebx, ecx, edx;
+  if (__get_cpuid(0x15, &eax, &ebx, &ecx, &edx) != 1 || eax == 0 || ebx == 0 ||
+      ecx == 0) {
+    return WAIT_OK;  // no invariant TSC ratio: degrade to the next iteration
+  }
+  const double tsc_hz = (double)ecx * (double)ebx / (double)eax;
+  if (!(tsc_hz > 0.0)) {
+    return WAIT_OK;
+  }
+  unsigned int lo, hi;
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  const uint64_t now_tsc = ((uint64_t)hi << 32) | lo;
+  const uint64_t deadline_tsc = now_tsc + (uint64_t)(wait_s * tsc_hz);
+  const uint64_t counter =
+      deadline_tsc & 0xFFFFFFFFFFFFFFFFULL;  // umwait reads EDX:EAX directly
+  // umonitor arms the wakeup range; the callback re-check in the outer loop
+  // closes the arm/store race, mirroring the monitorx pattern. umwait
+  // ecx=0 permits C0.1 (deeper wake latency, lower power). EFLAGS.ZF is set
+  // when the wake came from the counter deadline rather than the monitor;
+  // either way the loop re-checks the predicate, so ZF is ignored.
+  const unsigned int d_lo = (unsigned int)(counter & 0xFFFFFFFFULL);
+  const unsigned int d_hi = (unsigned int)(counter >> 32);
+  // x86-64 SysV: rdi/rsi are scratch inputs; rax is umonitor's address; the
+  // 64-bit deadline is staged in rsi:rdi and moved to rdx:rax before umwait.
+  // Encoded via .byte (SDM: umonitor rax = f3 0f ae f6; umwait ecx =
+  // f2 0f ae f1) because some otherwise-fine toolchains predate the WAITPKG
+  // mnemonics; baseline x86-64 assemblers accept the raw bytes. The
+  // instructions only execute on CPUID-gated WAITPKG parts.
+  __asm__ volatile(
+      "movq %%rdi, %%rax\n"             // rax = address for umonitor
+      ".byte 0xf3, 0x0f, 0xae, 0xf6\n"  // umonitor rax
+      "movl %1, %%eax\n"                // eax = counter low 32
+      "movl %2, %%edx\n"                // edx = counter high 32
+      "xorl %%ecx, %%ecx\n"             // control = 0 (C0.1 permitted)
+      ".byte 0xf2, 0x0f, 0xae, 0xf1\n"  // umwait ecx
+      :
+      : "D"(addr), "r"(d_lo), "r"(d_hi)
+      : "rax", "rcx", "rdx", "memory");
+  return WAIT_OK;
+}
+#endif
+
 static PyObject* method_spinloop(PyObject* self, PyObject* args,
                                  PyObject* kwargs) {
   Py_buffer buffer;
@@ -168,7 +253,10 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
   bool clock_error = false;  // deferred: PyErr raised after GIL reacquire
   bool timed_out = false;    // WFET exhausted the overall timeout
 #if defined(__aarch64__)
-  enum wfet_status wfet_status = WAIT_OK;
+  enum bounded_wait_status wfet_status = WAIT_OK;
+#endif
+#if defined(__i386__) || defined(__x86_64__)
+  enum bounded_wait_status umwait_status = WAIT_OK;
 #endif
   bool have_timeout = (timeout > 1e-9);
   unsigned int iteration = 0;
@@ -245,7 +333,18 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
       // clang-format off: preprocessor-guarded arch branches confuse the
 // formatter's brace/indent tracking; keep hand-aligned.
 #if defined(__i386__) || defined(__x86_64__)
-      __builtin_ia32_pause();
+      if (state->cpu_support == CPU_SUPPORT_WAITPKG) {
+        umwait_status = umwait_bounded_wait(buffer.buf, timeout, &t_start);
+        if (umwait_status == WAIT_CLOCK_ERR) {
+          clock_error = true;
+          error = true;
+        } else if (umwait_status == WAIT_SPUN_OUT) {
+          timed_out = true;
+        }
+        // WAIT_OK: continue the outer loop; the callback re-check decides.
+      } else {
+        __builtin_ia32_pause();
+      }
 #elif defined(__aarch64__)
       if (state->cpu_support == CPU_SUPPORT_WFET) {
         wfet_status = wfet_bounded_wait(timeout, &t_start);
