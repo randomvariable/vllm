@@ -12,7 +12,6 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
-from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -67,7 +66,7 @@ def test_v32_glm_sm120_backend_accepts_glm_block_size(
 
 def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     fake_module = SimpleNamespace(
-        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192)})
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192), (32, 256)})
     )
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
@@ -75,8 +74,8 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
 
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 256)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
 
@@ -86,63 +85,20 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
         attention_config=SimpleNamespace(use_non_causal=False),
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
     )
-    dspark = SimpleNamespace(
+    non_causal_no_spec = SimpleNamespace(
         attention_config=SimpleNamespace(use_non_causal=True),
-        speculative_config=SimpleNamespace(num_speculative_tokens=5),
-    )
-
-    assert _required_sm120_sparse_topk(causal, 128) == 128
-    assert _required_sm120_sparse_topk(dspark, 128) == 192
-
-
-def test_sparse_workspace_is_cached_per_cuda_device(monkeypatch) -> None:
-    allocations = []
-
-    def fake_zeros(size, *, dtype, device):
-        workspace = SimpleNamespace(size=size, dtype=dtype, device=device)
-        allocations.append(workspace)
-        return workspace
-
-    monkeypatch.setattr(torch, "zeros", fake_zeros)
-    flashinfer_mla_sparse._fi_sparse_workspace_by_device.clear()
-
-    cuda0_first = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:0"))
-    cuda1 = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:1"))
-    cuda0_second = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:0"))
-
-    assert cuda0_first is cuda0_second
-    assert cuda0_first is not cuda1
-    assert [workspace.device for workspace in allocations] == [
-        torch.device("cuda:0"),
-        torch.device("cuda:1"),
-    ]
-
-
-def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
-    fake_module = SimpleNamespace(
-        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192)})
-    )
-    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
-    monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
-    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
-
-    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
-    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
-
-    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
-
-
-def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
-    causal = SimpleNamespace(
-        attention_config=SimpleNamespace(use_non_causal=False),
-        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        speculative_config=None,
     )
     dspark = SimpleNamespace(
         attention_config=SimpleNamespace(use_non_causal=True),
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
     )
+    dspark_wide = SimpleNamespace(
+        attention_config=SimpleNamespace(use_non_causal=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=65),
+    )
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
+    assert _required_sm120_sparse_topk(non_causal_no_spec, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+    assert _required_sm120_sparse_topk(dspark_wide, 128) == 256

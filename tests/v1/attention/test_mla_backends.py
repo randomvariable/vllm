@@ -338,6 +338,8 @@ def test_dcp_chunked_context_accepts_non_virtual_block_aligned_prefix():
     ]
     assert [chunk.num_context_tokens for chunk in metadata.chunks] == [65, 96]
     assert [chunk.num_local_context_tokens for chunk in metadata.chunks] == [17, 24]
+
+
 def test_mla_init_propagates_safe_query_bmm_contract(monkeypatch):
     class FakeImpl:
         is_sparse = True
@@ -2809,6 +2811,10 @@ def _run_backend_correctness(
             assert torch.isfinite(backend_output).all(), (
                 f"[{backend_name}] produced non-finite values"
             )
+
+            # Check numerical similarity
+            rtol = 1e-2
+            atol = 1.5e-1
 
             max_diff = torch.max(torch.abs(backend_output - expected_output)).item()
             max_rel_diff = torch.max(
