@@ -817,6 +817,91 @@ class TestMalformedWrapperRecovery:
         assert collect_content(results) == "".join(chunks)
 
 
+class TestNoToolsDsmlContainment:
+    """No-tools requests must never surface DSML markup in content.
+
+    Incident (2026-08-19): DSv4-Flash under a degraded context (its own
+    empty prior assistant turn) emitted malformed DSML that reached the
+    client as plain content on a no-tools request, seeding further
+    derailment. Recovery may hold, roll back, or route the markup into
+    the reasoning channel — but it must not leak into ``content``.
+    """
+
+    def _parse(self, mock_tokenizer, text, thinking=True):
+        from unittest.mock import MagicMock
+
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        parser = DeepSeekV4Parser(
+            mock_tokenizer,
+            tools=None,
+            **({"chat_template_kwargs": {"thinking": thinking}} if thinking else {}),
+        )
+        req = MagicMock(spec=ChatCompletionRequest)
+        req.tools = None
+        req.tool_choice = None
+        req.include_reasoning = True
+        reasoning, content, _calls = parser.parse(text, req)
+        return reasoning, content
+
+    def _assert_no_dsml(self, content):
+        assert content is None or "<｜" not in content
+        assert content is None or "DSML" not in content
+        assert content is None or "invoke name" not in content
+
+    def test_orphan_invoke_no_tools_never_leaks(self, mock_tokenizer):
+        text = (
+            "We need to inspect the running task.\n"
+            '<｜DSML｜invoke name="bash">'
+            '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        )
+        for thinking in (True, False):
+            _, content = self._parse(mock_tokenizer, text, thinking=thinking)
+            self._assert_no_dsml(content)
+
+    def test_misspelled_wrapper_no_tools_never_leaks(self, mock_tokenizer):
+        # Observed incident shape: the model corrupted the outer wrapper
+        # spelling ("tool_call" instead of "tool_calls") and never closed it.
+        text = (
+            '<｜DSML｜tool_call>\n<invoke name="bash">\n'
+            '<parameter name="command">bash_status'
+        )
+        for thinking in (True, False):
+            _, content = self._parse(mock_tokenizer, text, thinking=thinking)
+            self._assert_no_dsml(content)
+
+    def test_valid_wrapper_no_tools_never_leaks(self, mock_tokenizer):
+        text = (
+            "<｜DSML｜tool_calls>"
+            '<｜DSML｜invoke name="bash">'
+            '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        _, content = self._parse(mock_tokenizer, text)
+        self._assert_no_dsml(content)
+
+    def test_truncated_invoke_no_tools_never_leaks(self, mock_tokenizer):
+        # finish=length mid-argument: markup unterminated.
+        text = (
+            "I'll check the task.\n"
+            '<｜DSML｜invoke name="bash_status"><｜DSML｜parameter '
+            'name="task_id" string="true">bash-972b'
+        )
+        for thinking in (True, False):
+            _, content = self._parse(mock_tokenizer, text, thinking=thinking)
+            self._assert_no_dsml(content)
+
+    def test_repetition_loop_no_tools_never_leaks(self, mock_tokenizer):
+        # Incident degenerate output: repeated wrapper-closer fragments.
+        text = "Checking. " + ("</invoke></｜DSML｜tool_calls> " * 40)
+        for thinking in (True, False):
+            _, content = self._parse(mock_tokenizer, text, thinking=thinking)
+            self._assert_no_dsml(content)
+
+
 class TestParallelUnwrapping:
     @pytest.fixture
     def weather_tool(self):
