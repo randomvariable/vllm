@@ -115,7 +115,7 @@ ARG VLLM_IMAGE_TAG
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.local/bin:${PATH} \
-    UV_PYTHON=3.13 \
+    UV_PYTHON=3.12 \
     UV_PYTHON_INSTALL_DIR=/opt/python \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     VLLM_TARGET_DEVICE=cuda \
@@ -146,8 +146,8 @@ COPY homelab/install-uv.sh /usr/local/bin/install-uv
 COPY homelab/install-runtime-wheels.sh /usr/local/bin/install-runtime-wheels
 RUN chmod 0755 /usr/local/bin/install-runtime-wheels /usr/local/bin/install-uv && \
     /usr/local/bin/install-uv && \
-    uv python install 3.13 && \
-    uv venv --python 3.13 /opt/venv
+    uv python install 3.12 && \
+    uv venv --python 3.12 /opt/venv
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     /usr/local/bin/install-runtime-wheels
 COPY homelab/setup-runtime.sh /usr/local/bin/setup-runtime

@@ -30,8 +30,8 @@ uv pip install --python "$PYTHON" --no-deps /wheels/*.whl
 # defaults false and b12x kernels use the standard preprocessor, so dropping
 # the token is safe; the pass compiles fine without it.
 "$PYTHON" - <<'PYEOF'
-import pathlib
-p = pathlib.Path("/opt/venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/compiler.py")
+import pathlib, sysconfig
+p = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/compiler.py"
 s = p.read_text()
 # BooleanCompileOption.serialize always emits `enable-pyir=false`, but the
 # native cute-to-nvvm pass does not register that option, so PassManager.parse
