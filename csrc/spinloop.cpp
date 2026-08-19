@@ -2,8 +2,14 @@
 
 extern "C" {
 
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
+
+#if defined(__aarch64__)
+  #include <sys/auxv.h>
+#endif
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
@@ -18,6 +24,19 @@ extern "C" {
 
 #define CPU_SUPPORT_NONE 0
 #define CPU_SUPPORT_MONITORX 1
+#define CPU_SUPPORT_WFET 2
+
+#if defined(__aarch64__)
+  // Bit 31 per the arm64 ELF hwcaps ABI (FEAT_WFxT).
+  #ifndef HWCAP2_WFXT
+    #define HWCAP2_WFXT (1UL << 31)
+  #endif
+  // Bounded wait budget per iteration, in microseconds. WFET is a bounded
+  // event/timeout wait; the caller's callback re-checks the predicate
+  // between waits, so a short budget bounds the worst-case re-check
+  // latency. Experimental: not validated for production use.
+  #define WFET_BUDGET_US 50
+#endif
 
 #define MWAITX_DEFAULT_TIMEOUT_CYCLES 1000000
 
@@ -51,7 +70,67 @@ static void determine_cpu_support(spinloop_state_t* state) {
     }
   }
 #endif
+
+#if defined(__aarch64__)
+  // FEAT_WFxT (WFET/WFIT): ELF HWCAP2 bit 31. Runtime-gated so baseline
+  // armv8 builds load everywhere and only wait via WFET where present.
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  if (hwcap2 & HWCAP2_WFXT) {
+    state->cpu_support = CPU_SUPPORT_WFET;
+  }
+#endif
 }
+
+#if defined(__aarch64__)
+// Bounded WFET wait for the fallback path. Computes the absolute CNTVCT
+// deadline from the remaining caller timeout and the per-wait budget, then
+// waits once. Pure C: no Python API is touched (caller holds no GIL).
+// Returns WAIT_OK, WAIT_SPUN_OUT when the overall timeout expired, or
+// WAIT_CLOCK_ERR when clock_gettime fails (caller defers the PyErr).
+enum wfet_status { WAIT_OK, WAIT_SPUN_OUT, WAIT_CLOCK_ERR };
+
+static enum wfet_status wfet_bounded_wait(double timeout,
+                                          const struct timespec* t_start) {
+  double remaining_s = INFINITY;
+  if (timeout > 1e-9) {
+    struct timespec t_now;
+    if (clock_gettime(TIMEOUT_CLOCK, &t_now) != 0) {
+      return WAIT_CLOCK_ERR;
+    }
+    const double elapsed = (double)(t_now.tv_sec - t_start->tv_sec) +
+                           (t_now.tv_nsec - t_start->tv_nsec) * 1e-9;
+    remaining_s = timeout - elapsed;
+    if (remaining_s <= 0) {
+      return WAIT_SPUN_OUT;
+    }
+  }
+  const double budget_s = (double)WFET_BUDGET_US * 1e-6;
+  const double wait_s = remaining_s < budget_s ? remaining_s : budget_s;
+  uint64_t now_ticks, freq_hz, wait_ticks, deadline_ticks;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now_ticks));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq_hz));
+  if (freq_hz == 0) {
+    // Unreachable on compliant hardware; degrade to a plain yield.
+    __asm__ volatile("yield" ::: "memory");
+    return WAIT_OK;
+  }
+  wait_ticks = (uint64_t)(wait_s * (double)freq_hz);
+  if (wait_ticks < 1) {
+    wait_ticks = 1;  // rounding must not produce an immediate wake
+  }
+  deadline_ticks = now_ticks + wait_ticks;
+  // wfet x16: register operand encoded in the .inst immediate
+  // (encoding d5031000 | Rd); x16 is an interprocedural scratch register
+  // not carrying live values here.
+  __asm__ volatile(
+      "mov x16, %[deadline]\n"
+      ".inst 0xd5031010\n"
+      :
+      : [deadline] "r"(deadline_ticks)
+      : "x16", "memory");
+  return WAIT_OK;
+}
+#endif
 
 static PyObject* method_spinloop(PyObject* self, PyObject* args,
                                  PyObject* kwargs) {
@@ -86,9 +165,16 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 
   bool result = false;
   bool error = false;
+  bool clock_error = false;  // deferred: PyErr raised after GIL reacquire
+  bool timed_out = false;    // WFET exhausted the overall timeout
+#if defined(__aarch64__)
+  enum wfet_status wfet_status = WAIT_OK;
+#endif
   bool have_timeout = (timeout > 1e-9);
   unsigned int iteration = 0;
+#if defined(__i386__) || defined(__x86_64__)
   const bool buffer_qualifies = (buffer.len <= state->max_monitor_line_size);
+#endif
 
   while (true) {
     PyObject* res = PyObject_CallNoArgs(callback);
@@ -156,18 +242,41 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 #endif
       // Give other threads a chance to be scheduled
       Py_BEGIN_ALLOW_THREADS
+      // clang-format off: preprocessor-guarded arch branches confuse the
+// formatter's brace/indent tracking; keep hand-aligned.
 #if defined(__i386__) || defined(__x86_64__)
       __builtin_ia32_pause();
 #elif defined(__aarch64__)
-        __asm__ volatile("yield" :: : "memory");
+      if (state->cpu_support == CPU_SUPPORT_WFET) {
+        wfet_status = wfet_bounded_wait(timeout, &t_start);
+        if (wfet_status == WAIT_CLOCK_ERR) {
+          clock_error = true;
+          error = true;
+        } else if (wfet_status == WAIT_SPUN_OUT) {
+          timed_out = true;
+        }
+        // WAIT_OK: continue the outer loop; the callback re-check decides.
+      } else {
+        __asm__ volatile("yield" ::: "memory");
+      }
 #endif
       Py_END_ALLOW_THREADS
+// clang-format on
 #if defined(__i386__) || defined(__x86_64__)
     }
 #endif
+
+    if (error || timed_out) {
+      break;
+    }
   }
 
   PyBuffer_Release(&buffer);
+
+  if (clock_error) {
+    PyErr_SetString(PyExc_RuntimeError, "clock_gettime() failed!");
+    return NULL;
+  }
 
   if (error) {
     return NULL;
@@ -181,14 +290,21 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 }
 
 static PyMethodDef spinloop_methods[] = {
-    {"spinloop", (PyCFunction)method_spinloop, METH_VARARGS | METH_KEYWORDS,
-     "Wait for store with callback"},
+    {"spinloop", (PyCFunction)(void (*)(void))method_spinloop,
+     METH_VARARGS | METH_KEYWORDS, "Wait for store with callback"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef spinloop_module = {
-    PyModuleDef_HEAD_INIT, "spinloop",
-    "Hardware-optimized spinloops for Python", sizeof(spinloop_state_t),
-    spinloop_methods};
+    PyModuleDef_HEAD_INIT,
+    "spinloop",
+    "Hardware-optimized spinloops for Python",
+    sizeof(spinloop_state_t),
+    spinloop_methods,
+    NULL, /* m_slots */
+    NULL, /* m_traverse */
+    NULL, /* m_clear */
+    NULL, /* m_free */
+};
 
 PyMODINIT_FUNC PyInit_spinloop(void) {
   PyObject* m = PyModule_Create(&spinloop_module);
