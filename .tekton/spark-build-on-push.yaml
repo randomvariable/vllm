@@ -326,3 +326,5 @@ spec:
 # trigger rebuild 2026-08-18: split cargo cache mounts (3d203188b2)
 
 # trigger rebuild 2026-08-19: runtime python 3.12 wheel-tag fix
+
+# trigger rebuild 2026-08-19: flashinfer cross nvcc flags + ELF guard
