@@ -15,7 +15,14 @@ ARG VLLM_SCM_VERSION=0.1.dev0
 
 FROM --platform=linux/amd64 nvidia/cuda:13.3.1-devel-ubuntu26.04 AS builder
 
-ARG VLLM_SCM_VERSION=0.1.dev0
+# VLLM_SCM_VERSION is deliberately NOT declared here. A build-arg's value is part
+# of the cache key of every RUN after its ARG declaration in the same stage, even
+# for RUNs that never reference it -- verified locally: changing only this arg's
+# value, with no file touched, re-executed every RUN in the stage including a
+# `RUN echo` that depends on nothing. Since setuptools-scm yields a new version
+# per commit, declaring it up here would rebuild the toolchain and the FlashInfer
+# AOT layer on every commit. It is declared immediately before the one RUN that
+# consumes it instead.
 ARG MAX_JOBS=4
 ARG CMAKE_BUILD_PARALLEL_LEVEL=4
 ARG NVCC_THREADS=1
@@ -151,6 +158,9 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 # Everything that genuinely depends on the full source and the release version:
 # the b12x wheel, the rust frontend and the vLLM wheel itself.
 COPY . /src/vllm
+# Declared here, after the FlashInfer AOT layer, so its per-commit value only
+# participates in the cache key of the wheel layer below.
+ARG VLLM_SCM_VERSION=0.1.dev0
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
@@ -168,10 +178,10 @@ RUN mkdir -p /runtime-requirements
 COPY requirements/cuda.txt /runtime-requirements/cuda.txt
 
 FROM --platform=$TARGETPLATFORM nvidia/cuda:13.3.1-runtime-ubuntu26.04 AS runtime
-ARG VLLM_BUILD_COMMIT
-ARG VLLM_BUILD_PIPELINE
-ARG VLLM_BUILD_URL
-ARG VLLM_IMAGE_TAG
+# The per-commit ARGs (build commit, image tag, pipeline URL) are declared just
+# above the LABEL that consumes them, not here: a build-arg value joins the cache
+# key of every RUN after its declaration in the stage, so declaring them at the
+# top invalidated this stage's qemu-emulated apt install on every single commit.
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:/root/.local/bin:${PATH} \
@@ -218,6 +228,10 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     /usr/local/bin/install-runtime-wheels
 COPY homelab/setup-runtime.sh /usr/local/bin/setup-runtime
 RUN chmod 0755 /usr/local/bin/setup-runtime && /usr/local/bin/setup-runtime
+ARG VLLM_BUILD_COMMIT
+ARG VLLM_BUILD_PIPELINE
+ARG VLLM_BUILD_URL
+ARG VLLM_IMAGE_TAG
 LABEL org.opencontainers.image.title="vllm-spark-cross-runtime" \
       org.opencontainers.image.description="Cross-compiled vLLM runtime for DGX Spark sm_121a" \
       org.opencontainers.image.source="https://github.com/randomvariable/vllm/tree/homelabs-main/homelab" \
