@@ -141,7 +141,13 @@ RUN --mount=type=cache,target=/root/.rustup,sharing=locked \
 # recreated from scratch every build.
 COPY Makefile common.mk ccache.conf pyproject.toml uv.lock /src/vllm/
 COPY requirements /src/vllm/requirements
-COPY tools /src/vllm/tools
+# Only flashinfer-build.sh is read here (verified: the script references no other
+# repo file, and check_wheel_elf.py is reached from build-wheel, not
+# build-flashinfer). Copying all of tools/ put unrelated scripts in this layer's
+# key -- editing tools/build_deepgemm_C.py, which this stage never runs, threw
+# away a completed 3423-unit AOT compile. The full tools/ tree still arrives
+# with `COPY .` for the wheel stage below.
+COPY tools/flashinfer-build.sh /src/vllm/tools/flashinfer-build.sh
 COPY third_party/flashinfer /src/vllm/third_party/flashinfer
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,id=vllm-spark-flashinfer-cubins-cross,target=/src/vllm/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins,sharing=locked \
