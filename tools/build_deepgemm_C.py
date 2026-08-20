@@ -38,6 +38,16 @@ info = json.loads(
     ).decode()
 )
 
+# Cross-compilation: <TARGET_PY> is the build host's interpreter, so its
+# EXT_SUFFIX carries the host architecture ("...-x86_64-linux-gnu.so"). The
+# content links correctly for the target because CXX is the cross compiler,
+# but CPython matches the extension suffix against its own interpreter, so a
+# host-tagged file is invisible on the target and `import deep_gemm` fails --
+# which in turn fails the DSv4 sparse indexer's DeepGEMM requirement at model
+# load. Let the cross build state the target's suffix and headers.
+ext_suffix = os.environ.get("DEEPGEMM_EXT_SUFFIX") or info["EXT_SUFFIX"]
+includepy = os.environ.get("DEEPGEMM_PYTHON_INCLUDE") or info["INCLUDEPY"]
+
 cuda_home = cpp_extension.CUDA_HOME
 if cuda_home is None:
     sys.exit("CUDA_HOME not found; cannot build DeepGEMM _C")
@@ -61,7 +71,7 @@ cuda_lib = cuda_lib_dir or f"{cuda_home}/lib64"
 
 # CCCL lives outside the standard CUDAToolkit search (mirrors DeepGEMM's setup.py).
 includes = [
-    info["INCLUDEPY"],
+    includepy,
     f"{cuda_home}/include",
     f"{cuda_home}/include/cccl",
     str(src / "csrc"),
@@ -97,7 +107,7 @@ cmd = [
     "-lcudart",
     "-lnvrtc",
     "-o",
-    str(out / f"_C{info['EXT_SUFFIX']}"),
+    str(out / f"_C{ext_suffix}"),
 ]
 print("[build_deepgemm_C] " + " ".join(cmd), flush=True)
 subprocess.check_call(cmd)

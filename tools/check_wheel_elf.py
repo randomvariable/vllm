@@ -1,12 +1,14 @@
 """Fail-closed ELF machine check for packaged wheels.
 
 Rejects any host-arch .so relabeled into a foreign-tagged wheel (e.g. x86_64
-binaries inside a linux_aarch64 wheel). Usage:
+binaries inside a linux_aarch64 wheel), and any extension whose CPython ABI
+tag names a different architecture than the wheel targets. Usage:
 
     python tools/check_wheel_elf.py <wheel> <expected-machine>
 
 Exits nonzero unless every .so member is a valid 64-bit little-endian ELF
-whose machine matches the expected one exactly.
+whose machine matches the expected one exactly, and no member's filename
+carries a foreign architecture tag.
 """
 
 import argparse
@@ -16,6 +18,12 @@ import zipfile
 _MACHINES = {62: "X86-64", 183: "AArch64"}
 _ELF_CLASS_64 = 2
 _ELF_DATA_LITTLE = 1
+# CPython encodes the platform in an extension's suffix
+# ("_C.cpython-312-aarch64-linux-gnu.so"). The importer matches that suffix
+# against the running interpreter, so a correctly-linked target binary saved
+# under a host tag is silently unimportable on the target. Cross builds hit
+# this when a build step derives EXT_SUFFIX from the build interpreter.
+_NAME_TAGS = {"aarch64": "AArch64", "x86_64": "X86-64"}
 
 
 def machine_of(data: bytes) -> str:
@@ -56,6 +64,17 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
+            for tag, tag_machine in _NAME_TAGS.items():
+                if tag not in name.rsplit("/", 1)[-1]:
+                    continue
+                if tag_machine.lower().replace("-", "") != expected:
+                    print(
+                        f"❌ {name}: filename ABI tag names {tag_machine}, "
+                        f"expected {args.expected}; CPython will not import "
+                        f"this extension on the target",
+                        file=sys.stderr,
+                    )
+                    return 1
             checked += 1
 
     if checked == 0:
