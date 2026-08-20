@@ -81,6 +81,11 @@ def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None
         rotary_emb=object(),
         forward_mqa=lambda *args: None,
     )
+    layer._run_parallel_input_projections = lambda hidden_states: (
+        attention_module.DeepseekV4Attention._run_parallel_input_projections(
+            layer, hidden_states
+        )
+    )
     tensor = torch.empty(1)
 
     attention_module.DeepseekV4Attention.attn_gemm_parallel_execute(layer, tensor)

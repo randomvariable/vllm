@@ -6,6 +6,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.kernels.mhc import tilelang as tilelang_module
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import _warmup_layer_mhc
 from vllm.models.deepseek_v4.nvidia import dspark as dspark_module
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
@@ -98,7 +99,9 @@ def test_b12x_forward_broadcasts_initial_residual() -> None:
     assert calls == [("pre", None), ("post_pre", layer.hc_ffn_fn_bf16)]
 
 
-def test_b12x_mhc_warmup_uses_broadcast_pre_contract() -> None:
+def test_b12x_mhc_warmup_uses_broadcast_pre_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hidden_size = 4
     hc_mult = 4
     full_fn = torch.ones(24, hc_mult * hidden_size)
@@ -160,6 +163,14 @@ def test_b12x_mhc_warmup_uses_broadcast_pre_contract() -> None:
         ffn_norm=norm,
         hc_pre=hc_pre,
         hc_post_pre=hc_post_pre,
+    )
+
+    # The warmup also compiles mhc_post_tilelang, which has no CPU kernel; this
+    # test covers the pre/post contract, so stub it out rather than skip.
+    monkeypatch.setattr(
+        tilelang_module,
+        "mhc_post_tilelang",
+        lambda *args, **kwargs: None,
     )
 
     _warmup_layer_mhc(layer, [1, 3])
