@@ -72,7 +72,6 @@ $(CROSS_TARGETS): DEEPGEMM_CXX=/usr/bin/aarch64-linux-gnu-g++
 # to host c++, which links the aarch64 nvcc objects with the x86_64 linker
 # ("file in wrong format"). Point it at the cross compiler.
 $(CROSS_TARGETS): CXX=/usr/bin/aarch64-linux-gnu-g++
-$(CROSS_TARGETS): DEEPGEMM_PYTHON_INCLUDE=/usr/include/python3.12
 $(CROSS_TARGETS): DEEPGEMM_EXT_SUFFIX=.cpython-312-aarch64-linux-gnu.so
 $(CROSS_TARGETS): DEEPGEMM_TORCH_ROOT=/opt/torch-aarch64/torch
 $(CROSS_TARGETS): DEEPGEMM_CUDA_LIB_DIR=/usr/local/cuda/targets/sbsa-linux/lib
