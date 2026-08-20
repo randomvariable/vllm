@@ -360,7 +360,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                     assert attn_metadata.c128a_global_decode_topk_indices is not None
                     assert attn_metadata.c128a_decode_topk_lens is not None
                     decode_compressed_indices = (
-                        attn_metadata.c128a_global_decode_topk_indices.view(
+                        attn_metadata.c128a_global_decode_topk_indices.reshape(
                             num_decode_tokens, -1
                         )
                     )
