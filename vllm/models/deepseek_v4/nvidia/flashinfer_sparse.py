@@ -767,11 +767,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # prefill kernel, whose SM120 build asserts num_tokens > 64
         # ("Decode ... must go through sparse_mla_sm120_decode_dsv4").
         out_arg = output
-        if num_decodes > 0 and num_decode_tokens > num_decodes:
-            assert num_decode_tokens % num_decodes == 0, (
-                f"ragged spec decode batch: {num_decode_tokens} tokens over "
-                f"{num_decodes} requests"
-            )
+        if (
+            num_decodes > 0
+            and num_decode_tokens > num_decodes
+            and num_decode_tokens % num_decodes == 0
+        ):
             next_n = num_decode_tokens // num_decodes
             q = q.view(num_decodes, next_n, *q.shape[1:])
             out_arg = output.view(num_decodes, next_n, *output.shape[1:])
