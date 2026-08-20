@@ -43,6 +43,12 @@ FLASHINFER_WHEEL_PLATFORM_TAG ?=
 FLASHINFER_FMHA_V2_HOST_BUILD ?= 1
 FLASHINFER_FMHA_V2_HOST_CXX ?= g++
 FLASHINFER_EXTRA_LDFLAGS ?=
+# The cubin wheel build fetches ~23k artifacts from NVIDIA's CDN and raises if
+# ANY single file exhausts its own retries, discarding the ~2.5h AOT compile
+# that precedes it in the same layer. Observed twice: 108/23016 and 80/23091
+# transient 403s. download_artifacts() skips files already valid on disk and the
+# cubin dir is a cache mount, so a retry re-fetches only the residual failures.
+FLASHINFER_CUBIN_ATTEMPTS ?= 4
 CMAKE_JOB_POOLS ?= compile=5
 RUST_TOOLCHAIN ?= 1.95
 UV ?= uv
@@ -172,8 +178,18 @@ build-flashinfer: sync-deps ccache-keyfile
 	MAX_JOBS=$(FLASHINFER_MAX_JOBS) FLASHINFER_NVCC_THREADS=$(FLASHINFER_NVCC_THREADS) \
 	BUILD_JIT_CACHE=true BUILD_NVEP=0 \
 	./tools/flashinfer-build.sh && \
-	$(UV) build --python $(PYTHON) --no-build-isolation --wheel \
-		--out-dir $(FLASHINFER_DIST_DIR) ./third_party/flashinfer/flashinfer-cubin
+	set -e; \
+	n=0; \
+	until $(UV) build --python $(PYTHON) --no-build-isolation --wheel \
+		--out-dir $(FLASHINFER_DIST_DIR) ./third_party/flashinfer/flashinfer-cubin; do \
+		n=$$((n + 1)); \
+		if [ $$n -ge $(FLASHINFER_CUBIN_ATTEMPTS) ]; then \
+			echo "cubin wheel build failed after $$n attempts" >&2; \
+			exit 1; \
+		fi; \
+		echo "cubin wheel build attempt $$n failed; retrying in $$((n * 30))s" >&2; \
+		sleep $$((n * 30)); \
+	done
 
 build-rust:
 	if ! command -v rustup >/dev/null 2>&1; then \
