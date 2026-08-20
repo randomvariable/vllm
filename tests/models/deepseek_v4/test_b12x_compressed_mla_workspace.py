@@ -126,11 +126,11 @@ def _make_layer(
     ("compress_ratio", "dspark", "expected_width"),
     [
         pytest.param(1, False, 128, id="swa-causal"),
-        pytest.param(1, True, 512, id="swa-dspark"),
+        pytest.param(1, True, 192, id="swa-dspark"),
         pytest.param(4, False, 2176, id="c4-causal"),
-        pytest.param(4, True, 2560, id="c4-dspark"),
+        pytest.param(4, True, 2240, id="c4-dspark"),
         pytest.param(128, False, 4224, id="c128-causal"),
-        pytest.param(128, True, 4608, id="c128-dspark"),
+        pytest.param(128, True, 4288, id="c128-dspark"),
     ],
 )
 def test_reserve_uses_full_runtime_width(
@@ -184,8 +184,8 @@ def test_reserve_uses_dcp_gathered_heads(monkeypatch) -> None:
 
 def test_workspace_width_helpers_match_reporter_geometry() -> None:
     assert get_c128a_topk_width(524288, 128) == 4096
-    assert get_dspark_swa_index_width(128, 5) == 512
-    assert get_dspark_swa_index_width(512, 5) == 1024
+    assert get_dspark_swa_index_width(128, 5) == 192
+    assert get_dspark_swa_index_width(512, 5) == 576
 
 
 @pytest.mark.parametrize(
