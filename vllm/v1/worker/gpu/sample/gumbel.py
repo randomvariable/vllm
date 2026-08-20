@@ -342,6 +342,7 @@ def _gumbel_sample_kernel(
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     HAS_SCHEDULE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
@@ -378,6 +379,7 @@ def _gumbel_sample_kernel(
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
+        HAS_ACTIVE_ROW_LIMIT=HAS_ACTIVE_ROW_LIMIT,
         HAS_SCHEDULE=HAS_SCHEDULE,
     )
     token_id = block_idx * BLOCK_SIZE + idx
