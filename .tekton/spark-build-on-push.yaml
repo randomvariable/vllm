@@ -244,6 +244,25 @@ spec:
                 # The working set is the ~95GB layer store plus a 100G ccache
                 # (CCACHE_MAXSIZE in the builder stage), so reserve 280GB and cap
                 # at 320GB, leaving the volume's own headroom.
+                #
+                # Those worker-level fields alone did NOT stop the wipes, because
+                # they do not replace the default policy list. buildkitd only
+                # falls back to config.DefaultGCPolicy when the gcpolicy array is
+                # empty (cmd/buildkitd/main.go: `if len(cfg.GCPolicy) == 0`), and
+                # that default's FIRST rule hard-codes
+                #   filters      = ["type==source.local", "type==exec.cachemount",
+                #                   "type==source.git.checkout"]
+                #   maxUsedSpace = 512MB
+                # so every cache mount above 512MB was still evicted once it went
+                # 48h unused -- our ccache is sized 100G. Measured directly: the
+                # run after a successful 2114-object FlashInfer stage still
+                # reported "Files: 0" at stage entry.
+                #
+                # Stating the array explicitly suppresses that default entirely.
+                # Rule 1 keeps cache mounts (ccache, cubins, uv, cargo, the CMake
+                # binary dir) under the same budget as everything else instead of
+                # 512MB. Rule 2 is the general cap, and rule 3 (all = true) is the
+                # last-resort sweep the default list also ends with.
                 mkdir -p /home/user/.config/buildkit
                 cat > /home/user/.config/buildkit/buildkitd.toml <<'BKCONF'
                 root = "/home/user/.local/share/buildkit"
@@ -254,6 +273,23 @@ spec:
                   reservedSpace = "280GB"
                   maxUsedSpace = "320GB"
                   minFreeSpace = "20GB"
+
+                  [[worker.oci.gcpolicy]]
+                    filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
+                    reservedSpace = "280GB"
+                    maxUsedSpace = "320GB"
+                    minFreeSpace = "20GB"
+
+                  [[worker.oci.gcpolicy]]
+                    reservedSpace = "280GB"
+                    maxUsedSpace = "320GB"
+                    minFreeSpace = "20GB"
+
+                  [[worker.oci.gcpolicy]]
+                    all = true
+                    reservedSpace = "280GB"
+                    maxUsedSpace = "320GB"
+                    minFreeSpace = "20GB"
                 BKCONF
                 echo "== buildkitd config =="
                 cat /home/user/.config/buildkit/buildkitd.toml
