@@ -336,7 +336,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
 
         result: dict[str, torch.Tensor | None] = {}
         if num_decode_tokens > 0:
-            result["c128a_global_decode_topk_indices"] = global_decode.view(
+            result["c128a_global_decode_topk_indices"] = global_decode.reshape(
                 num_decode_tokens, 1, -1
             )
             result["c128a_decode_topk_lens"] = decode_lens
@@ -399,9 +399,9 @@ def build_c128a_topk_metadata(
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
 
-    global_decode = global_decode_buffer[:num_decode_tokens]
+    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens]
+    prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
