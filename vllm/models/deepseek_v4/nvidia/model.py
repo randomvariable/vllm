@@ -2385,7 +2385,6 @@ class DeepseekV4ForCausalLM(
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         self.model.setup_b12x_wo_projection()
-        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
