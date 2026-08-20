@@ -539,8 +539,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       message(STATUS "Machete generation script hash: ${MACHETE_GEN_SCRIPT_HASH}")
       message(STATUS "Last run machete generate script hash: $CACHE{MACHETE_GEN_SCRIPT_HASH}")
 
+      # Same source-tree/build-directory split as the Marlin blocks below: the
+      # hash cache lives in the build directory while the sources are generated
+      # into the source tree, so a persisted build directory with a fresh
+      # checkout would skip generation and leave nothing to compile.
+      set(MACHETE_GEN_SENTINEL
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/machete/generated)
       if (NOT DEFINED CACHE{MACHETE_GEN_SCRIPT_HASH}
-          OR NOT $CACHE{MACHETE_GEN_SCRIPT_HASH} STREQUAL ${MACHETE_GEN_SCRIPT_HASH})
+          OR NOT $CACHE{MACHETE_GEN_SCRIPT_HASH} STREQUAL ${MACHETE_GEN_SCRIPT_HASH}
+          OR NOT EXISTS ${MACHETE_GEN_SENTINEL})
         execute_process(
           COMMAND ${CMAKE_COMMAND} -E env
           PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass_extensions/:${CUTLASS_DIR}/python/:${VLLM_PYTHON_PATH}:$ENV{PYTHONPATH}
@@ -649,8 +656,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       message(STATUS "Marlin generation script hash: ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH}")
       message(STATUS "Last run Marlin generate script hash: $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH}")
 
+      # The hash cache lives in the build directory, but the generated sources
+      # land in the source tree. A persisted build directory paired with a fresh
+      # checkout (CI clones per run) therefore skips generation against a tree
+      # that no longer has the outputs, and marlin.cu fails on its
+      # `#include "kernel_selector.h"`. Re-run whenever an output is missing.
+      set(MARLIN_GEN_SENTINEL
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin/kernel_selector.h)
       if (NOT DEFINED CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
-          OR NOT $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH})
+          OR NOT $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
+          OR NOT EXISTS ${MARLIN_GEN_SENTINEL})
         execute_process(
           COMMAND ${CMAKE_COMMAND} -E env
           PYTHONPATH=$ENV{PYTHONPATH}
@@ -1365,8 +1380,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     message(STATUS "Marlin MOE generation script hash with arch: ${MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH}")
     message(STATUS "Last run Marlin MOE generate script hash with arch: $CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH}")
 
+    # Same source-tree/build-directory split as the non-MoE Marlin block above:
+    # re-run when the generated header is absent, not only when the hash moved.
+    set(MOE_MARLIN_GEN_SENTINEL
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel_selector.h)
     if (NOT DEFINED CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
-        OR NOT $CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH})
+        OR NOT $CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
+        OR NOT EXISTS ${MOE_MARLIN_GEN_SENTINEL})
       execute_process(
         COMMAND ${CMAKE_COMMAND} -E env
         PYTHONPATH=$ENV{PYTHONPATH}
