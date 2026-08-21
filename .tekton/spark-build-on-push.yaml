@@ -353,7 +353,8 @@ spec:
                 set +e
                 buildctl build --frontend dockerfile.v0 \
                   --local context="$SRC" --local dockerfile="$SRC" \
-                  --build-context "shuttle-src=$SHUTTLE_DIR" \
+                  --local shuttle-src="$SHUTTLE_DIR" \
+                  --opt "context:shuttle-src=local:shuttle-src" \
                   --opt filename=homelab/spark-cross.Dockerfile \
                   --opt platform=linux/arm64 \
                   --opt build-arg:MAX_JOBS=4 \
@@ -374,7 +375,8 @@ spec:
                 rm -rf "$SHUTTLE_NEW_DIR"
                 if buildctl build --frontend dockerfile.v0 \
                   --local context="$SRC" --local dockerfile="$SRC" \
-                  --build-context "shuttle-src=$SHUTTLE_DIR" \
+                  --local shuttle-src="$SHUTTLE_DIR" \
+                  --opt "context:shuttle-src=local:shuttle-src" \
                   --opt filename=homelab/spark-cross.Dockerfile \
                   --opt platform=linux/arm64 \
                   --opt build-arg:VLLM_SCM_VERSION="$SCM_VERSION" \
