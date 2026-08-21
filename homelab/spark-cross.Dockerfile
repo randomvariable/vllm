@@ -13,6 +13,24 @@ ARG CMAKE_BUILD_PARALLEL_LEVEL=4
 ARG NVCC_THREADS=1
 ARG VLLM_SCM_VERSION=0.1.dev0
 
+# PVC cache shuttle. Cache mounts are exec.cachemount refs whose lifetime is
+# tied to buildkitd's session: a cancelled/killed/failed run orphans the refs
+# and the next daemon start drops the contents (measured repeatedly -- ccache
+# "Files: 0" at entry after a failed run, all 23k cubins re-downloaded). This
+# stage restores both expensive mounts from plain tarballs on the build PVC
+# before any compile runs. The pipeline binds the PVC shuttle dir as the
+# shuttle-src context and exports the shuttle-flush stage back to it.
+#
+# The builder resumes FROM this stage (ordering edge: restore is sequenced
+# before the AOT compile; a separate unconstrained stage could race it).
+FROM --platform=linux/amd64 alpine:3.19 AS cache-prime
+RUN --mount=type=bind,from=shuttle-src,target=/sh \
+    --mount=type=cache,id=vllm-spark-ccache-cross,target=/ccache,sharing=locked \
+    --mount=type=cache,id=vllm-spark-flashinfer-cubins-cross,target=/cubins,sharing=locked \
+    sh -c 'set -e; \
+      if [ -f /sh/ccache.tgz ]; then mkdir -p /ccache && tar -xzf /sh/ccache.tgz -C /ccache && echo "shuttle: restored ccache $(find /ccache -type f | wc -l) files"; else echo "shuttle: ccache cold"; fi; \
+      if [ -f /sh/cubins.tgz ]; then mkdir -p /cubins && tar -xzf /sh/cubins.tgz -C /cubins && echo "shuttle: restored cubins $(find /cubins -type f | wc -l) files"; else echo "shuttle: cubins cold"; fi'
+
 FROM --platform=linux/amd64 nvidia/cuda:13.3.1-devel-ubuntu26.04 AS builder
 
 # VLLM_SCM_VERSION is deliberately NOT declared here. A build-arg's value is part
@@ -149,6 +167,13 @@ COPY requirements /src/vllm/requirements
 # with `COPY .` for the wheel stage below.
 COPY tools/flashinfer-build.sh /src/vllm/tools/flashinfer-build.sh
 COPY third_party/flashinfer /src/vllm/third_party/flashinfer
+# Ordering edge for the cache shuttle: forces the cache-prime stage to be
+# solved (i.e. the PVC tarballs restored into the mounts) before the AOT
+# compile runs. buildkit only builds stages reachable from the target, so
+# without this dependency cache-prime would never execute. Placed after the
+# narrowed COPYs and immediately before the RUN it orders, so the shuttle
+# tarball's per-build digest only keys this one layer, not the toolchain.
+COPY --from=cache-prime /etc/alpine-release /tmp/.shuttle-primed
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=cache,id=vllm-spark-flashinfer-cubins-cross,target=/src/vllm/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins,sharing=locked \
     --mount=type=cache,id=vllm-spark-ccache-cross,target=/root/.cache/ccache,sharing=locked \
@@ -159,6 +184,10 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     cd /src/vllm && make cross-flashinfer; \
     rc=$?; \
     echo "== ccache at flashinfer exit (rc=$rc) ==" && ccache -sv; \
+    mkdir -p /shuttle-out && \
+    tar -czf /shuttle-out/ccache.tgz -C /root/.cache/ccache . && \
+    tar -czf /shuttle-out/cubins.tgz -C /src/vllm/third_party/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins . && \
+    echo "shuttle: flushed $(du -sh /shuttle-out | cut -f1)"; \
     exit $rc
 
 # Everything that genuinely depends on the full source and the release version:
@@ -191,10 +220,19 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION} make cross-rest; \
     rc=$?; \
     echo "== ccache at wheel exit (rc=$rc) ==" && ccache -sv; \
+    mkdir -p /shuttle-out && tar -czf /shuttle-out/ccache.tgz -C /root/.cache/ccache . && \
+    echo "shuttle: flushed wheel ccache $(du -sh /shuttle-out/ccache.tgz | cut -f1)"; \
     exit $rc
 
 RUN mkdir -p /runtime-requirements
 COPY requirements/cuda.txt /runtime-requirements/cuda.txt
+
+# Shuttle export: plain files on the build PVC via --output type=local in the
+# pipeline. Not part of the final image; exists solely to carry the tarballs
+# out of buildkit's ref lifecycle between runs.
+FROM scratch AS shuttle-flush
+COPY --from=builder /shuttle-out/ /shuttle/
+
 
 FROM --platform=$TARGETPLATFORM nvidia/cuda:13.3.1-runtime-ubuntu26.04 AS runtime
 # The per-commit ARGs (build commit, image tag, pipeline URL) are declared just

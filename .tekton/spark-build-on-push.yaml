@@ -341,9 +341,19 @@ spec:
                 # loses. mode=max stores the builder stages too, so the
                 # FlashInfer AOT layer survives loss of that local state.
                 # ignore-error keeps a registry hiccup at the end of a
-                # multi-hour build from failing the build itself.
+                # ignore-error stays: a registry hiccup must not fail a
+                # multi-hour build; the shuttle below is the durable copy.
+                # SHUTTLE_DIR lives on the buildkitd PVC mount (survives runs);
+                # the flush solve runs AFTER the main solve so the
+                # sharing=locked cache mounts are never held concurrently.
+                SHUTTLE_DIR=/home/user/.local/share/buildkit/shuttle
+                SHUTTLE_NEW_DIR=${SHUTTLE_DIR}.new
+                rm -rf "$SHUTTLE_NEW_DIR"
+                mkdir -p "$SHUTTLE_DIR"
+                set +e
                 buildctl build --frontend dockerfile.v0 \
                   --local context="$SRC" --local dockerfile="$SRC" \
+                  --build-context "shuttle-src=$SHUTTLE_DIR" \
                   --opt filename=homelab/spark-cross.Dockerfile \
                   --opt platform=linux/arm64 \
                   --opt build-arg:MAX_JOBS=4 \
@@ -356,8 +366,35 @@ spec:
                   --import-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:latest" \
                   --export-cache "type=registry,ref=${HARBOR_REGISTRY}/${IMAGE_NAME}:buildcache,mode=max,ignore-error=true" \
                   --output "type=image,\"name=${IMAGE_REF},${HARBOR_REGISTRY}/${IMAGE_NAME}:latest\",push=true"
+                MAIN_RC=$?
+                set -e
+                # Shuttle flush: export to a sibling directory, then promote only
+                # a complete result. The output layout includes /shuttle/ because
+                # shuttle-flush copies /shuttle-out into that directory.
+                rm -rf "$SHUTTLE_NEW_DIR"
+                if buildctl build --frontend dockerfile.v0 \
+                  --local context="$SRC" --local dockerfile="$SRC" \
+                  --build-context "shuttle-src=$SHUTTLE_DIR" \
+                  --opt filename=homelab/spark-cross.Dockerfile \
+                  --opt platform=linux/arm64 \
+                  --opt build-arg:VLLM_SCM_VERSION="$SCM_VERSION" \
+                  --opt target=shuttle-flush \
+                  --output "type=local,dest=$SHUTTLE_NEW_DIR"; then
+                  if [ -s "$SHUTTLE_NEW_DIR/shuttle/ccache.tgz" ] && \
+                    [ -s "$SHUTTLE_NEW_DIR/shuttle/cubins.tgz" ]; then
+                    mv "$SHUTTLE_NEW_DIR/shuttle/ccache.tgz" "$SHUTTLE_DIR/ccache.tgz"
+                    mv "$SHUTTLE_NEW_DIR/shuttle/cubins.tgz" "$SHUTTLE_DIR/cubins.tgz"
+                    echo "shuttle: promoted complete export"
+                  else
+                    echo "WARN: shuttle flush produced incomplete output; keeping prior export"
+                  fi
+                else
+                  echo "WARN: shuttle flush failed; keeping prior export"
+                fi
+                rm -rf "$SHUTTLE_NEW_DIR"
                 printf '%s' "$IMAGE_REF" > "$(results.IMAGE_REF.path)"
                 printf '%s' "$SHORT_SHA" > "$(results.IMAGE_TAG.path)"
+                exit $MAIN_RC
               volumeMounts:
                 - {name: dockerconfig, mountPath: /home/user/.docker}
                 - {name: buildkitd, mountPath: /home/user/.local/share/buildkit}
