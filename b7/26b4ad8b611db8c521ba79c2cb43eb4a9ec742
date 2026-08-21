@@ -1,0 +1,20 @@
+tests/v1/attention/test_deepseek_v4_sparse_mla_metadata.py
+  h_15da545fc8cfbe 5,10-17,26-78,108-122,207-235
+vllm/models/deepseek_v4/common/ops/cache_utils.py
+  h_15da545fc8cfbe 452-461,493-502
+vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+  h_15da545fc8cfbe 81-98,766-769,784,894-900,905,908
+vllm/models/deepseek_v4/sparse_mla.py
+  h_15da545fc8cfbe 473,483,485-486,490,496,500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "b726b4ad8b611db8c521ba79c2cb43eb4a9ec742",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
