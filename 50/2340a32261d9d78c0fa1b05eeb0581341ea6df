@@ -1,0 +1,16 @@
+vllm/v1/worker/gpu/sample/gumbel.py
+  h_15da545fc8cfbe 136,146,148
+vllm/v1/worker/gpu/sample/states.py
+  h_15da545fc8cfbe 299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "502340a32261d9d78c0fa1b05eeb0581341ea6df",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
