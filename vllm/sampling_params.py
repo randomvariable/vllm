@@ -1290,6 +1290,20 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+        if (
+            self.has_temperature_schedule
+            and speculative_config.num_speculative_tokens > 1
+        ):
+            raise VLLMValidationError(
+                "The ReSET entropy-threshold temperature policy (arXiv "
+                "2606.13233) is sequential per token and cannot be resolved "
+                "ahead over speculative draft positions; it is not supported "
+                "with speculative decoding. Disable speculative decoding for "
+                "ReSET requests.",
+                parameter="temperature_low",
+                value=self.temperature_low,
+            )
+
     def _validate_diffusion(self, model_config: ModelConfig) -> None:
         if not model_config.is_diffusion:
             return
