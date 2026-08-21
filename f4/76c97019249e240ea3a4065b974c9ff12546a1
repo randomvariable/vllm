@@ -1,0 +1,16 @@
+.tekton/spark-build-on-push.yaml
+  h_15da545fc8cfbe 344-353,356,369-394,397
+homelab/spark-cross.Dockerfile
+  h_15da545fc8cfbe 16-33,170-176,187-190,223-224,230-236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "f476c97019249e240ea3a4065b974c9ff12546a1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
