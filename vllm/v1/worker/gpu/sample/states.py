@@ -296,7 +296,7 @@ class SamplingStates:
                 # No request requires temperature. Skip the kernel launch.
                 return
 
-        apply_temperature(logits, expanded_idx_mapping, self.temperature.gpu)
+        apply_temperature(logits, expanded_idx_mapping, self.temperature.gpu, schedule)
 
     def apply_min_p(
         self,

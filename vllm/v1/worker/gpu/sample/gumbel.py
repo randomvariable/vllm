@@ -143,6 +143,7 @@ def apply_temperature(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
+    schedule: "TemperatureSchedule | None" = None,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
@@ -152,7 +153,9 @@ def apply_temperature(
         logits.stride(0),
         expanded_idx_mapping,
         temperature,
+        *schedule_args(schedule, fallback=temperature),
         vocab_size,
+        HAS_SCHEDULE=schedule is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
