@@ -1,0 +1,14 @@
+.tekton/spark-build-on-push.yaml
+  h_15da545fc8cfbe 356-357,378-379
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "7dc83d7aca6fa8a1890cf3b22bdd1071ff7130d9",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
