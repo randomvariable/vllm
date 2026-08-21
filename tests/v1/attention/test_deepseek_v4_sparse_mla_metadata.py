@@ -2,16 +2,78 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
+from vllm.config import VllmConfig
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    compute_dcp_global_topk_indices_and_lens,
+    compute_global_topk_indices_and_lens,
+)
+from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    _validate_prefill_metadata_lengths,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadataBuilder,
     build_c128a_topk_metadata,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def test_c128a_prefill_slices_must_match_topk_rows() -> None:
+    """Validate prefill metadata before launching the sparse Triton kernel."""
+    prefill_local = torch.empty((3, 8), dtype=torch.int32)
+    token_to_req_indices = torch.empty(2, dtype=torch.int32)
+    is_valid_token = torch.empty(2, dtype=torch.bool)
+
+    with pytest.raises(AssertionError, match="length mismatch"):
+        _validate_prefill_metadata_lengths(
+            prefill_local, token_to_req_indices, is_valid_token
+        )
+
+    _validate_prefill_metadata_lengths(
+        prefill_local[:2], token_to_req_indices, is_valid_token
+    )
+
+
+def test_global_topk_rejects_mismatched_metadata_rows() -> None:
+    """Reject row mismatch before the Triton kernel can read out of bounds."""
+    topk_indices = torch.zeros((3, 4), dtype=torch.int32)
+    token_to_req_indices = torch.zeros(2, dtype=torch.int32)
+    is_valid_token = torch.ones(2, dtype=torch.bool)
+    block_table = torch.zeros((1, 4), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="row count mismatch"):
+        compute_global_topk_indices_and_lens(
+            topk_indices,
+            token_to_req_indices,
+            block_table,
+            block_size=2,
+            is_valid_token=is_valid_token,
+        )
+
+
+def test_dcp_global_topk_rejects_mismatched_metadata_rows() -> None:
+    """Reject DCP row mismatch before its Triton kernel can read out of bounds."""
+    topk_indices = torch.zeros((3, 4), dtype=torch.int32)
+    token_to_req_indices = torch.zeros(2, dtype=torch.int32)
+    is_valid_token = torch.ones(2, dtype=torch.bool)
+    block_table = torch.zeros((1, 4), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="row count mismatch"):
+        compute_dcp_global_topk_indices_and_lens(
+            topk_indices,
+            token_to_req_indices,
+            block_table,
+            block_size=2,
+            is_valid_token=is_valid_token,
+            dcp_world_size=2,
+            dcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -43,18 +105,22 @@ def test_compressed_slot_mapping_uses_dcp_local_pages(
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(index_topk=512),
-            max_model_len=1024,
+
+    vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(index_topk=512),
+                max_model_len=1024,
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=2,
+                prefill_context_parallel_size=1,
+                cp_kv_cache_interleave_size=1,
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+            speculative_config=None,
         ),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=2,
-            prefill_context_parallel_size=1,
-            cp_kv_cache_interleave_size=1,
-        ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
-        speculative_config=None,
     )
     builder = DeepseekV4FlashMLAMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
@@ -138,3 +204,32 @@ def test_c128a_metadata_compacts_dcp_local_decode_slots(
     )
     expected_prefill[0, :5] = torch.arange(5, dtype=torch.int32, device=device)
     torch.testing.assert_close(prefill, expected_prefill)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_c128a_metadata_masks_invalid_non_dcp_decode_tokens() -> None:
+    """Invalid decode rows must not dereference or emit from their request id."""
+    global_decode, decode_lens, _ = build_c128a_topk_metadata(
+        positions=torch.tensor([127], dtype=torch.int64, device="cuda"),
+        compress_ratio=128,
+        num_decode_tokens=1,
+        actual_num_query_tokens=1,
+        token_to_req_indices=torch.tensor([1024], dtype=torch.int32, device="cuda"),
+        block_table=torch.tensor([[11]], dtype=torch.int32, device="cuda"),
+        block_size=2,
+        slot_mapping=torch.tensor([-1], dtype=torch.int64, device="cuda"),
+        global_decode_buffer=torch.empty((1, 1), dtype=torch.int32, device="cuda"),
+        decode_lens_buffer=torch.empty(1, dtype=torch.int32, device="cuda"),
+        prefill_buffer=torch.empty((1, 1), dtype=torch.int32, device="cuda"),
+        max_compressed_tokens=1,
+        dcp_world_size=1,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    torch.testing.assert_close(
+        global_decode, torch.tensor([[-1]], dtype=torch.int32, device="cuda")
+    )
+    torch.testing.assert_close(
+        decode_lens, torch.zeros(1, dtype=torch.int32, device="cuda")
+    )

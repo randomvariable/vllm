@@ -449,6 +449,16 @@ def compute_global_topk_indices_and_lens(
     3. Masking padding tokens to length 0
     """
     num_tokens = topk_indices.shape[0]
+    if (
+        token_to_req_indices.shape[0] != num_tokens
+        or is_valid_token.shape[0] != num_tokens
+    ):
+        raise ValueError(
+            "Global top-k metadata row count mismatch: "
+            f"topk={num_tokens}, "
+            f"req_ids={token_to_req_indices.shape[0]}, "
+            f"valid={is_valid_token.shape[0]}"
+        )
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
@@ -480,6 +490,16 @@ def compute_dcp_global_topk_indices_and_lens(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Filter global top-k ids to this DCP rank and map them to cache slots."""
     num_tokens = topk_indices.shape[0]
+    if (
+        token_to_req_indices.shape[0] != num_tokens
+        or is_valid_token.shape[0] != num_tokens
+    ):
+        raise ValueError(
+            "DCP global top-k metadata row count mismatch: "
+            f"topk={num_tokens}, "
+            f"req_ids={token_to_req_indices.shape[0]}, "
+            f"valid={is_valid_token.shape[0]}"
+        )
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_dcp_global_topk_indices_and_lens_kernel[(num_tokens,)](
