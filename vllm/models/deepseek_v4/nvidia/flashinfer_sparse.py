@@ -77,6 +77,24 @@ def _pad_to_supported_q_heads(num_heads: int) -> int:
     )
 
 
+def _validate_prefill_metadata_lengths(
+    local_topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+) -> None:
+    if not (
+        local_topk_indices.shape[0]
+        == token_to_req_indices.shape[0]
+        == is_valid_token.shape[0]
+    ):
+        raise AssertionError(
+            "Sparse MLA prefill metadata length mismatch: "
+            f"topk={local_topk_indices.shape[0]}, "
+            f"req_ids={token_to_req_indices.shape[0]}, "
+            f"valid={is_valid_token.shape[0]}"
+        )
+
+
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
     """Return the SM120 DSV4 SWA specialization needed by this model."""
     if not vllm_config.attention_config.use_non_causal:
@@ -724,6 +742,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Sparse MLA metadata is required for compressed layers."
                 )
+            if swa_metadata.token_to_req_indices is None:
+                raise RuntimeError(
+                    "SWA request mapping is required for compressed layers."
+                )
             if swa_metadata.is_valid_token is None:
                 raise RuntimeError(
                     "SWA validity metadata is required for compressed layers."
@@ -738,7 +760,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 global_indices, extra_sparse_lengths = (
                     compute_global_topk_indices_and_lens(
                         self.topk_indices_buffer[:num_decode_tokens],
-                        swa_metadata.token_to_req_indices,
+                        swa_metadata.token_to_req_indices[:num_decode_tokens],
                         attn_metadata.block_table[:num_decodes],
                         block_size,
                         is_valid,
@@ -848,14 +870,21 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             prefill_token_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
+            token_to_req_indices = swa_metadata.token_to_req_indices[
+                prefill_token_slice
+            ]
+            is_valid_token = swa_metadata.is_valid_token[prefill_token_slice]
+            _validate_prefill_metadata_lengths(
+                local_topk_indices, token_to_req_indices, is_valid_token
+            )
             block_size = attn_metadata.block_size // self.compress_ratio
             extra_sparse_indices, extra_sparse_lengths = (
                 compute_global_topk_indices_and_lens(
                     local_topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_token_slice],
+                    token_to_req_indices,
                     attn_metadata.block_table,
                     block_size,
-                    swa_metadata.is_valid_token[prefill_token_slice],
+                    is_valid_token,
                 )
             )
 

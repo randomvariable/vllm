@@ -464,6 +464,7 @@ def _build_c128a_topk_metadata_kernel(
             # query must contribute an attention partial on every rank.
             is_valid_token = token_idx < actual_num_query_tokens
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+        safe_req_idx = tl.where(is_valid_token, req_idx, 0)
         count = tl.zeros((), dtype=tl.int32)
         virtual_block_size = block_size * DCP_WORLD_SIZE
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
@@ -473,23 +474,24 @@ def _build_c128a_topk_metadata_kernel(
 
             if DCP_WORLD_SIZE == 1:
                 block_indices = offset // block_size
+                valid = mask & is_valid & is_valid_token
                 block_numbers = tl.load(
-                    block_table_ptr + req_idx * block_table_stride + block_indices,
-                    mask=mask & is_valid,
+                    block_table_ptr + safe_req_idx * block_table_stride + block_indices,
+                    mask=valid,
                 )
                 block_offsets = offset % block_size
                 slot_ids = block_numbers * block_size + block_offsets
-                slot_ids = tl.where(is_valid, slot_ids, -1)
+                slot_ids = tl.where(valid, slot_ids, -1)
                 tl.store(
                     global_decode_ptr + token_idx * global_decode_stride + offset,
                     slot_ids,
                     mask=mask,
                 )
-                count += tl.sum(is_valid.to(tl.int32), axis=0)
+                count += tl.sum(valid.to(tl.int32), axis=0)
             else:
                 block_indices = offset // virtual_block_size
                 block_numbers = tl.load(
-                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    block_table_ptr + safe_req_idx * block_table_stride + block_indices,
                     mask=mask & is_valid & is_valid_token,
                 ).to(tl.int64)
                 virtual_block_offsets = offset - block_indices * virtual_block_size
