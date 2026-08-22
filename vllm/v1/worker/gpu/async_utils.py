@@ -209,6 +209,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
                     break
         self.model_runner_output.sampled_token_ids = sampled_token_ids
 
+        # Monitor-only observations are host-side (no D2H needed); map each
+        # request row to its req_id so the scheduler can advance recurrence.
+        if self.sampler_output.monitor_observations is not None:
+            req_ids = self.model_runner_output.req_ids
+            self.model_runner_output.monitor_observations = {
+                req_ids[i]: obs
+                for i, obs in enumerate(self.sampler_output.monitor_observations)
+                if obs
+            }
+
         if self.sampling_mask_tensors is not None:
             self.model_runner_output.sampling_masks = (
                 self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.worker.gpu.sample.reasoning_monitor import MonitoredObservation
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
@@ -284,6 +285,9 @@ class SamplerOutput:
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
 
+    # req-indexed committed-position monitor observations.
+    monitor_observations: list[list["MonitoredObservation"]] | None = None
+
 
 @dataclass
 class KVConnectorOutput:
@@ -371,6 +375,12 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
+
+    # req_id -> committed-position monitor observations (MGT-B telemetry).
+    # Populated only for requests that opted in via
+    # `SamplingParams.reasoning_monitor`; None otherwise. Monitor-only: never
+    # alters sampled output.
+    monitor_observations: dict[str, list["MonitoredObservation"]] | None = None
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None

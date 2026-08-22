@@ -4904,6 +4904,7 @@ class GPUModelRunner(
         self.kv_connector_output = None
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+            monitor_observations = sampler_output.monitor_observations
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4916,6 +4917,17 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                monitor_observations=(
+                    {
+                        req_id: observations
+                        for req_id, observations in zip(
+                            req_ids_output_copy, monitor_observations
+                        )
+                        if observations
+                    }
+                    if monitor_observations is not None
+                    else None
+                ),
                 routed_experts=None,
             )
 
@@ -5861,7 +5873,7 @@ class GPUModelRunner(
                     else self.sampler.compute_logprobs(chunk_logits)
                 )
                 del chunk_logits
-                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                token_ids, logprobs, ranks, *_ = self.sampler.gather_logprobs(
                     scores, num_prompt_logprobs, chunk_tgt
                 )
                 del scores

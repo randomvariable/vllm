@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
 _MAX_TEMPERATURE = 2.0
+_MAX_MARKER_PENALTY = 10.0
 
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
@@ -196,6 +197,35 @@ def validate_reasoning_answer_temperature(
     return float(value)
 
 
+def validate_reasoning_marker_penalty(
+    value: float | int | bool | None,
+) -> float | None:
+    """Validate ``reasoning_marker_penalty``; return ``None`` if unset.
+
+    The overthinking-marker penalty (arXiv 2606.00206) is subtracted from
+    marker-token logits at every reasoning-phase decode position. ``None`` and
+    ``0.0`` both mean disabled; a finite value in ``[0, 10]`` is required so a
+    pathological value cannot drive marker logits to ``-inf`` (values above 10
+    can erase enough probability mass to distort the surrounding distribution).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite float in [0, 10].",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= _MAX_MARKER_PENALTY:
+        raise VLLMValidationError(
+            "`reasoning_marker_penalty` must be a finite float in [0, 10].",
+            parameter="reasoning_marker_penalty",
+            value=value,
+        )
+    return value
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
@@ -219,6 +249,10 @@ ResetWindow = Annotated[
 ReasoningAnswerTemperature = Annotated[
     float | None,
     BeforeValidator(validate_reasoning_answer_temperature),
+]
+ReasoningMarkerPenalty = Annotated[
+    float | None,
+    BeforeValidator(validate_reasoning_marker_penalty),
 ]
 
 
@@ -543,6 +577,37 @@ class SamplingParams(
     ``thinking_token_budget``, because the phase is only tracked for
     requests the reasoning path already follows.
     """
+    reasoning_marker_penalty: ReasoningMarkerPenalty = None
+    """Logit penalty subtracted from overthinking-marker tokens (arXiv
+    2606.00206).
+
+    At every reasoning-phase decode position, a fixed ``lambda`` is subtracted
+    from the logits of a tokenizer-resolved set of leading-space
+    branch-opening markers (``_wait``, ``_But``, ``_alternatively``, ...),
+    suppressing the overthinking that aggressive quantization amplifies. The
+    penalty is applied only inside the reasoning block, never after the answer
+    phase begins or on rows whose thinking budget is exhausted.
+
+    ``None`` and ``0.0`` disable the penalty; a finite value in ``[0, 10]`` is
+    required otherwise. The marker set is model/tokenizer-derived and is part
+    of the calibration key for the reasoning-control stack — ReSET entropy
+    temperature and the marker penalty are coupled, not additive, because the
+    penalty lowers the entropy ReSET measures.
+    """
+    reasoning_monitor: bool = False
+    """Enable monitor-only reasoning telemetry capture.
+
+    When set, the V2 sampler captures full-vocabulary entropy (before and
+    after the control stack), the chosen-token log-probability after commit,
+    and the accepted token id + committed position for this request, and the
+    scheduler maintains the MGT-B-style recurrence state (64/32-window
+    features, CUSUM statistic, refractory, alarm count, sampled/emitted/
+    deleted-token accounting).
+
+    Strictly opt in and strictly monitor only: it never changes output and
+    adds no extra forward pass; a request without it is byte-for-byte
+    behaviourally inert on the sampling path.
+    """
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -584,6 +649,8 @@ class SamplingParams(
         entropy_threshold: float | None = None,
         reset_window: int | None = None,
         reasoning_answer_temperature: float | None = None,
+        reasoning_marker_penalty: float | None = None,
+        reasoning_monitor: bool = False,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
@@ -654,6 +721,8 @@ class SamplingParams(
             entropy_threshold=entropy_threshold,
             reset_window=reset_window,
             reasoning_answer_temperature=reasoning_answer_temperature,
+            reasoning_marker_penalty=reasoning_marker_penalty,
+            reasoning_monitor=reasoning_monitor,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -699,6 +768,9 @@ class SamplingParams(
         self.reset_window = validate_reset_window(self.reset_window)
         self.reasoning_answer_temperature = validate_reasoning_answer_temperature(
             self.reasoning_answer_temperature
+        )
+        self.reasoning_marker_penalty = validate_reasoning_marker_penalty(
+            self.reasoning_marker_penalty
         )
         # The ReSET temps are validated in (0, 2] so no low-value floor is
         # needed; a positive value below the epsilon would have divided logits

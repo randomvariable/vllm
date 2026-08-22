@@ -131,6 +131,31 @@ class InputProcessor:
                     "enabled. Start the engine with --enable-trace-replay "
                     "to use it."
                 )
+            marker_penalty = getattr(params, "reasoning_marker_penalty", None)
+            if (
+                marker_penalty is not None
+                and marker_penalty > 0.0
+                and (
+                    self.vllm_config.reasoning_config is None
+                    or not self.vllm_config.reasoning_config.enabled
+                )
+            ):
+                raise VLLMValidationError(
+                    "reasoning_marker_penalty is set but reasoning_config is "
+                    "not configured. Please set --reasoning-parser "
+                    "and/or --reasoning-config to use the marker penalty."
+                )
+            if (
+                marker_penalty is not None
+                and marker_penalty > 0.0
+                and self.vllm_config.reasoning_config is not None
+                and not self.vllm_config.reasoning_config.marker_token_ids
+            ):
+                raise VLLMValidationError(
+                    "reasoning_marker_penalty is set but the model's "
+                    "tokenizer resolved no overthinking markers to a single "
+                    "token. The marker penalty cannot apply to this model."
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS

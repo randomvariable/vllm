@@ -24,8 +24,12 @@ from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_scores,
 )
+from vllm.v1.worker.gpu.sample.marker_penalty import (
+    ReasoningMarkerPenaltyState,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.reasoning_monitor import ReasoningMonitor
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
@@ -62,6 +66,23 @@ class Sampler:
         self.trace_replay_state = (
             TraceReplayState(req_states) if enable_trace_replay else None
         )
+        marker_ids = (
+            reasoning_config.marker_token_ids if reasoning_config is not None else None
+        )
+        budget_tensor = (
+            self.thinking_budget_state.thinking_token_budget.gpu
+            if self.thinking_budget_state.enabled
+            else None
+        )
+        self.marker_penalty_state = ReasoningMarkerPenaltyState(
+            req_states,
+            reasoning_config,
+            marker_ids or [],
+            budget_tensor,
+        )
+        self.reasoning_monitor = ReasoningMonitor(
+            max_num_reqs, device, max(1, num_speculative_tokens)
+        )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
@@ -89,6 +110,8 @@ class Sampler:
         self.thinking_budget_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
+        self.marker_penalty_state.add_request(req_idx, sampling_params)
+        self.reasoning_monitor.add_request(req_idx, sampling_params)
 
         states = self.sampling_states
         temperature = states.temperature.np[req_idx]
@@ -100,6 +123,7 @@ class Sampler:
                 self.thinking_budget_state.enabled
                 and self.thinking_budget_state.use_thinking_budget[req_idx]
             )
+            or self.marker_penalty_state.use_marker_penalty[req_idx]
             or (temperature != 0.0 and temperature != 1.0)
             or states.min_p.np[req_idx] != 0.0
             or states.top_k.np[req_idx] != states.vocab_size
@@ -115,6 +139,8 @@ class Sampler:
         self.thinking_budget_state.apply_staged_writes()
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
+        self.marker_penalty_state.apply_staged_writes()
+        self.reasoning_monitor.apply_staged_writes()
 
     def get_logprobs_dims(
         self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
@@ -151,8 +177,9 @@ class Sampler:
 
         logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
 
-        sampled, processed_logits = self.sample(
-            logits,
+        raw_logits = logits
+        sampled, processed_logits, control_logits = self.sample(
+            raw_logits,
             expanded_idx_mapping,
             idx_mapping,
             idx_mapping_np,
@@ -203,6 +230,24 @@ class Sampler:
                 processed_logits, num_sampled
             )
 
+        # Monitor-only observation capture for requests that opted in. Gate on
+        # the host array (no kernel, no D2H) so the no-monitor path is free;
+        # only when a monitored request is in the batch do we reduce entropy
+        # from the already-computed logits (never an extra forward pass) and
+        # synchronize the required counts.
+        monitor_observations = None
+        if self.reasoning_monitor.has_enabled_requests and np.any(
+            self.reasoning_monitor.monitoring(idx_mapping_np)
+        ):
+            monitor_observations = self.reasoning_monitor.capture(
+                raw_logits,
+                control_logits,
+                sampled.view(-1),
+                num_sampled.cpu().numpy().astype(np.int64),
+                pos.cpu().numpy().astype(np.int64),
+                idx_mapping_np,
+            )
+
         # These are GPU tensors.
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
@@ -214,6 +259,7 @@ class Sampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
+            monitor_observations=monitor_observations,
         )
         return sampler_output
 
@@ -270,6 +316,20 @@ class Sampler:
             expanded_local_pos,
         )
 
+        # Apply the overthinking-marker logit penalty (arXiv 2606.00206) to
+        # rows still inside their reasoning block. Runs after budget forcing so
+        # budget-exhausted rows are excluded, and before ReSET so the penalty
+        # book is part of the post-processing logits ReSET observes (the two are
+        # mechanism-additive but outcome-coupled; see module docstring).
+        self.marker_penalty_state.apply(
+            logits,
+            idx_mapping,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
         # Apply the ReSET entropy-threshold temperature (arXiv 2606.13233) to
         # ReSET rows before the static divide. ReSET rows carry temperature
         # 1.0, so `apply_temperature` below is a no-op for them. Under
@@ -311,6 +371,10 @@ class Sampler:
             self.thinking_budget_state.use_thinking_budget[idx_mapping_np]
         ):
             return True
+        if self.marker_penalty_state.enabled and np.any(
+            self.marker_penalty_state.use_marker_penalty[idx_mapping_np]
+        ):
+            return True
         if np.any(self.sampling_states.use_reset[idx_mapping_np]):
             return True
 
@@ -338,8 +402,8 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         return_logprobs: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        processed_logits = self.apply_sampling_params(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        control_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
             idx_mapping,
@@ -349,6 +413,7 @@ class Sampler:
             expanded_local_pos,
             skip_top_k_top_p=True,
         )
+        processed_logits = control_logits
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )
@@ -368,6 +433,13 @@ class Sampler:
         if use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
+            # apply_top_k_top_p masks logits in place; control_logits must keep
+            # the untruncated control stack for the monitor's entropy_post
+            # and chosen-token logprob.
+            if (
+                top_k is not None or top_p is not None
+            ) and self.reasoning_monitor.has_enabled_requests:
+                processed_logits = control_logits.clone()
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
             sampled = gumbel_sample(
                 processed_logits,
@@ -378,8 +450,8 @@ class Sampler:
                 apply_temperature=False,
                 is_drafting=False,
                 use_fp64=self.use_fp64_gumbel,
-                # Temperature is already applied above; the schedule is passed
-                # so the greedy branch tests the resolved value, not the base.
+                # Temperature is already applied above; the greedy branch tests
+                # the resolved value, not the base.
                 schedule=self.sampling_states.temperature_schedule(idx_mapping_np),
             )
-        return sampled, processed_logits
+        return sampled, processed_logits, control_logits

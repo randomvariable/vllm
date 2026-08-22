@@ -451,6 +451,10 @@ class VllmConfig:
     """The configurations for custom encoder cache manager."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
+    reasoning_monitor_calibration_path: str | None = None
+    """Optional immutable MGT-B calibration JSON artifact."""
+    reasoning_monitor_calibration_key: str = ""
+    """Resolved model/control identity used to validate MGT-B calibration."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -1945,6 +1949,14 @@ class VllmConfig:
         self._verify_kv_transfer_compat()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
+
+        from vllm.v1.core.sched.mgtb_monitor import build_mgtb_calibration_key
+
+        self.reasoning_monitor_calibration_key = build_mgtb_calibration_key(
+            self.model_config,
+            self.quant_config,
+            self.reasoning_config,
+        )
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when

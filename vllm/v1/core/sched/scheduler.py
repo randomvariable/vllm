@@ -39,6 +39,12 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.mgtb_monitor import (
+    MGTBCalibration,
+    MGTBConfig,
+    MGTBRequestState,
+    build_mgtb_calibration_key,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -190,6 +196,23 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # Request-owned state is populated only for opted-in requests via
+        # `SamplingParams.reasoning_monitor`; the default path is untouched.
+        # Load once per scheduler. Request-specific control stacks are matched
+        # against this immutable artifact at admission.
+        self.mgtb_calibration = None
+        calibration_path = vllm_config.reasoning_monitor_calibration_path
+        if calibration_path:
+            self.mgtb_calibration = MGTBCalibration.load(calibration_path)
+            if self.mgtb_calibration is None:
+                logger.warning(
+                    "MGT-B calibration artifact is invalid; using monitor-only fallback"
+                )
+        self.mgtb_config = MGTBConfig(calibration=None)
+        self._mgtb_warned_keys: set[str] = set()
+        self.mgtb_drift = 0.0
+        self.mgtb_threshold = self.mgtb_config.threshold
+        self.mgtb_refractory = self.mgtb_config.stride
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1924,6 +1947,7 @@ class Scheduler(SchedulerInterface):
                     del generated_token_ids[i:]
                     break
 
+            num_rejected = 0
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -1983,12 +2007,41 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
+            state = request.mgtb_monitor_state
+            monitor_obs = None
+            if model_runner_output.monitor_observations is not None:
+                monitor_obs = model_runner_output.monitor_observations.get(req_id)
 
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
+
+                # Advance recurrence only for tokens that survived stop handling.
+                if state is not None and not output_is_stale:
+                    committed_count = len(new_token_ids)
+                    committed_observations = (
+                        monitor_obs[:committed_count] if monitor_obs else ()
+                    )
+                    for obs in committed_observations:
+                        entropy = obs.entropy_post
+                        if entropy != entropy:
+                            entropy = obs.entropy_pre
+                        state.advance(
+                            entropy,
+                            obs.logprob,
+                            drift=self.mgtb_drift,
+                            threshold=self.mgtb_threshold,
+                            refractory_tokens=self.mgtb_refractory,
+                            token_id=obs.token_id,
+                            position=obs.position,
+                            emitted=False,
+                        )
+                    observed_tokens = len(committed_observations)
+                    if observed_tokens < committed_count:
+                        state.record_sampled(committed_count - observed_tokens)
+                    state.record_emitted(committed_count)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2004,6 +2057,8 @@ class Scheduler(SchedulerInterface):
                 # a consumed prompt also means every item in it was encoded.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+            if state is not None and not output_is_stale and num_rejected:
+                state.record_deleted(num_rejected)
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
@@ -2453,6 +2508,29 @@ class Scheduler(SchedulerInterface):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
 
+    def _mgtb_config_for_request(self, request: Request) -> MGTBConfig:
+        """Return calibration only when its full control-stack key matches."""
+        calibration = self.mgtb_calibration
+        sampling_params = request.sampling_params
+        if calibration is None or sampling_params is None:
+            return self.mgtb_config
+        expected_key = build_mgtb_calibration_key(
+            self.vllm_config.model_config,
+            self.vllm_config.quant_config,
+            self.vllm_config.reasoning_config,
+            sampling_params,
+        )
+        if calibration.key != expected_key:
+            if expected_key not in self._mgtb_warned_keys:
+                logger.warning(
+                    "MGT-B calibration key does not match request %s; using "
+                    "monitor-only fallback",
+                    request.request_id,
+                )
+                self._mgtb_warned_keys.add(expected_key)
+            return self.mgtb_config
+        return replace(self.mgtb_config, calibration=calibration)
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -2475,6 +2553,14 @@ class Scheduler(SchedulerInterface):
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
+                )
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.reasoning_monitor is True
+            ):
+                request.mgtb_monitor_state = MGTBRequestState(
+                    prompt_token_ids=request.prompt_token_ids or (),
+                    config=self._mgtb_config_for_request(request),
                 )
             if self.connector is not None:
                 self.connector.on_new_request(request)
@@ -2563,6 +2649,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        request.mgtb_monitor_state = None
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

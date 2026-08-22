@@ -122,6 +122,31 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+def test_mgtb_records_rejected_spec_tokens_without_committed_output():
+    scheduler = create_scheduler()
+    scheduler.log_stats = False
+    request = create_requests(num_requests=1)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.reasoning_monitor = True
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.num_sampled_tokens_per_step = 0
+    scheduler_output.scheduled_spec_decode_tokens[request.request_id] = [11, 12]
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.mgtb_monitor_state is not None
+    assert request.mgtb_monitor_state.deleted_tokens == 2
+    assert request.mgtb_monitor_state.sampled_tokens == 2
+    assert request.mgtb_monitor_state.emitted_tokens == 0
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
