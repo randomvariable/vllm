@@ -1,0 +1,16 @@
+.claude/skills/reset-stack-tuning/SKILL.md
+  h_15da545fc8cfbe 1-150
+.claude/skills/reset-stack-tuning/stack_optimizer.py
+  h_15da545fc8cfbe 1-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "45ac543de8b21ecace0423d3cbfd36656a8f38a5",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
