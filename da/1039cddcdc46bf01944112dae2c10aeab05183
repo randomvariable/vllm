@@ -1,0 +1,30 @@
+docs/features/reasoning_outputs.md
+  h_15da545fc8cfbe 389-394
+tests/v1/sample/test_reset_spec_chain.py
+  h_15da545fc8cfbe 1-445
+tests/v1/spec_decode/test_logprobs_adaptive_verification.py
+  h_15da545fc8cfbe 45-47,49-51,58-64
+vllm/sampling_params.py
+  h_15da545fc8cfbe 1058,1064,1188,1200-1202,1206,1210-1213
+vllm/v1/engine/input_processor.py
+  h_15da545fc8cfbe 109
+vllm/v1/sample/ops/reset.py
+  h_15da545fc8cfbe 120-123,138,142-155,250-332
+vllm/v1/worker/gpu/sample/sampler.py
+  h_15da545fc8cfbe 204-205,249-254
+vllm/v1/worker/gpu/sample/states.py
+  h_15da545fc8cfbe 69-71,109-110,217-218,225-231,241,250-271,273,278,280-305
+vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+  h_15da545fc8cfbe 166,172-180,189-190,208-209,252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "da1039cddcdc46bf01944112dae2c10aeab05183",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
