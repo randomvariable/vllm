@@ -27,6 +27,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.sched.mgtb_monitor import MGTBRequestState
 
 
 @dataclass
@@ -190,6 +191,7 @@ class Request:
         # they should also be updated simultaneously.
         self.output_token_ids = ConstantList(self._output_token_ids)
         self.all_token_ids = ConstantList(self._all_token_ids)
+        self.mgtb_monitor_state: MGTBRequestState | None = None
         # trace_headers
         self.trace_headers = trace_headers
         self.session_id = session_id

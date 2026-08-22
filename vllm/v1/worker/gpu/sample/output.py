@@ -10,6 +10,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, SamplingMaskLists
+from vllm.v1.worker.gpu.sample.reasoning_monitor import MonitoredObservation
 
 
 @dataclass
@@ -20,6 +21,7 @@ class SamplerOutput:
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    monitor_observations: list[list[MonitoredObservation]] | None = None
 
 
 @triton.jit

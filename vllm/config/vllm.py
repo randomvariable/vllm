@@ -451,6 +451,10 @@ class VllmConfig:
     """The configurations for custom encoder cache manager."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
+    reasoning_monitor_calibration_path: str | None = None
+    """Optional immutable MGT-B calibration JSON artifact."""
+    reasoning_monitor_calibration_key: str = ""
+    """Resolved model/control identity used to validate MGT-B calibration."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -769,34 +773,6 @@ class VllmConfig:
         if getattr(model_config, "is_attention_free", False):
             return False
         return is_default_v2_architecture or not model_config.is_moe
-
-    def _uses_breakable_cudagraph_by_default(self) -> bool:
-        model_config = self.model_config
-        if model_config is None:
-            return False
-
-        architectures = set(model_config.architectures)
-        return bool(architectures & default_breakable_cudagraph_architectures())
-
-    def _maybe_enable_breakable_cudagraph(self) -> bool:
-        if (
-            "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and self._uses_breakable_cudagraph_by_default()
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
-
-        from vllm.compilation.breakable_cudagraph import (
-            is_breakable_cudagraph_enabled,
-        )
-
-        enabled = is_breakable_cudagraph_enabled()
-        if enabled:
-            self.compilation_config.mode = CompilationMode.NONE
-        return enabled
 
     @property
     def needs_dp_coordinator(self) -> bool:
@@ -1892,6 +1868,14 @@ class VllmConfig:
         self._verify_kv_transfer_compat()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
+
+        from vllm.v1.core.sched.mgtb_monitor import build_mgtb_calibration_key
+
+        self.reasoning_monitor_calibration_key = build_mgtb_calibration_key(
+            self.model_config,
+            self.quant_config,
+            self.reasoning_config,
+        )
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when

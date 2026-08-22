@@ -54,7 +54,7 @@ def quantize_and_insert_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
-    use_fnuz: tl.constexpr = False,
+    use_fnuz: tl.constexpr = False,  # ty: ignore[invalid-parameter-default]
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -208,7 +208,7 @@ def quantize_and_insert_k_cache(
 
     grid = (num_tokens,)
 
-    quantize_and_insert_k_kernel[grid](
+    quantize_and_insert_k_kernel[grid](  # pyright: ignore[reportIndexIssue]
         k,
         slot_mapping,
         k_cache,
@@ -243,13 +243,13 @@ def _dequantize_and_gather_k_kernel(
     bf16_dim: tl.constexpr,  # 64
     scale_dim: tl.constexpr,  # 8
     quant_block: tl.constexpr,  # 64 (quantization block size)
-    cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+    cache_block_size: tl.constexpr,  # 64 (paged cache block size)
     token_data_size: tl.constexpr,  # 576 bytes per token data
     block_stride: tl.constexpr,  # total bytes per block (padded) int32
-    output_dim: tl.constexpr,  # 512
+    output_dim: tl.constexpr,  # 512  # ty: ignore[invalid-parameter-default]
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
-    use_fnuz: tl.constexpr = False,
+    use_fnuz: tl.constexpr = False,  # ty: ignore[invalid-parameter-default]
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -365,7 +365,7 @@ def dequantize_and_gather_k_cache_triton(
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
-    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](  # pyright: ignore[reportIndexIssue]
         out,
         out.stride(0),
         out.stride(1),
@@ -461,7 +461,7 @@ def compute_global_topk_indices_and_lens(
         )
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
-    _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+    _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](  # pyright: ignore[reportIndexIssue]
         global_topk_indices,
         global_topk_indices.stride(0),
         topk_lens,
@@ -502,7 +502,7 @@ def compute_dcp_global_topk_indices_and_lens(
         )
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
-    _compute_dcp_global_topk_indices_and_lens_kernel[(num_tokens,)](
+    _compute_dcp_global_topk_indices_and_lens_kernel[(num_tokens,)](  # pyright: ignore[reportIndexIssue]
         global_topk_indices,
         global_topk_indices.stride(0),
         topk_lens,
@@ -741,7 +741,7 @@ def _scheduler_config_int(vllm_config: Any, name: str, default: int) -> int:
 
 
 class CombineTopkSwaIndicesKernel(
-    VllmJitKernel["CombineTopkSwaIndicesKernel.CompileKey"]
+    VllmJitKernel["CombineTopkSwaIndicesKernel.CompileKey"]  # pyright: ignore[reportGeneralTypeIssues]
 ):
     @dataclass(frozen=True)
     class CompileKey:
@@ -831,7 +831,7 @@ class CombineTopkSwaIndicesKernel(
             combined_len = topk_len + swa_len
             tl.store(combined_lens_ptr + token_idx, combined_len)
 
-    def dispatch(  # type: ignore[override]
+    def dispatch(  # type: ignore[override]  # ty: ignore[invalid-method-override]
         self,
         *,
         topk_width: int,
@@ -908,7 +908,7 @@ class CombineTopkSwaIndicesKernel(
         WINDOW_SIZE: int,
     ) -> None:
         num_reqs = seq_lens.shape[0]
-        self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](
+        self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](  # pyright: ignore[reportIndexIssue]
             combined_indices,
             combined_indices.stride(0),
             combined_lens,
@@ -1032,7 +1032,7 @@ def build_flashinfer_mixed_sparse_indices(
         if compressed_block_span is None
         else compressed_block_span
     )
-    _build_flashinfer_mixed_sparse_indices_kernel[(num_tokens,)](
+    _build_flashinfer_mixed_sparse_indices_kernel[(num_tokens,)](  # pyright: ignore[reportIndexIssue]
         sparse_indices,
         sparse_indices.stride(0),
         sparse_topk_lens,

@@ -9,6 +9,7 @@ from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -17,6 +18,7 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.reasoning_monitor import MonitoredObservation
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
@@ -168,7 +170,12 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[list[MonitoredObservation]] | None,
+    ]:
         # Host-side chain-length bound for the ReSET scan. Under adaptive
         # verification the numpy mirror holds the pre-compacted layout, an
         # over-estimate, which the scan masks off per position.
@@ -178,17 +185,43 @@ class RejectionSampler:
             max_chain = (
                 int(np.diff(cu_num_logits_np).max()) if cu_num_logits_np.size > 1 else 0
             )
-        processed_logits = self.sampler.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping,
-            idx_mapping_np,
-            pos,
-            draft_sampled,
-            expanded_local_pos,
-            cu_num_logits=cu_num_logits,
-            max_chain=max_chain,
+        monitoring = (
+            not self.enable_adaptive_verification
+            and self.sampler.reasoning_monitor.has_enabled_requests
+            and np.any(self.sampler.reasoning_monitor.monitoring(idx_mapping_np))
         )
+        if monitoring:
+            control_logits = self.sampler.apply_sampling_params(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping,
+                idx_mapping_np,
+                pos,
+                draft_sampled,
+                expanded_local_pos,
+                cu_num_logits=cu_num_logits,
+                max_chain=max_chain,
+                skip_top_k_top_p=True,
+            )
+            top_k, top_p = self.sampler.sampling_states.get_top_k_top_p(
+                expanded_idx_mapping, idx_mapping_np
+            )
+            # apply_top_k_top_p masks in place; capture_spec below reads the
+            # untruncated control stack, so truncation gets its own tensor.
+            processed_logits = apply_top_k_top_p(control_logits.clone(), top_k, top_p)
+        else:
+            control_logits = None
+            processed_logits = self.sampler.apply_sampling_params(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping,
+                idx_mapping_np,
+                pos,
+                draft_sampled,
+                expanded_local_pos,
+                cu_num_logits=cu_num_logits,
+                max_chain=max_chain,
+            )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -205,9 +238,20 @@ class RejectionSampler:
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
         )
+        monitor_observations = None
+        if monitoring and control_logits is not None:
+            monitor_observations = self.sampler.reasoning_monitor.capture_spec(
+                logits,
+                control_logits,
+                sampled,
+                num_sampled.cpu().numpy().astype(np.int64),
+                pos,
+                cu_num_logits_np,
+                idx_mapping_np,
+            )
         # Commit the ReSET running state for exactly the committed prefix.
         self.sampler.sampling_states.commit_reset_spec(num_sampled)
-        return processed_logits, sampled, num_sampled
+        return processed_logits, sampled, num_sampled, monitor_observations
 
     def _verify_in_chunks(
         self,
@@ -218,7 +262,12 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         max_num_logprobs: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        LogprobsTensors | None,
+        list[list[MonitoredObservation]] | None,
+    ]:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
@@ -236,6 +285,15 @@ class RejectionSampler:
         sampled_chunks: list[torch.Tensor] = []
         num_sampled_chunks: list[torch.Tensor] = []
         logprobs_chunks: list[LogprobsTensors] = []
+        monitoring_enabled = (
+            self.sampler.reasoning_monitor.has_enabled_requests
+            and np.any(
+                self.sampler.reasoning_monitor.monitoring(input_batch.idx_mapping_np)
+            )
+        )
+        monitor_observations: list[list[MonitoredObservation]] | None = (
+            [[] for _ in range(num_reqs)] if monitoring_enabled else None
+        )
 
         for start, end in request_chunks:
             lo = int(cu_num_logits_np[start])
@@ -243,7 +301,7 @@ class RejectionSampler:
             chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
             chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
             # draft_logits uses persistent request-state indices and stays global.
-            processed_logits, sampled, num_sampled = self._verify(
+            processed_logits, sampled, num_sampled, chunk_observations = self._verify(
                 logits[lo:hi],
                 draft_logits,
                 draft_sampled[lo:hi],
@@ -268,10 +326,18 @@ class RejectionSampler:
             del processed_logits
             sampled_chunks.append(sampled)
             num_sampled_chunks.append(num_sampled)
+            if monitor_observations is not None and chunk_observations is not None:
+                for local_idx, observations in enumerate(chunk_observations):
+                    monitor_observations[start + local_idx].extend(observations)
 
         if len(sampled_chunks) == 1:
             logprobs_tensors = logprobs_chunks[0] if logprobs_chunks else None
-            return sampled_chunks[0], num_sampled_chunks[0], logprobs_tensors
+            return (
+                sampled_chunks[0],
+                num_sampled_chunks[0],
+                logprobs_tensors,
+                monitor_observations,
+            )
 
         logprobs_tensors = None
         if logprobs_chunks:
@@ -285,7 +351,7 @@ class RejectionSampler:
 
         sampled = torch.cat(sampled_chunks)
         num_sampled = torch.cat(num_sampled_chunks)
-        return sampled, num_sampled, logprobs_tensors
+        return sampled, num_sampled, logprobs_tensors, monitor_observations
 
     def __call__(
         self,
@@ -307,14 +373,16 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            chunk_logit_limit,
-            max_num_logprobs,
+        sampled, num_sampled, logprobs_tensors, monitor_observations = (
+            self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                chunk_logit_limit,
+                max_num_logprobs,
+            )
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
@@ -324,6 +392,12 @@ class RejectionSampler:
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
         )
+        if monitor_observations is not None:
+            committed_counts = num_sampled.cpu().tolist()
+            monitor_observations = [
+                observations[: int(committed_counts[req_idx])]
+                for req_idx, observations in enumerate(monitor_observations)
+            ]
 
         return SamplerOutput(
             sampled_token_ids=sampled,
@@ -331,4 +405,5 @@ class RejectionSampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            monitor_observations=monitor_observations,
         )

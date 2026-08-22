@@ -7,6 +7,7 @@ from vllm.config.model import ModelConfig
 from vllm.config.utils import config
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.v1.sample.marker_data import resolve_marker_token_ids
 
 
 @config
@@ -40,6 +41,13 @@ class ReasoningConfig:
     )
     """Token IDs that naturally terminate reasoning, as defined by the parser."""
 
+    _marker_token_ids: list[int] | None = field(default=None, init=False, repr=False)
+    """Overthinking-marker token IDs for the marker penalty (arXiv 2606.00206).
+
+    Set by `initialize_token_ids` from the canonical leading-space marker list.
+    Empty when no marker resolves to a single token (the marker penalty then
+    fails closed). Not intended to be configured directly."""
+
     _enabled: bool = field(default=False, init=False, repr=False)
     """Private field indicating whether reasoning token IDs have been initialized.
     Set to True by `initialize_token_ids` once token IDs are initialized."""
@@ -49,6 +57,13 @@ class ReasoningConfig:
         """Returns True if reasoning is enabled (i.e. if token IDs have been
         initialized), False otherwise."""
         return self._enabled
+
+    @property
+    def marker_token_ids(self) -> list[int] | None:
+        """Overthinking-marker token IDs, or `None` if reasoning never
+        initialized. Empty list means reasoning is enabled but no marker
+        resolved to a single token; the marker penalty must fail closed."""
+        return self._marker_token_ids
 
     @property
     def reasoning_start_token_ids(self) -> list[int] | None:
@@ -72,6 +87,7 @@ class ReasoningConfig:
             self._reasoning_start_token_ids is not None
             and self._reasoning_end_token_ids is not None
             and self._natural_reasoning_end_token_ids is not None
+            and self._marker_token_ids is not None
         ):
             self._enabled = True
             return  # Already initialized
@@ -122,4 +138,5 @@ class ReasoningConfig:
                 f"reasoning_end_str='{self.reasoning_end_str}'. "
                 "Ensure the strings are valid tokens in the model's vocabulary."
             )
+        self._marker_token_ids = resolve_marker_token_ids(tokenizer)
         self._enabled = True

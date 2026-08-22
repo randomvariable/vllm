@@ -434,7 +434,115 @@ sampling_params = SamplingParams(
 )
 ```
 
-## Automatic `enable_thinking` Activation
+## Overthinking-Marker Penalty
+
+Post-training-quantized reasoning models over-sample leading-space branch-opening
+tokens (`_wait`, `_But`, `_alternatively`, ...) at high-entropy decoding
+positions, opening redundant reasoning branches that replace already-reached
+correct conclusions. The overthinking-marker penalty ("Quantized Reasoning
+Models Think They Need to Think Longer, but They Do Not",
+[arXiv 2606.00206](https://arxiv.org/abs/2606.00206)) suppresses this by
+subtracting a fixed logit penalty from a curated marker set at every
+reasoning-phase decode position.
+
+One per-request sampling parameter configures it:
+
+- `reasoning_marker_penalty` (float) — the fixed logit penalty `lambda`
+  subtracted from marker-token logits. `None` and `0.0` disable it; a finite
+  value in `[0, 10]` is required otherwise.
+
+The marker set is model/tokenizer-derived: the canonical 50-marker lexical
+list from the paper's Appendix C is tokenized at model load, keeping only
+leading-space variants that resolve to exactly one token, and rejecting tokens
+whose ID collides with a bare high-frequency function word (so an article or
+connective is never penalized when it appears in ordinary prose). Unresolved,
+multi-token, and collision items are logged once at init. If the active
+tokenizer resolves no markers, the feature fails closed — any request that
+enables it is rejected.
+
+### Policy
+
+The penalty applies only while the request is inside its reasoning block: from
+the reasoning start marker until the natural end marker has fully completed.
+It is never applied to answer-phase output, to non-reasoning models, or to a
+row whose thinking budget is already exhausted (i.e. one being force-driven
+toward the reasoning end marker). It does not require a thinking token budget:
+a request may enable the marker penalty without one. With speculative
+decoding, the reasoning phase is derived per draft position by conditioning on
+the committed tokens plus the draft prefix, so acceptance outcomes are
+indistinguishable from sequential application at every accepted prefix.
+
+### Runners and limitations
+
+The marker penalty is applied by the V2 model runner's sampler between
+thinking-budget forcing and ReSET, on the same post-processing logits ReSET
+observes. This is intentional but carries a coupling: subtracting mass from
+~50 tokens lowers the entropy ReSET measures, biasing it toward `temperature_low`.
+The two mechanisms are *additive in mechanism* but *coupled in outcome* — they
+must be calibrated as a single stack (the resolved marker set is part of the
+calibration key), never read as two independent knobs.
+
+### Online Serving
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      { "role": "user", "content": "9.11 and 9.8, which is greater?" }
+    ],
+    "temperature": 1.0,
+    "temperature_low": 0.1,
+    "temperature_high": 1.0,
+    "entropy_threshold": 0.5505,
+    "reasoning_marker_penalty": 2.0
+  }'
+```
+
+### Offline Inference
+
+```python
+sampling_params = SamplingParams(
+    temperature=1.0,
+    temperature_low=0.1,
+    temperature_high=1.0,
+    entropy_threshold=0.5505,
+    reasoning_marker_penalty=2.0,
+)
+```
+
+## Monitor-Only MGT-B Telemetry
+
+MGT-B telemetry measures whether a reasoning trajectory is entering a
+repetitive, overconfident loop. It is strictly opt in and does not change
+sampling or stop behavior. Enable it per request:
+
+```python
+sampling_params = SamplingParams(
+    reasoning_monitor=True,
+)
+```
+
+The scheduler keeps a 64-token window with a 32-token stride and records
+entropy, chosen-token log probability, generated-suffix n-gram repetition,
+confidence increase on repeated n-grams, and local entropy change. It applies
+the calibrated upper-tail recurrence and refractory alarm rule to committed
+tokens only. Alarm state is monitor telemetry; Phase B does not feed it back
+into sampling.
+
+Plain decode captures one observation per committed token. Non-adaptive
+speculative decoding captures the accepted prefix; adaptive speculative
+decoding and chunked-prefill batches omit observations when row alignment is
+not provable. This keeps speculative acceptance unchanged. Requests with
+`reasoning_monitor=False` take the existing sampler path without entropy
+reductions or an extra forward pass.
+
+An optional immutable MGT-B JSON artifact can be supplied through
+`VllmConfig.reasoning_monitor_calibration_path`. vLLM derives a key from model
+and tokenizer revisions, quantization, and the active sampling/reasoning
+control stack. Missing, malformed, or key-mismatched artifacts fail closed to
+telemetry-only fallback defaults; they never enable an intervention.
 
 Some models (such as Gemma 4, DeepSeek-V4-Pro and IBM Granite 3.2) require `enable_thinking: true` in their chat template kwargs to activate thinking mode — without it, reasoning tokens are never generated regardless of other settings.
 

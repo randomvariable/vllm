@@ -10,6 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required for sampler flag tests", allow_module_level=True)
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.ops.reset import reset_entropy
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -21,6 +22,7 @@ class MockReasoningConfig:
     reasoning_start_token_ids = [90]
     reasoning_end_token_ids = [91]
     natural_reasoning_end_token_ids = [91]
+    marker_token_ids: list[int] = []
 
 
 def _make_sampler() -> Sampler:
@@ -88,3 +90,46 @@ def test_logits_processing_cache_only_checks_active_requests():
 
     assert not np.any(sampler.needs_logits_processing[sampling_only])
     assert np.any(sampler.needs_logits_processing[with_processing])
+
+
+def test_sample_keeps_control_logits_untruncated_for_monitor():
+    """Monitor observables must not see top-k/top-p -inf masking.
+
+    apply_top_k_top_p mutates its input in place; if control_logits aliases
+    the sampling tensor, entropy_post and the chosen-token logprob come from
+    the truncated distribution instead of the full control stack.
+    """
+    sampler = _make_sampler()
+    sampler.add_request(
+        0,
+        prompt_len=1,
+        sampling_params=SamplingParams(
+            temperature=1.0, top_k=5, reasoning_monitor=True
+        ),
+    )
+    sampler.apply_staged_writes()
+    # Pin the native path: the in-place aliasing hazard is in
+    # apply_top_k_top_p, not the flashinfer sampler.
+    sampler.use_flashinfer = False
+
+    logits = torch.randn(1, VOCAB_SIZE, device=DEVICE)
+    idx_mapping_np = np.array([0], dtype=np.int32)
+    idx_mapping = torch.from_numpy(idx_mapping_np).to(DEVICE)
+    zeros = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+
+    _, processed_logits, control_logits = sampler.sample(
+        logits,
+        expanded_idx_mapping=idx_mapping,
+        idx_mapping=idx_mapping,
+        idx_mapping_np=idx_mapping_np,
+        pos=zeros,
+        input_ids=zeros,
+        expanded_local_pos=zeros,
+    )
+
+    # Truncation ran on the sampling tensor.
+    assert torch.isneginf(processed_logits).sum().item() == VOCAB_SIZE - 5
+    # The control stack keeps full support, so entropy_post is the entropy
+    # of the untruncated logits, not of the truncated distribution.
+    assert torch.isfinite(control_logits).all()
+    assert torch.equal(reset_entropy(control_logits), reset_entropy(logits.float()))

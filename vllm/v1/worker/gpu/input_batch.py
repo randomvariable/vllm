@@ -147,7 +147,9 @@ class InputBatch:
             # too; attention metadata is built from the promised max_query_len.
             base_tokens = num_tokens // num_reqs
             num_extra = num_tokens % num_reqs
-            assert max_query_len is None or base_tokens + (num_extra > 0) <= max_query_len
+            assert (
+                max_query_len is None or base_tokens + (num_extra > 0) <= max_query_len
+            )
             num_scheduled_tokens = np.full(num_reqs, base_tokens, dtype=np.int32)
             if num_extra > 0:
                 num_scheduled_tokens[-num_extra:] += 1
