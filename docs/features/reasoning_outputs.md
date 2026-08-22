@@ -386,10 +386,12 @@ low). Its effect on unquantized weights is not characterised by the paper.
 
 ReSET is applied by a batched logits processor on the V1 model runner and by an
 equivalent on-device step in the V2 model runner's sampler; both produce the
-same decisions. It is **not** supported together with speculative decoding: the
-per-token temperature depends on the previous token's sampled entropy, which a
-speculator cannot resolve ahead over draft positions, so the combination is
-rejected at request admission rather than silently applying a wrong policy.
+same decisions. With speculative decoding, the V2 runner resolves each draft
+position's temperature from the target distribution at that position and
+commits the running state for exactly the accepted prefix plus the recovered
+token, so acceptance outcomes are indistinguishable from sequential ReSET; the
+V1 sampler cannot do this, so the combination is rejected at request admission
+there rather than silently applying a wrong policy.
 
 ### Validation
 

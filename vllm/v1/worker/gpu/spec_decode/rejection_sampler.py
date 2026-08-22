@@ -163,11 +163,21 @@ class RejectionSampler:
         draft_sampled: torch.Tensor,
         pos: torch.Tensor,
         cu_num_logits: torch.Tensor,
+        cu_num_logits_np: np.ndarray,
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Host-side chain-length bound for the ReSET scan. Under adaptive
+        # verification the numpy mirror holds the pre-compacted layout, an
+        # over-estimate, which the scan masks off per position.
+        if self.enable_adaptive_verification:
+            max_chain = self.num_speculative_steps + 1
+        else:
+            max_chain = (
+                int(np.diff(cu_num_logits_np).max()) if cu_num_logits_np.size > 1 else 0
+            )
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -176,6 +186,8 @@ class RejectionSampler:
             pos,
             draft_sampled,
             expanded_local_pos,
+            cu_num_logits=cu_num_logits,
+            max_chain=max_chain,
         )
         sampled, num_sampled = rejection_sample(
             processed_logits,
@@ -193,6 +205,8 @@ class RejectionSampler:
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
         )
+        # Commit the ReSET running state for exactly the committed prefix.
+        self.sampler.sampling_states.commit_reset_spec(num_sampled)
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -235,6 +249,7 @@ class RejectionSampler:
                 draft_sampled[lo:hi],
                 pos[lo:hi],
                 chunk_cu_num_logits,
+                chunk_cu_num_logits_np,
                 input_batch.idx_mapping[start:end],
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],

@@ -66,6 +66,9 @@ class SamplingStates:
         self._reset_model_config: Any = None
         self._reset_nl_lut: torch.Tensor | None = None
         self._reset_dnl_lut: torch.Tensor | None = None
+        # Deferred ReSET chain-scan snapshots under speculative decoding,
+        # committed by `commit_reset_spec` once acceptance is known.
+        self._reset_pending: Any = None
 
         # Initialize top_k and top_p manually because 0 is an invalid value for them.
         self.top_k.np.fill(self.vocab_size)
@@ -102,6 +105,8 @@ class SamplingStates:
         elif num_logprobs == -1:
             num_logprobs = self.vocab_size
         self.num_logprobs[req_idx] = num_logprobs
+
+        self._add_temperature_schedule(req_idx, sampling_params)
 
     def bind_reasoning_state(
         self,
@@ -209,14 +214,21 @@ class SamplingStates:
         logits: torch.Tensor,
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
+        cu_num_logits: torch.Tensor | None = None,
+        max_chain: int = 0,
     ) -> None:
         """Apply the ReSET entropy-threshold temperature to ReSET rows.
 
         Resolves each ReSET row's temperature from the shared on-device core
         and scales those logits rows in place, before the static temperature
         divide (which is a no-op for ReSET rows, whose ``temperature`` is 1.0).
-        ReSET requests are admitted only without speculative decoding, so the
-        logits rows map one-to-one to requests via ``idx_mapping``.
+
+        Without speculative decoding the logits rows map one-to-one to
+        requests via ``idx_mapping`` and state advances immediately. With
+        speculative decoding (``cu_num_logits`` given) each request owns a
+        chain of draft-position rows; `resolve_reset_speculative` resolves the
+        per-position temperatures and defers the running-state commit to
+        `commit_reset_spec`, which must be called once acceptance is known.
         """
         if self.reset_state is None:
             return
@@ -226,6 +238,7 @@ class SamplingStates:
         from vllm.v1.sample.ops.reset import resolve_reset
 
         self._ensure_reset_luts(logits.device)
+        assert self._reset_nl_lut is not None and self._reset_dnl_lut is not None
         rows = torch.from_numpy(np.nonzero(mask)[0]).to(logits.device, torch.int64)
         req_idx = idx_mapping[rows].to(torch.int64)
         rs = self._req_states
@@ -234,16 +247,62 @@ class SamplingStates:
         gen_step = total_len - prompt_len
         last_token = rs.last_sampled_tokens[req_idx, 0].to(torch.int64)
         sub = self.reset_state.index_select(req_idx)
-        temperature = resolve_reset(
-            logits[rows],
+        if cu_num_logits is None:
+            temperature = resolve_reset(
+                logits[rows],
+                last_token,
+                gen_step,
+                self._reset_nl_lut,
+                self._reset_dnl_lut,
+                sub,
+            )
+            sub.scatter_into(self.reset_state, req_idx)
+            logits[rows] = logits[rows] / temperature.unsqueeze(-1)
+            return
+
+        from vllm.v1.sample.ops.reset import resolve_reset_speculative
+
+        base_rows = cu_num_logits[rows].to(torch.int64)
+        chain_lens = (cu_num_logits[1:] - cu_num_logits[:-1])[rows].to(torch.int64)
+        draft_ids = rs.draft_tokens[req_idx]
+        snapshots = resolve_reset_speculative(
+            logits,
+            base_rows,
+            chain_lens,
             last_token,
+            draft_ids,
             gen_step,
             self._reset_nl_lut,
             self._reset_dnl_lut,
             sub,
+            max_chain,
         )
-        sub.scatter_into(self.reset_state, req_idx)
-        logits[rows] = logits[rows] / temperature.unsqueeze(-1)
+        self._reset_pending = (req_idx, rows, snapshots)
+
+    def commit_reset_spec(self, num_sampled: torch.Tensor) -> None:
+        """Commit the ReSET chain-scan state matching the acceptance outcome.
+
+        ``num_sampled[r]`` committed tokens means chain positions ``0..
+        num_sampled[r]-1`` were realized, so the snapshot at index
+        ``num_sampled[r] - 1`` is the state sequential ReSET would hold. Runs
+        after the rejection sampler, on device, with no host sync. A request
+        that committed nothing keeps its pre-step state.
+        """
+        pending = self._reset_pending
+        if pending is None:
+            return
+        self._reset_pending = None
+        req_idx, batch_pos, snapshots = pending
+        committed = num_sampled[batch_pos]
+        snap_idx = (committed - 1).clamp(min=0).to(torch.int64)
+        rows_arange = torch.arange(req_idx.shape[0], device=req_idx.device)
+        for name in snapshots[0]:
+            stacked = torch.stack([snap[name] for snap in snapshots])
+            chosen = stacked[snap_idx, rows_arange]
+            owner = getattr(self.reset_state, name)
+            current = owner[req_idx]
+            keep = (committed > 0).view(-1, *([1] * (chosen.ndim - 1)))
+            owner.index_copy_(0, req_idx, torch.where(keep, chosen, current))
 
     def apply_staged_writes(self) -> None:
         self.temperature.copy_to_uva()
