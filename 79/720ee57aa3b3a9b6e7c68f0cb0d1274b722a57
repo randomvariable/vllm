@@ -1,0 +1,60 @@
+docs/features/reasoning_outputs.md
+  h_15da545fc8cfbe 437-545
+tests/v1/core/test_scheduler.py
+  h_15da545fc8cfbe 125-149
+tests/v1/sample/test_marker_penalty.py
+  h_15da545fc8cfbe 1-311
+tests/v1/sample/test_mgtb_monitor.py
+  h_15da545fc8cfbe 1-263
+tests/v1/worker/test_gpu_sampler_flags.py
+  h_15da545fc8cfbe 13,25,93-135
+uv.lock
+  h_15da545fc8cfbe 28-32,899,901,928,1013-1014,1151,1156-1173,1183-1185,1211,1213,1260,1262,1285-1287,1630-1631,1633,1638-1639,1648-1650,1661,1845-1846,1848,1861-1863,2093-2095,2342,2355,2357,2376-2378,2396-2399,2534,2539,2922-2951,2967,3058-3059,3167-3169,3196-3198,3254-3255,3257,3519-3521,3542,3547,3549,3555,3574,3576,3611-3613,3646,3651-3706,3712,3723-3797,3803,3814-3886,3892,3894,3897-3898,3904,3906-3908,3927-3928,3950,3967-3969,3975,3987,4004-4006,4012,4024,4029-4030,4064,4066-4067,4072,4079,4084,4088-4090,4097-4108,4113,4117-4119,4125,4130,4134-4136,4143-4154,4159,4163-4165,4172-4183,4191-4192,4211,4213-4214,4230,4232-4233,4322-4324,4529,4608-4609,4670-4737,6208-6210,6313,6376-6377,6425,6487,6572-6573,6626-6628,6861-6863,6883-6885,6949,6953,6955,6975-6977,7066-7068,7207-7208,7346-7348,7397-7399,7416,7418-7429,7459-7460,7462,7595-7597,7682,7725,7727,7787,8285-8287,8615-8617
+vllm/config/reasoning.py
+  h_15da545fc8cfbe 10,44-50,61-67,90,141
+vllm/config/vllm.py
+  h_15da545fc8cfbe 454-457,1872-1879
+vllm/models/deepseek_v4/common/ops/cache_utils.py
+  h_15da545fc8cfbe 57,211,246,249,252,368,464,505,744,834,911,1035
+vllm/sampling_params.py
+  h_15da545fc8cfbe 30,200-228,253-256,588-618,647-648,717-718,764-766
+vllm/v1/core/sched/mgtb_monitor.py
+  h_15da545fc8cfbe 1-434
+vllm/v1/core/sched/scheduler.py
+  h_15da545fc8cfbe 42-47,189-205,1894,1940-1943,1950-1974,1990-1991,2436-2458,2478-2485,2573
+vllm/v1/engine/input_processor.py
+  h_15da545fc8cfbe 132-156
+vllm/v1/outputs.py
+  h_15da545fc8cfbe 23,280-282,371-376
+vllm/v1/request.py
+  h_15da545fc8cfbe 30,194
+vllm/v1/sample/marker_data.py
+  h_15da545fc8cfbe 1-215
+vllm/v1/worker/gpu/async_utils.py
+  h_15da545fc8cfbe 212-221
+vllm/v1/worker/gpu/input_batch.py
+  h_15da545fc8cfbe 150-152
+vllm/v1/worker/gpu/sample/marker_penalty.py
+  h_15da545fc8cfbe 1-465
+vllm/v1/worker/gpu/sample/output.py
+  h_15da545fc8cfbe 13,24
+vllm/v1/worker/gpu/sample/reasoning_monitor.py
+  h_15da545fc8cfbe 1-256
+vllm/v1/worker/gpu/sample/sampler.py
+  h_15da545fc8cfbe 27-29,32,64-80,106-107,119,133-134,159-161,207-224,236,293-306,348-351,379-380,390,410-416,426-427,430
+vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+  h_15da545fc8cfbe 12,21,173-178,188-191,193-224,241-251,254,265-270,288-296,304,329-331,335-340,354,376-385,395-400,408
+vllm/v1/worker/gpu_model_runner.py
+  h_15da545fc8cfbe 4957,4970-4980,5926
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "79720ee57aa3b3a9b6e7c68f0cb0d1274b722a57",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
