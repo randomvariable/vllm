@@ -1063,6 +1063,7 @@ class SamplingParams(
         speculative_config: SpeculativeConfig | None,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
+        spec_decode_supports_reset: bool = False,
     ) -> None:
         self._validate_logprobs(model_config)
         self._validate_logit_bias(model_config)
@@ -1070,7 +1071,7 @@ class SamplingParams(
         self._validate_stop_token_ids(model_config)
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(model_config)
-        self._validate_spec_decode(speculative_config)
+        self._validate_spec_decode(speculative_config, spec_decode_supports_reset)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
@@ -1279,6 +1280,7 @@ class SamplingParams(
     def _validate_spec_decode(
         self,
         speculative_config: SpeculativeConfig | None,
+        spec_decode_supports_reset: bool = False,
     ) -> None:
         if speculative_config is None:
             return
@@ -1290,16 +1292,20 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+        # The V2 model runner resolves ReSET per draft position in its
+        # rejection sampler; the V1 path still fails closed, and must reject
+        # here so the request fails with a 400 instead of killing the engine.
         if (
             self.has_temperature_schedule
             and speculative_config.num_speculative_tokens > 1
+            and not spec_decode_supports_reset
         ):
             raise VLLMValidationError(
                 "The ReSET entropy-threshold temperature policy (arXiv "
-                "2606.13233) is sequential per token and cannot be resolved "
-                "ahead over speculative draft positions; it is not supported "
-                "with speculative decoding. Disable speculative decoding for "
-                "ReSET requests.",
+                "2606.13233) with speculative decoding requires the V2 model "
+                "runner; the V1 sampler cannot resolve per-draft-position "
+                "temperatures. Enable the V2 model runner or disable "
+                "speculative decoding for ReSET requests.",
                 parameter="temperature_low",
                 value=self.temperature_low,
             )

@@ -99,6 +99,7 @@ class InputProcessor:
                 self.speculative_config,
                 self.structured_outputs_config,
                 self.tokenizer,
+                spec_decode_supports_reset=self.vllm_config.use_v2_model_runner,
             )
 
             if self.model_config.return_sampling_mask:

@@ -9,7 +9,6 @@ import torch
 import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.config.reasoning import ReasoningConfig
-from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -82,16 +81,6 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
-        if self.num_speculative_tokens > 1 and sampling_params.has_temperature_schedule:
-            raise VLLMValidationError(
-                "The ReSET entropy-threshold temperature policy (arXiv "
-                "2606.13233) is sequential per token and cannot be resolved "
-                "ahead over speculative draft positions; it is not supported "
-                "with speculative decoding. Disable speculative decoding for "
-                "ReSET requests.",
-                parameter="temperature_low",
-                value=sampling_params.temperature_low,
-            )
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -238,6 +227,8 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
+        cu_num_logits: torch.Tensor | None = None,
+        max_chain: int = 0,
     ) -> torch.Tensor:
         if not self._requires_logits_processing(idx_mapping_np):
             return logits
@@ -281,8 +272,12 @@ class Sampler:
 
         # Apply the ReSET entropy-threshold temperature (arXiv 2606.13233) to
         # ReSET rows before the static divide. ReSET rows carry temperature
-        # 1.0, so `apply_temperature` below is a no-op for them.
-        self.sampling_states.apply_reset(logits, idx_mapping, idx_mapping_np)
+        # 1.0, so `apply_temperature` below is a no-op for them. Under
+        # speculative decoding the chain scan resolves each draft position's
+        # temperature and defers the state commit to the rejection sampler.
+        self.sampling_states.apply_reset(
+            logits, idx_mapping, idx_mapping_np, cu_num_logits, max_chain
+        )
 
         # Apply temperature in place. The kernel resolves the per-row step,
         # anneal progress and reasoning phase itself, reading the marker cache

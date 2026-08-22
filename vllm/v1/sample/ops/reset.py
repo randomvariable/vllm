@@ -117,6 +117,10 @@ class ResetState:
     def _names(self) -> tuple[str, ...]:
         return tuple(f.name for f in fields(self))
 
+    def clone_running(self) -> dict[str, torch.Tensor]:
+        """Snapshot the running-state fields (a copy) for deferred commit."""
+        return {name: getattr(self, name).clone() for name in _RUNNING_FIELDS}
+
     def narrow(self, num_rows: int) -> ResetState:
         """View of the first ``num_rows`` rows; advances write back in place."""
         return ResetState(**{n: getattr(self, n)[:num_rows] for n in self._names()})
@@ -131,17 +135,22 @@ class ResetState:
 
     def scatter_into(self, owner: ResetState, rows: torch.Tensor) -> None:
         """Write this view's running state back into ``owner`` at ``rows``."""
-        for name in (
-            "global_sum",
-            "global_n",
-            "sw_ring",
-            "sw_pos",
-            "sw_count",
-            "step_sum",
-            "step_len",
-            "prev_was_nl",
-        ):
+        for name in _RUNNING_FIELDS:
             getattr(owner, name).index_copy_(0, rows, getattr(self, name))
+
+
+# Running-state fields advanced per committed token; config fields are
+# immutable per request and never snapshotted or scattered.
+_RUNNING_FIELDS = (
+    "global_sum",
+    "global_n",
+    "sw_ring",
+    "sw_pos",
+    "sw_count",
+    "step_sum",
+    "step_len",
+    "prev_was_nl",
+)
 
 
 def resolve_reset(
@@ -236,6 +245,89 @@ def resolve_reset(
     )
 
     return temperature
+
+
+def resolve_reset_speculative(
+    logits: torch.Tensor,
+    base_rows: torch.Tensor,
+    chain_lens: torch.Tensor,
+    last_committed: torch.Tensor,
+    draft_ids: torch.Tensor,
+    base_gen_step: torch.Tensor,
+    nl_lut: torch.Tensor,
+    dnl_lut: torch.Tensor,
+    state: ResetState,
+    max_chain: int,
+) -> list[dict[str, torch.Tensor]]:
+    """Resolve ReSET temperatures across speculative draft chains, in place.
+
+    Rejection sampling commits a prefix of each request's draft chain, so the
+    temperature at chain position ``j`` must be what sequential ReSET would
+    resolve after generating exactly the draft prefix: the target logits row
+    at position ``j`` is conditioned on draft tokens ``0..j-1``, which *are*
+    the committed tokens wherever the walk reaches ``j``. The per-position
+    inputs are therefore all known before acceptance:
+
+    * ``last_token`` at position ``j`` is the previously committed token
+      (``j == 0``) or draft token ``j - 1``;
+    * ``gen_step`` at position ``j`` is the committed count plus ``j``;
+    * the entropy folded into the running state is a property of the target
+      distribution at ``j``, not of which token gets sampled there.
+
+    The one thing acceptance decides is where the chain stops, so this scans
+    the chain with `resolve_reset`, scales each row by its position's
+    temperature in place, and returns a per-position snapshot of the running
+    state. The caller commits snapshot ``num_sampled - 1`` once the rejection
+    sampler reports how many tokens were actually committed; entropy
+    bookkeeping for positions past the stop point is dropped with the rest of
+    the snapshot list.
+
+    Args:
+        logits: ``[num_rows, vocab]`` processed logits for the whole
+            verification batch; rows of ReSET requests are scaled in place.
+        base_rows: ``[R]`` row index of each ReSET request's chain position 0.
+        chain_lens: ``[R]`` number of logits rows in each request's chain.
+        last_committed: ``[R]`` each request's most recent committed token.
+            Ignored where ``base_gen_step == 0``.
+        draft_ids: ``[R, D]`` proposed draft token ids per request.
+        base_gen_step: ``[R]`` committed generated-token count before this
+            step.
+        nl_lut: ``[vocab]`` bool, true for single-newline token ids.
+        dnl_lut: ``[vocab]`` bool, true for double-newline token ids.
+        state: Working `ResetState` for the ``R`` ReSET rows; advanced in
+            place and left positioned after the full chain (the caller uses
+            the snapshots, not this end state).
+        max_chain: Host-side upper bound on chain length (the loop bound).
+
+    Returns:
+        ``max_chain`` snapshots; entry ``j`` is the running state after
+        processing chain position ``j``.
+    """
+    base_enabled = (state.enabled != 0).to(state.enabled.dtype)
+    zero = torch.zeros((), dtype=state.enabled.dtype, device=logits.device)
+    snapshots: list[dict[str, torch.Tensor]] = []
+    for j in range(max_chain):
+        active = (base_enabled != 0) & (j < chain_lens)
+        state.enabled.copy_(torch.where(active, base_enabled, zero))
+        # Rows past a request's chain end clamp to its own position-0 row;
+        # their temperature resolves to the (1.0) base, an exact no-op divide.
+        rows_j = torch.where(active, base_rows + j, base_rows)
+        if j == 0:
+            last_tok_j = last_committed
+        else:
+            last_tok_j = draft_ids[:, min(j - 1, draft_ids.shape[1] - 1)]
+        temperature = resolve_reset(
+            logits[rows_j],
+            last_tok_j,
+            base_gen_step + j,
+            nl_lut,
+            dnl_lut,
+            state,
+        )
+        logits[rows_j] = logits[rows_j] / temperature.unsqueeze(-1)
+        snapshots.append(state.clone_running())
+    state.enabled.copy_(base_enabled)
+    return snapshots
 
 
 def make_reset_state(max_num_reqs: int, device: torch.device) -> ResetState:
