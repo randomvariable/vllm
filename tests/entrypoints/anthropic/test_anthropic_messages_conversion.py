@@ -1613,6 +1613,55 @@ class TestStopSequenceReason:
 
 
 # ======================================================================
+# ReSET control pass-through
+# ======================================================================
+
+
+class TestResetControls:
+    def test_reset_controls_passed_through(self):
+        """ReSET knobs on the Anthropic request reach the converted
+        ChatCompletionRequest, so /v1/messages callers can drive the
+        entropy-adaptive temperature schedule."""
+        request = _make_request(
+            [{"role": "user", "content": "Hello"}],
+            temperature_low=0.1,
+            temperature_high=1.0,
+            entropy_threshold=0.6349,
+            reset_window=32,
+        )
+        result = _convert(request)
+        assert result.temperature_low == 0.1
+        assert result.temperature_high == 1.0
+        assert result.entropy_threshold == 0.6349
+        assert result.reset_window == 32
+
+    def test_reset_window_alone_activates_schedule(self):
+        """A single knob is enough to activate ReSET; the remaining bounds
+        fall back to the engine defaults."""
+        request = _make_request(
+            [{"role": "user", "content": "Hello"}],
+            reset_window=32,
+        )
+        result = _convert(request)
+        assert result.reset_window == 32
+        assert result.to_sampling_params(
+            max_tokens=128, default_sampling_params={}
+        ).has_temperature_schedule
+
+    def test_reset_controls_default_to_none(self):
+        """Omitting the knobs leaves ReSET inactive (unchanged behavior)."""
+        request = _make_request([{"role": "user", "content": "Hello"}])
+        result = _convert(request)
+        assert result.temperature_low is None
+        assert result.temperature_high is None
+        assert result.entropy_threshold is None
+        assert result.reset_window is None
+        assert not result.to_sampling_params(
+            max_tokens=128, default_sampling_params={}
+        ).has_temperature_schedule
+
+
+# ======================================================================
 # Client-caused errors are 4xx, not 500 (Issue #52088)
 # ======================================================================
 

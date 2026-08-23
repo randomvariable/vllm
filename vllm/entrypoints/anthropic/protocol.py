@@ -174,6 +174,26 @@ class AnthropicMessagesRequest(BaseModel):
             "Will be accessible by the template."
         ),
     )
+    temperature_low: float | None = Field(
+        default=None,
+        description=(
+            "ReSET lower temperature bound, applied to low-entropy tokens. "
+            "Setting any ReSET field activates the schedule, which requires "
+            "`temperature` to be 1.0 or unset."
+        ),
+    )
+    temperature_high: float | None = Field(
+        default=None,
+        description="ReSET upper temperature bound, applied to high-entropy tokens.",
+    )
+    entropy_threshold: float | None = Field(
+        default=None,
+        description="ReSET entropy threshold separating the two temperature regimes.",
+    )
+    reset_window: int | None = Field(
+        default=None,
+        description="ReSET rolling-entropy window length, in tokens.",
+    )
 
     @field_validator("model")
     @classmethod

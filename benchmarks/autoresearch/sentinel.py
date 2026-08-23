@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Sentinel driver for nvfp4 KV-cache recovery via reasoning controls.
 
 Runs a builtin bench profile sequentially against a served endpoint and reports
@@ -41,10 +44,11 @@ def build_request(args, prompt: str, index: int = 0) -> dict:
     body: dict = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": args.temperature,
         "stream": False,
         "seed": args.seed_base + index,
     }
+    if not args.omit_temperature:
+        body["temperature"] = args.temperature
     if args.max_tokens > 0:
         body["max_completion_tokens"] = args.max_tokens
     if args.top_p is not None:
@@ -68,14 +72,12 @@ def build_request(args, prompt: str, index: int = 0) -> dict:
     return body
 
 
-def post(url: str, body: dict, timeout: float) -> dict:
+def post(url: str, body: dict, timeout: float, auth: str = "") -> dict:
     payload = json.dumps(body).encode()
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = f"Bearer {auth}"
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
@@ -84,7 +86,7 @@ def run_trial(args, prompt: str, profile: dict, bench, index: int) -> dict:
     url = args.endpoint.rstrip("/") + "/v1/chat/completions"
     started = time.monotonic()
     try:
-        raw = post(url, build_request(args, prompt, index), args.timeout)
+        raw = post(url, build_request(args, prompt, index), args.timeout, args.auth)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
         return {
@@ -145,6 +147,13 @@ def main() -> int:
     ap.add_argument(
         "--temperature", type=float, default=float(env("TEMPERATURE", "1.0"))
     )
+    ap.add_argument(
+        "--omit-temperature",
+        action="store_true",
+        default=env("OMIT_TEMPERATURE") == "1",
+        help="Send no temperature field, exercising the server/proxy default path",
+    )
+    ap.add_argument("--auth", default=env("AUTH", ""), help="Bearer token")
     ap.add_argument("--top-p", type=float, default=_optional_float("TOP_P"))
     ap.add_argument("--top-k", type=int, default=_optional_int("TOP_K"))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", "60000")))
@@ -153,9 +162,7 @@ def main() -> int:
     ap.add_argument(
         "--marker-penalty", type=float, default=_optional_float("MARKER_PENALTY")
     )
-    ap.add_argument(
-        "--monitor", action="store_true", default=env("MONITOR") == "1"
-    )
+    ap.add_argument("--monitor", action="store_true", default=env("MONITOR") == "1")
     ap.add_argument("--extra", default=env("EXTRA", ""), help="JSON of fork controls")
     ap.add_argument("--label", default=os.environ.get("LABEL", "run"))
     ap.add_argument("--jsonl", default=os.environ.get("JSONL", ""))
