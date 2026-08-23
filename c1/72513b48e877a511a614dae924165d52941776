@@ -1,0 +1,26 @@
+tests/v1/core/test_kv_cache_utils.py
+  h_15da545fc8cfbe 2751
+vllm/model_executor/layers/attention/mla_attention.py
+  h_15da545fc8cfbe 2069-2071
+vllm/v1/attention/backends/flashinfer.py
+  h_15da545fc8cfbe 1452-1465
+vllm/v1/kv_cache_interface.py
+  h_15da545fc8cfbe 1170-1172
+vllm/v1/worker/gpu/attn_utils.py
+  h_15da545fc8cfbe 3,5,11,15,39-40
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 85
+vllm/v1/worker/gpu/sample/gumbel.py
+  h_15da545fc8cfbe 17-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "c172513b48e877a511a614dae924165d52941776",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
