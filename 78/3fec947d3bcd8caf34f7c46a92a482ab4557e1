@@ -1,0 +1,18 @@
+tests/entrypoints/openai/chat_completion/test_reasoning_marker_penalty.py
+  h_15da545fc8cfbe 1-69
+vllm/entrypoints/openai/chat_completion/protocol.py
+  h_15da545fc8cfbe 49,306-322,814-815
+vllm/entrypoints/openai/completion/protocol.py
+  h_15da545fc8cfbe 32,297-313,472-473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "783fec947d3bcd8caf34f7c46a92a482ab4557e1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

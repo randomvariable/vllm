@@ -1,0 +1,16 @@
+tests/v1/spec_decode/test_logprobs_adaptive_verification.py
+  h_15da545fc8cfbe 14-15,17,34-63
+vllm/sampling_params.py
+  h_15da545fc8cfbe 1262-1275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "07dee2651751a3d91b2c2e7f9d026afd8a439822",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

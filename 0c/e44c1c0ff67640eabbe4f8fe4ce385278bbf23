@@ -1,0 +1,14 @@
+docs/features/reasoning_outputs.md
+  h_15da545fc8cfbe 527-542
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "0ce44c1c0ff67640eabbe4f8fe4ce385278bbf23",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}

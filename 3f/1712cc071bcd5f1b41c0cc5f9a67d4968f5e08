@@ -1,0 +1,16 @@
+autoresearch.sh
+  h_15da545fc8cfbe 21-22
+benchmarks/autoresearch/aggregate.py
+  h_15da545fc8cfbe 8-18,50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "3f1712cc071bcd5f1b41c0cc5f9a67d4968f5e08",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
