@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import math
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ from vllm.v1.core.sched.mgtb_monitor import (
     MGTBRequestState,
     build_mgtb_calibration_key,
 )
+from vllm.v1.sample.ops.reset import reset_entropy
 from vllm.v1.worker.gpu.sample.reasoning_monitor import ReasoningMonitor
 
 
@@ -261,3 +263,47 @@ def test_capture_records_plain_decode_observation(monkeypatch) -> None:
     assert len(observations[0]) == 1
     assert observations[0][0].token_id == 1
     assert observations[0][0].position == 7
+
+
+def test_reset_entropy_upcasts_reduced_precision() -> None:
+    entropy = reset_entropy(torch.zeros(2, 8, dtype=torch.bfloat16))
+    assert entropy.dtype is torch.float32
+    assert torch.allclose(entropy, torch.full((2,), math.log(8.0)), atol=1e-3)
+
+
+def test_capture_spec_accepts_bfloat16_logits(monkeypatch) -> None:
+    """Model logits are bfloat16 on the serving path.
+
+    ``numpy`` has no bfloat16 dtype, so an un-upcast observable raises
+    ``TypeError: Got unsupported ScalarType BFloat16`` inside the sampler and
+    kills EngineCore for every request that enables the monitor. ``reset_entropy``
+    stays real here because it is the primitive that produced the crash; only the
+    Triton logprob kernel is stubbed, and it returns bfloat16 so the conversion
+    guard on the chosen-token logprob is exercised too.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.sample.logprob.compute_token_logprobs",
+        lambda logits, token_ids: torch.log_softmax(logits.float(), dim=-1)
+        .gather(1, token_ids)
+        .to(torch.bfloat16),
+    )
+    monitor = ReasoningMonitor.__new__(ReasoningMonitor)
+    monitor._monitor_enabled = cast(Any, np.array([True], dtype=bool))
+
+    observations = monitor.capture_spec(
+        raw_logits=torch.tensor([[4.0, 0.0, 0.0, 0.0]], dtype=torch.bfloat16),
+        control_logits=torch.tensor([[2.0, 0.0, 0.0, 0.0]], dtype=torch.bfloat16),
+        sampled_token_ids=torch.tensor([[0]], dtype=torch.long),
+        committed_counts=np.array([1], dtype=np.int64),
+        positions=torch.tensor([7], dtype=torch.int32),
+        cu_num_logits=np.array([0, 1], dtype=np.int64),
+        request_indices=np.array([0], dtype=np.int64),
+    )
+
+    observation = observations[0][0]
+    assert math.isfinite(observation.entropy_pre)
+    assert observation.entropy_pre > 0.0
+    assert math.isfinite(observation.entropy_post)
+    assert math.isfinite(observation.logprob)
+    assert observation.logprob < 0.0
+    assert observation.position == 7

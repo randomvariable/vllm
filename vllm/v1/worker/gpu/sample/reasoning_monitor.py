@@ -236,6 +236,7 @@ class ReasoningMonitor:
             compute_token_logprobs(
                 control_logits.index_select(0, rows_tensor), tokens_tensor[:, None]
             )[:, 0]
+            .float()
             .detach()
             .cpu()
             .numpy()
