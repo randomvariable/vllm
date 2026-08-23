@@ -1,0 +1,16 @@
+tests/config/test_nvfp4_kv_cache_mla.py
+  h_15da545fc8cfbe 1-61
+vllm/config/vllm.py
+  h_15da545fc8cfbe 2603-2607,2613-2614
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "b2c0fd0611f148bc0e997c4ccea549a2eab616e2",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
