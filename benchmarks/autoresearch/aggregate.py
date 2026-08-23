@@ -5,10 +5,17 @@ Objective ordering is fixed by the campaign: correctness first, then wall
 time, then token burn. That is encoded lexicographically in ``score``:
 
 * any incorrect or errored trial pushes ``score`` above ``INCORRECT_FLOOR``,
-  scaled by how many trials were wrong, so no time/token win can ever buy
-  its way past a correctness regression;
-* an all-correct arm scores its total wall seconds, with total completion
-  tokens folded in at 1e-6 weight as a tiebreak only.
+  scaled by how many trials were wrong, so no cost win can ever buy its way
+  past a correctness regression;
+* an all-correct arm scores its total completion tokens.
+
+Tokens rather than seconds carry the cost term deliberately. Wall time on
+this deployment swings ~2x between identical seeded trials (pod contention,
+batch composition - DSv4 TP2 with the MTP drafter is not reproducible even
+at temperature 0), so seconds measure the cluster, not the arm. Decode
+throughput is roughly fixed, so completion tokens are the quantity an arm
+actually controls and they stand in for wall time with far less noise.
+Seconds stay reported as a secondary for inspection.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ def main(paths: list[str]) -> int:
     tokens_total = sum(int(r.get("tokens") or 0) for r in rows)
 
     if correct_frac >= 1.0:
-        score = seconds_total + 1e-6 * tokens_total
+        score = float(tokens_total)
     else:
         score = INCORRECT_FLOOR + (1.0 - correct_frac) * 1e6
 

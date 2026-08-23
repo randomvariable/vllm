@@ -18,8 +18,8 @@
 # (0..N-1), no network beyond the two local tunnels.
 #
 # Emits `METRIC score=` as the primary objective. score is lexicographic:
-# correctness dominates, then wall seconds, with completion tokens as a
-# 1e-6-weighted tiebreak.
+# correctness dominates (any wrong trial lands above 1e9), then total
+# completion tokens as the noise-robust stand-in for wall time.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
