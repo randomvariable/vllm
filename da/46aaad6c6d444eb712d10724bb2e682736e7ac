@@ -1,0 +1,20 @@
+benchmarks/autoresearch/sentinel.py
+  h_15da545fc8cfbe 2-4,50-51,75,77-80,89,150-156,165
+tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+  h_15da545fc8cfbe 1466-1514
+vllm/entrypoints/anthropic/protocol.py
+  h_15da545fc8cfbe 170-189
+vllm/entrypoints/anthropic/serving.py
+  h_15da545fc8cfbe 493-496
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "da46aaad6c6d444eb712d10724bb2e682736e7ac",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
