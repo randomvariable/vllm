@@ -1,0 +1,18 @@
+tests/v1/sample/test_mgtb_monitor.py
+  h_15da545fc8cfbe 5,20,266-309
+vllm/v1/sample/ops/reset.py
+  h_15da545fc8cfbe 67-69,72,74
+vllm/v1/worker/gpu/sample/reasoning_monitor.py
+  h_15da545fc8cfbe 239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "47d3a3ea89c172e83c8346c7e1799d2968a3dea2",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
