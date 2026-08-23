@@ -64,11 +64,14 @@ def reset_entropy(logits: torch.Tensor) -> torch.Tensor:
 
     Args:
         logits: ``[num_rows, vocab]`` logits, taken over the full vocabulary.
+            Reduced-precision inputs are upcast: ``bfloat16`` carries about
+            three decimal digits, which is not enough to accumulate a
+            vocabulary-wide sum, and ``numpy`` cannot represent it at all.
 
     Returns:
-        A ``[num_rows]`` float tensor of per-row entropies.
+        A ``[num_rows]`` float32 tensor of per-row entropies.
     """
-    probs = torch.softmax(logits, dim=-1)
+    probs = torch.softmax(logits.float(), dim=-1)
     return -(probs * probs.clamp_min(_PROB_EPS).log()).sum(dim=-1)
 
 
