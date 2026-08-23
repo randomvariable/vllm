@@ -1,0 +1,16 @@
+tests/distributed/test_dcp_a2a.py
+  h_15da545fc8cfbe 56,168,174,187,211,233,277,302,328,365,1150,1234,1318,1368
+vllm/v1/attention/ops/dcp.py
+  h_15da545fc8cfbe 905-907
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "4475e8d8f12386de2be2b8ee896afcaabadb2aa4",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
