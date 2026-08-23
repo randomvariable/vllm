@@ -524,6 +524,22 @@ sampling_params = SamplingParams(
 )
 ```
 
+Or over the OpenAI-compatible API, where it can be combined with the other
+reasoning controls on the same request:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      { "role": "user", "content": "9.11 and 9.8, which is greater?" }
+    ],
+    "reasoning_monitor": true,
+    "reasoning_marker_penalty": 2.0
+  }'
+```
+
 The scheduler keeps a 64-token window with a 32-token stride and records
 entropy, chosen-token log probability, generated-suffix n-gram repetition,
 confidence increase on repeated n-grams, and local entropy change. It applies
