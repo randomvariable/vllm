@@ -174,7 +174,8 @@ def main() -> int:
 
     print(
         f"# label={args.label} profile={name} runs={args.runs} "
-        f"effort={args.effort or '(server default)'} temp={args.temperature} "
+        f"effort={args.effort or '(server default)'} "
+        f"temp={'(omitted)' if args.omit_temperature else args.temperature} "
         f"top_p={args.top_p} marker_penalty={args.marker_penalty} "
         f"monitor={int(args.monitor)} max_tokens={args.max_tokens}",
         flush=True,
