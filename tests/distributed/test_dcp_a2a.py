@@ -53,7 +53,7 @@ def _packed_a2a_reference(
     h_per_rank: int,
     is_lse_base_on_e: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+    from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
     B, _H, D = cp_attn_out.shape
     outputs = (
@@ -165,13 +165,13 @@ class TestLSEWeightedCombine:
 
     def test_importable(self):
         """Verify _lse_weighted_combine is importable."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         assert callable(_lse_weighted_combine)
 
     def test_single_rank(self):
         """Single rank: output unchanged."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         # N=1, B=2, H=4, D=8
         outputs = torch.randn(1, 2, 4, 8)
@@ -184,7 +184,7 @@ class TestLSEWeightedCombine:
 
     def test_equal_lse(self):
         """Equal LSE values: outputs averaged equally."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         _N, B, H, D = 2, 1, 1, 4
         outputs = torch.tensor(
@@ -208,7 +208,7 @@ class TestLSEWeightedCombine:
 
     def test_dominant_rank(self):
         """Different LSE values: larger LSE gets more weight."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         B, H, D = 1, 1, 2
         outputs = torch.tensor(
@@ -230,7 +230,7 @@ class TestLSEWeightedCombine:
         torch.testing.assert_close(result, outputs[1], atol=1e-5, rtol=1e-5)
 
     def test_empty_shard_ignores_undefined_output(self):
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         outputs = torch.tensor([[[[float("nan")]]], [[[3.0]]]])
         lses = torch.tensor([[[-float("inf")]], [[0.0]]])
@@ -274,7 +274,7 @@ class TestLSEWeightedCombine:
 
     def test_mathematically_correct(self):
         """Verify mathematical correctness of LSE combination."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         outputs = torch.tensor(
             [
@@ -299,7 +299,7 @@ class TestLSEWeightedCombine:
 
     def test_return_lse(self):
         """return_lse=True returns global LSE (logsumexp of inputs)."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         B, H, D = 1, 1, 2
         outputs = torch.tensor(
@@ -325,7 +325,7 @@ class TestLSEWeightedCombine:
 
     def test_base2_return_lse(self):
         """Base-2 LSE mode returns log2-sum-exp2 global LSE."""
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         outputs = torch.tensor(
             [
@@ -362,7 +362,7 @@ class TestLSEWeightedCombine:
 
     def test_lse_pack_dim(self):
         """Packed A2A stores one fp32 LSE in output-dtype lanes."""
-        from vllm.v1.attention.ops.dcp import _dcp_a2a_lse_pack_dim
+        from vllm.v1.attention.ops.dcp_alltoall import _dcp_a2a_lse_pack_dim
 
         assert _dcp_a2a_lse_pack_dim(torch.bfloat16) == 2
         assert _dcp_a2a_lse_pack_dim(torch.float16) == 2
@@ -1147,7 +1147,7 @@ class TestPackedA2AKernels:
         return_lse: bool,
         is_lse_base_on_e: bool,
     ):
-        from vllm.v1.attention.ops.dcp import (
+        from vllm.v1.attention.ops.dcp_alltoall import (
             _dcp_a2a_lse_pack_dim,
             _dcp_a2a_pack_send,
             _dcp_a2a_unpack_combine,
@@ -1231,7 +1231,7 @@ def test_cuda_reduce_scatter_can_preserve_head_major_output(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
     )
     def test_empty_seq_lens_ignore_undefined_output(self):
-        from vllm.v1.attention.ops.dcp import (
+        from vllm.v1.attention.ops.dcp_alltoall import (
             _dcp_a2a_lse_pack_dim,
             _dcp_a2a_pack_send,
             _dcp_a2a_unpack_combine,
@@ -1315,7 +1315,7 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
 
         init_workspace_manager(torch.device(f"cuda:{local_rank}"))
     try:
-        from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce
+        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 
         dtype = _dtype_from_name(env["TEST_DTYPE"])
         return_lse = env["RETURN_LSE"] == "1"
@@ -1365,7 +1365,7 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             [t[:, rank * h_per_rank : (rank + 1) * h_per_rank] for t in gathered_lse],
             dim=0,
         )
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         expected_out, expected_lse = _lse_weighted_combine(
             outputs,
