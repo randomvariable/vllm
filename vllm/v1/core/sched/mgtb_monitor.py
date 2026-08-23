@@ -15,6 +15,10 @@ from types import MappingProxyType
 
 import numpy as np
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _MGTB_SAMPLING_CONTROL_FIELDS = (
     "presence_penalty",
     "frequency_penalty",
@@ -333,11 +337,26 @@ class MGTBRequestState:
             self.config.stride if refractory_tokens is None else refractory_tokens
         )
         self.statistic = max(0.0, self.statistic) + math.log(factor) - drift
-        if self.statistic < threshold or position < self.refractory_until:
-            return False
-        self.alarms += 1
-        self.refractory_until = position + max(0, refractory_tokens)
-        return True
+        alarmed = (
+            self.statistic >= threshold and position >= self.refractory_until
+        )
+        if alarmed:
+            self.alarms += 1
+            self.refractory_until = position + max(0, refractory_tokens)
+        logger.info(
+            "MGT-B window pos=%d feats=(ent=%.4f nlp=%.4f rep=%.4f "
+            "conf_inc=%.4f dent_pos=%.4f dent_neg=%.4f) score=%.4f "
+            "p=%.4g factor=%.4g stat=%.4f alarms=%d%s",
+            position,
+            *features,
+            score,
+            probability,
+            factor,
+            self.statistic,
+            self.alarms,
+            " ALARM" if alarmed else "",
+        )
+        return alarmed
 
     def record_sampled(self, count: int) -> None:
         """Account for sampled tokens without a committed observation."""

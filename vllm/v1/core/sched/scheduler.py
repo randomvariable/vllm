@@ -2028,7 +2028,7 @@ class Scheduler(SchedulerInterface):
                         entropy = obs.entropy_post
                         if entropy != entropy:
                             entropy = obs.entropy_pre
-                        state.advance(
+                        if state.advance(
                             entropy,
                             obs.logprob,
                             drift=self.mgtb_drift,
@@ -2037,7 +2037,15 @@ class Scheduler(SchedulerInterface):
                             token_id=obs.token_id,
                             position=obs.position,
                             emitted=False,
-                        )
+                        ):
+                            logger.warning(
+                                "MGT-B loop alarm: request=%s pos=%s "
+                                "stat=%.4f alarms=%d",
+                                req_id,
+                                obs.position,
+                                state.statistic,
+                                state.alarms,
+                            )
                     observed_tokens = len(committed_observations)
                     if observed_tokens < committed_count:
                         state.record_sampled(committed_count - observed_tokens)
