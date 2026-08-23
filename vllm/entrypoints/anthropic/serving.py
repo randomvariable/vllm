@@ -490,6 +490,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=anthropic_request.kv_transfer_params,
             ec_transfer_params=anthropic_request.ec_transfer_params,
             chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            temperature_low=anthropic_request.temperature_low,
+            temperature_high=anthropic_request.temperature_high,
+            entropy_threshold=anthropic_request.entropy_threshold,
+            reset_window=anthropic_request.reset_window,
         )
 
     @classmethod
