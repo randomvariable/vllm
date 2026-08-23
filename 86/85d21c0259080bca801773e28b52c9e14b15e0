@@ -1,0 +1,16 @@
+vllm/v1/core/sched/mgtb_monitor.py
+  h_15da545fc8cfbe 18-21,340-359
+vllm/v1/core/sched/scheduler.py
+  h_15da545fc8cfbe 1961,1970-1978
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "8685d21c0259080bca801773e28b52c9e14b15e0",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
