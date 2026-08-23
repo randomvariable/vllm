@@ -1830,11 +1830,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self._vllm_config.attention_config.sparse_mla_force_mqa
         )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # Let per-backend impls do their own weight packing first (no-op
-        # unless overridden), mirroring Attention.process_weights_after_loading.
-        self.impl.process_weights_after_loading(act_dtype)
-
     def _prepare_b12x_absorb_bmm(self, act_dtype: torch.dtype) -> bool:
         for name in ("_b12x_absorb_uk_rhs", "_b12x_absorb_uv_rhs"):
             if hasattr(self, name):
@@ -2084,6 +2079,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             set_default_quant_scales(self, register_buffer=False)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        # Let per-backend impls do their own weight packing first (no-op
+        # unless overridden), mirroring Attention.process_weights_after_loading.
+        self.impl.process_weights_after_loading(act_dtype)
         self._use_b12x_absorb_bmm = self._prepare_b12x_absorb_bmm(act_dtype)
         self._fused_mla_query_output_dtype = (
             current_platform.fp8_dtype()

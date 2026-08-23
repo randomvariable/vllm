@@ -1668,71 +1668,6 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
 
 
-def test_get_max_concurrency_packed_kv_cache_config():
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_config_packed,
-        _use_packed_kv_cache_config,
-    )
-
-    model_config = ModelConfig(
-        "Qwen/Qwen1.5-7B",
-        runner="generate",
-        dtype="float16",
-        max_model_len=16384,
-    )
-    scheduler_config = SchedulerConfig(
-        max_num_batched_tokens=1024,
-        enable_chunked_prefill=True,
-        max_model_len=model_config.max_model_len,
-        is_encoder_decoder=model_config.is_encoder_decoder,
-        async_scheduling=False,
-    )
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        scheduler_config=scheduler_config,
-    )
-
-    # All-UniformTypeKVCacheSpecs groups select the packed layout.
-    mla_specs = {f"layer_{i}": new_mla_spec() for i in range(4)}
-    swa_specs = {
-        f"layer_{i}": SlidingWindowMLASpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=576,
-            dtype=torch.float32,
-            sliding_window=128,
-        )
-        for i in range(4, 6)
-    }
-    kv_cache_groups = [
-        KVCacheGroupSpec(
-            list(mla_specs),
-            UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=mla_specs),
-        ),
-        KVCacheGroupSpec(
-            list(swa_specs),
-            UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=swa_specs),
-        ),
-    ]
-    assert _use_packed_kv_cache_config(vllm_config, kv_cache_groups)
-    num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
-        vllm_config, kv_cache_groups, 2 * GiB_bytes
-    )
-    assert num_blocks > 0
-    kv_cache_config_packed = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-    )
-    # Per-request blocks: the MLA group needs cdiv(16384, 16) = 1024 pages;
-    # the SWA group cdiv(min(128 - 1 + 1024, 16384), 16) + 1 = 73. The
-    # previous formula normalized by the first group's page size and gave
-    # 1061 blocks per request instead of 1097.
-    assert get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config_packed
-    ) == num_blocks / (1024 + 73)
-
-
 def _make_dsv4_vllm_config(dcp: int):
     class _Dsv4VllmConfig(SimpleNamespace):
         def validate_block_size(self):
@@ -2759,10 +2694,6 @@ def test_get_kv_cache_config_one_worker():
     # different hidden size that cannot be aligned by using different block size,
     # but can be aligned by padding the smaller physical page.
     swa_spec = new_sliding_window_spec(head_size=96)
-    # Different hidden size and different type that cannot be aligned by using
-    # different block size, but can be aligned by padding the smaller physical
-    # page.
-    swa_spec = new_sliding_window_spec(head_size=96, indexes_kv_by_block_stride=True)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": swa_spec,
@@ -2842,6 +2773,7 @@ def test_warns_when_num_gpu_blocks_override_exceeds_profiled_capacity(monkeypatc
         model_config=model_config, device_config=DeviceConfig(device="cpu")
     )
     vllm_config.cache_config.num_gpu_blocks_override = 33
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
     mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
     kv_cache_specs = {
         "layer_1": new_kv_cache_spec(),

@@ -1173,6 +1173,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return None
 
     # NOTE: below util functions are only used by DeepseekV4 for now.
+    def get_page_sizes(self) -> list[int]:
+        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+
     def get_num_layer_tuples(self) -> int:
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()

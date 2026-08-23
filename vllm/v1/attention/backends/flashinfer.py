@@ -1457,7 +1457,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                         self._get_workspace_buffer(),
                         get_flashinfer_layout_string(self.kv_cache_layout),
-                        backend=backend,
+                        backend="fa2",
+                    )
+                elif self.is_kvcache_nvfp4:
+                    # trtllm-gen on SM100.
+                    self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                        self._get_workspace_buffer(),
+                        get_flashinfer_layout_string(self.kv_cache_layout),
+                        backend="trtllm-gen",
+                    )
+                else:
+                    self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                        self._get_workspace_buffer(),
+                        get_flashinfer_layout_string(self.kv_cache_layout),
+                        backend="auto",
                     )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper

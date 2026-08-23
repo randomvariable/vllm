@@ -20,9 +20,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     nvfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.quantization.utils.b12x_moe import (
-    prepare_nvfp4_moe_layer_for_b12x,
-)
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
     prepare_nvfp4_moe_layer_for_b12x,
@@ -49,7 +46,6 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
     FLASHINFER_B12X = "FLASHINFER_B12X"
-    B12X = "B12X"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
@@ -178,7 +174,6 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
-        "b12x": NvFp4MoeBackend.B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,

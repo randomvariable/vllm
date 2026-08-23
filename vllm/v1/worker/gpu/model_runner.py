@@ -79,6 +79,7 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.block_table import get_block_table_width
