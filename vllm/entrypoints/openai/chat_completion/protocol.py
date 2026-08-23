@@ -46,6 +46,7 @@ from vllm.sampling_params import (
     BeamSearchParams,
     EntropyThreshold,
     ReasoningAnswerTemperature,
+    ReasoningMarkerPenalty,
     RepetitionDetectionParams,
     RequestOutputKind,
     ResetWindow,
@@ -300,6 +301,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "Only applies after a natural end-of-thinking marker completes; "
             "a request that never enters reasoning never takes the "
             "override. Requires a reasoning control to be configured."
+        ),
+    )
+    reasoning_marker_penalty: ReasoningMarkerPenalty = Field(
+        default=None,
+        description=(
+            "Logit penalty subtracted from overthinking-marker tokens while "
+            "the model is inside the reasoning block (arXiv 2606.00206). "
+            "Finite float in [0, 10]; 0 or null disables. Fails closed when no "
+            "marker resolves to a single token for the model's tokenizer."
+        ),
+    )
+    reasoning_monitor: bool = Field(
+        default=False,
+        description=(
+            "Enable the MGT-B reasoning-loop monitor for this request, which "
+            "scores decode-time loop features and raises a loop alarm once the "
+            "calibrated statistic crosses its threshold."
         ),
     )
     include_reasoning: bool = True
@@ -793,6 +811,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             entropy_threshold=self.entropy_threshold,
             reset_window=self.reset_window,
             reasoning_answer_temperature=self.reasoning_answer_temperature,
+            reasoning_marker_penalty=self.reasoning_marker_penalty,
+            reasoning_monitor=self.reasoning_monitor,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
