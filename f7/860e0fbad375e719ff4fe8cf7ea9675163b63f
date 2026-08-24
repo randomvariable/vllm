@@ -1,0 +1,22 @@
+tests/test_module_reference_integrity.py
+  h_15da545fc8cfbe 3-4,6-10,12-19,115-294
+vllm/entrypoints/openai/api_server.py
+  h_15da545fc8cfbe 311-312,315
+vllm/v1/attention/backends/b12x_attn.py
+  h_15da545fc8cfbe 55,526-529
+vllm/v1/attention/backends/flashinfer.py
+  h_15da545fc8cfbe 3245
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 374-377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f7860e0fbad375e719ff4fe8cf7ea9675163b63f",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
