@@ -611,14 +611,21 @@ def select_deepseek_v4_mxfp4_moe_backend(
     # falling back to the auto priority list.
     runner_backend = config.moe_backend
     if runner_backend == "auto" and envs.VLLM_USE_B12X_MOE:
-        return _return_or_raise(
-            Mxfp4MoeBackend.B12X,
-            config,
-            kMxfp4Static,
-            None,
-            activation_format,
-            scope="local",
-        )
+        b12x_error: Exception | None = None
+        for b12x_backend in B12X_BACKENDS:
+            try:
+                return _return_or_raise(
+                    b12x_backend,
+                    config,
+                    kMxfp4Static,
+                    _backend_activation_key(b12x_backend),
+                    activation_format,
+                    scope="local",
+                )
+            except ValueError as e:
+                b12x_error = e
+        assert b12x_error is not None
+        raise b12x_error
     if runner_backend != "auto":
         requested_backends = _get_requested_backends(runner_backend, None)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
@@ -752,7 +759,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
 ]:
     """Convert loaded weights into backend-specific kernel format."""
 
-    if mxfp4_backend == Mxfp4MoeBackend.B12X:
+    if mxfp4_backend in B12X_BACKENDS:
         return (
             w13_weight.data,
             w2_weight.data,

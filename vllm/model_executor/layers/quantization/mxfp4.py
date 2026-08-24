@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    B12X_BACKENDS,
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
@@ -446,7 +447,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_scale_cols = intermediate_size_per_partition // mxfp4_block
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             tp_rank = self.moe.moe_parallel_config.tp_rank
             w2_scale_cols = _mxfp4_w2_scale_cols_for_rank(
                 intermediate_size_per_partition,
@@ -466,7 +467,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         w2_weight_scale.quant_method = "block"
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             tp_rank = self.moe.moe_parallel_config.tp_rank
             w2_weight_scale.b12x_mxfp4_w2_scale_group_size = mxfp4_block
             w2_weight_scale.b12x_mxfp4_w2_logical_k = intermediate_size_per_partition
@@ -513,7 +514,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         sf_block_size = 32
         w2_scale_cols = intermediate_size // sf_block_size
 
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             w2, w2_scale = _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
                 w2,
                 w2_scale,
@@ -849,7 +850,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_scale_cols = intermediate_size_per_partition // mxfp4_block
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             tp_rank = self.moe.moe_parallel_config.tp_rank
             w2_scale_cols = _mxfp4_w2_scale_cols_for_rank(
                 intermediate_size_per_partition,
@@ -870,7 +871,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, {"weight_loader": scale_weight_loader})
         w2_weight_scale.quant_method = "block"
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             tp_rank = self.moe.moe_parallel_config.tp_rank
             w2_weight_scale.b12x_mxfp4_w2_scale_group_size = mxfp4_block
             w2_weight_scale.b12x_mxfp4_w2_logical_k = intermediate_size_per_partition
@@ -919,7 +920,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         sf_block_size = 32
         w2_scale_cols = intermediate_size // sf_block_size
 
-        if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+        if self.mxfp4_backend in B12X_BACKENDS:
             w2, w2_scale = _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
                 w2,
                 w2_scale,

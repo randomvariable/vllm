@@ -105,7 +105,9 @@ def test_b12x_ep_oracles_prefer_ep_specialization_before_tp() -> None:
         b12x_ep_moe.B12xEPExperts,
         B12xExperts,
     ]
-    assert mxfp4_oracle.backend_to_kernel_cls(mxfp4_oracle.Mxfp4MoeBackend.B12X) == [
+    assert mxfp4_oracle.backend_to_kernel_cls(
+        mxfp4_oracle.Mxfp4MoeBackend.B12X_MXFP4_MXFP8
+    ) == [
         b12x_ep_moe.B12xEPExperts,
         B12xExperts,
     ]

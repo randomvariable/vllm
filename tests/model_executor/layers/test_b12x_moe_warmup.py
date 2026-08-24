@@ -301,14 +301,14 @@ def test_compressed_tensors_situ_mxfp4_selects_b12x(monkeypatch) -> None:
     monkeypatch.setattr(
         ct_mxfp4,
         "select_mxfp4_moe_backend",
-        lambda moe: (ct_mxfp4.Mxfp4MoeBackend.B12X, FakeB12xExperts),
+        lambda moe: (ct_mxfp4.Mxfp4MoeBackend.B12X_MXFP4_MXFP8, FakeB12xExperts),
     )
 
     method = ct_mxfp4.CompressedTensorsW4A4Mxfp4MoEMethod(
-        SimpleNamespace(activation=MoEActivation.SITU)
+        SimpleNamespace(activation=MoEActivation.SITU, moe_backend="b12x")
     )
 
-    assert method.mxfp4_backend == ct_mxfp4.Mxfp4MoeBackend.B12X
+    assert method.mxfp4_backend == ct_mxfp4.Mxfp4MoeBackend.B12X_MXFP4_MXFP8
     assert method.experts_cls is FakeB12xExperts
     assert not method.use_cutlass_mxfp4
 
