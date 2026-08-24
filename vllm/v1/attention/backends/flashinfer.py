@@ -3266,7 +3266,7 @@ class FlashInferImpl(AttentionImpl):
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),
                     lse=lse,
-                    return_lse=self.need_to_return_lse_for_decode,
+                    return_lse=use_dcp,
                 )
 
                 if use_dcp:

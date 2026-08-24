@@ -48,15 +48,11 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.backends.utils import (
-    KVCacheLayoutType,
-    get_kv_cache_layout,
-    set_kv_cache_layout,
-)
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_diffkv,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -518,11 +514,6 @@ class B12XPagedAttentionBackend(AttentionBackend):
         cls,
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        cache_layout = get_kv_cache_layout()
-        if cache_layout != "NHD":
-            raise ValueError(
-                f"B12X_ATTN requires NHD KV cache layout; got {cache_layout!r}."
-            )
         if cls._uses_packed_kv_cache():
             if include_num_layers_dimension:
                 return (1, 0, 2, 3, 4)
@@ -532,8 +523,10 @@ class B12XPagedAttentionBackend(AttentionBackend):
         return (0, 1, 2, 3, 4)
 
     @classmethod
-    def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
-        return "NHD"
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # The b12x paged kernels index block interiors as [N, H, C]; the
+        # stride orders above are the token-major permutation.
+        return (KVCacheLayout.LBNHC,)
 
 
 @dataclass
@@ -1781,7 +1774,6 @@ def get_b12x_paged_attention_backend(
     head_size_v: int,
 ) -> type[B12XPagedAttentionBackend]:
     """Return a B12X paged backend class with a per-layer VO head dimension."""
-    set_kv_cache_layout("NHD")
     head_size_v = int(head_size_v)
     if head_size_v <= 0 or head_size_v % 16 != 0:
         raise ValueError(

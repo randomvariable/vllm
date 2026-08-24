@@ -352,6 +352,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_pooling_model = self.model_config.runner_type == "pooling"
         self.pooling_runner: PoolingRunner | None = None
 
+        # Encoder-only multimodal models return the encoder output directly and
+        # never run the decoder half of execute_model.
+        self.is_encoder_only = self.vllm_config.is_mm_encoder_only
+
         # Multi-module MTP feeds its modules the next num_speculative_steps prefill
         # tokens during chunked prefill. Other speculators only read the immediate
         # next one.

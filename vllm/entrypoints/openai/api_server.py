@@ -308,11 +308,11 @@ def build_app(
 
     if "realtime" in supported_tasks:
         # Add WebSocket metrics middleware
-        from vllm.entrypoints.speech_to_text.factories import (
-            add_websocket_metrics_middleware,
+        from vllm.entrypoints.speech_to_text.realtime.metrics import (
+            WebSocketMetricsMiddleware,
         )
 
-        add_websocket_metrics_middleware(app)
+        app.add_middleware(WebSocketMetricsMiddleware)
 
     if envs.VLLM_DEBUG_LOG_API_SERVER_RESPONSE:
         logger.warning(
