@@ -37,7 +37,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_mla_split_cap,
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_a2a_lse_reduce,
     dcp_b12x_all_gather_heads,

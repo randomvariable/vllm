@@ -819,7 +819,7 @@ def _distributed_direct_a2a_worker(env: dict[str, str]) -> None:
     torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
-        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+        from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         rank = dist.get_rank()
         world_size = dist.get_world_size()

@@ -37,10 +37,8 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_num_attention_heads_from_layers,
 )
-from vllm.v1.attention.ops.dcp import (
-    cp_lse_ag_out_rs,
-    dcp_a2a_lse_reduce,
-)
+from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
