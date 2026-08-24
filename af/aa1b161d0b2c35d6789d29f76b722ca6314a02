@@ -1,0 +1,20 @@
+tests/model_executor/layers/test_b12x_ep_moe.py
+  h_15da545fc8cfbe 108
+tests/model_executor/layers/test_b12x_moe_warmup.py
+  h_15da545fc8cfbe 304,308,311
+vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+  h_15da545fc8cfbe 614-628,762
+vllm/model_executor/layers/quantization/mxfp4.py
+  h_15da545fc8cfbe 24,450,470,517,853,874,923
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "afaa1b161d0b2c35d6789d29f76b722ca6314a02",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
