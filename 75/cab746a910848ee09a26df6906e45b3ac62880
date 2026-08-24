@@ -1,0 +1,20 @@
+tests/distributed/test_dcp_direct_a2a_lse_reduce.py
+  h_15da545fc8cfbe 822
+vllm/models/deepseek_v4/nvidia/b12x.py
+  h_15da545fc8cfbe 40
+vllm/v1/attention/backends/flash_attn.py
+  h_15da545fc8cfbe 37-38
+vllm/v1/attention/backends/flashinfer.py
+  h_15da545fc8cfbe 79-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "75cab746a910848ee09a26df6906e45b3ac62880",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
