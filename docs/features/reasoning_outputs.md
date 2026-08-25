@@ -317,6 +317,39 @@ for output in outputs:
     print("text:", output.outputs[0].text)
 ```
 
+## Answer-Phase Temperature
+
+`reasoning_answer_temperature` sets a separate temperature after a reasoning
+block closes. It overrides `temperature` and any ReSET decision only after the
+reasoning end marker has completed. This lets a request explore during thinking
+and use a deterministic answer temperature afterward.
+
+The parameter requires `thinking_token_budget`, even when the budget is large.
+Requests that never enter a reasoning block keep their normal temperature. The
+override is not applied while a thinking budget is being force-terminated.
+
+```python
+from vllm import LLM, SamplingParams
+
+sampling_params = SamplingParams(
+    temperature=1.0,
+    thinking_token_budget=1024,
+    reasoning_answer_temperature=0.2,
+)
+```
+
+For the OpenAI-compatible API, send it as an extra body field:
+
+```json
+{
+  "thinking_token_budget": 1024,
+  "reasoning_answer_temperature": 0.2
+}
+```
+
+`reasoning_answer_temperature` can be combined with ReSET. ReSET controls
+thinking-phase tokens; this value controls answer-phase tokens.
+
 ## ReSET Entropy-Threshold Temperature
 
 Temperature is normally a single constant applied to every token of a
