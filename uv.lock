@@ -435,7 +435,7 @@ wheels = [
 
 [[package]]
 name = "b12x"
-version = "1.2.4"
+version = "1.2.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -450,9 +450,9 @@ dependencies = [
     { name = "torch" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/70/2f/b6ccdae2fa0f23e93e6f5126c887250c04bbbf3dce8eaa057bf25694451a/b12x-1.2.4.tar.gz", hash = "sha256:f678f1a450501f908f24447827a91780595c98444406e86ba957ced46372db3b", size = 1355209, upload-time = "2026-08-12T15:11:48.275Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/b4/8bf4bd686e88f7c0067f98cb5fa87f7f47c2e97d39b80ae938e33689ce72/b12x-1.2.6.tar.gz", hash = "sha256:a7483e075e2eb555fa87c0d12f41c2a33757afb86642d8a604853efdf0d09b4e", size = 1355002, upload-time = "2026-08-20T19:43:02.926Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/53/a48e294987c08ff99feb04727b764adbddcd609576f03947afbf97f49a6f/b12x-1.2.4-py3-none-any.whl", hash = "sha256:6192de0b6ff51611ba7f0f42dff326e4f3fb9db36002ed1f3f2a76b155581e27", size = 1473362, upload-time = "2026-08-12T15:11:45.235Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/f3/4227ddbcfe05bdcd8ec606c1772b8e4315ac92dfbea2f2a3134a7621dd81/b12x-1.2.6-py3-none-any.whl", hash = "sha256:c51f9b06c7ecd0b0f68c83932cd4f40b07dd673e0fe2893bc7adf308a7b7e684", size = 1472847, upload-time = "2026-08-20T19:43:01.291Z" },
 ]
 
 [[package]]
@@ -7582,6 +7582,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "humming-kernels", extra = ["cu13"] },
     { name = "ijson" },
+    { name = "instanttensor" },
     { name = "jsonschema" },
     { name = "lark" },
     { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
@@ -7709,7 +7710,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.71.0" },
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "av", marker = "extra == 'audio'" },
-    { name = "b12x", marker = "extra == 'b12x'", specifier = "==1.2.4" },
+    { name = "b12x", marker = "extra == 'b12x'", specifier = "==1.2.6" },
     { name = "blake3" },
     { name = "cachetools" },
     { name = "cbor2" },
@@ -7727,6 +7728,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.28.0" },
     { name = "humming-kernels", extras = ["cu13"], specifier = "==0.1.12" },
     { name = "ijson" },
+    { name = "instanttensor", specifier = ">=0.1.9" },
     { name = "instanttensor", marker = "extra == 'instanttensor'", specifier = ">=0.1.9" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "lark", specifier = "==1.2.2" },
@@ -7798,7 +7800,7 @@ requires-dist = [
     { name = "torchcodec", specifier = ">=0.14" },
     { name = "torchvision", specifier = "==0.28.0" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=5.5.3" },
+    { name = "transformers", specifier = ">=5.10.4" },
     { name = "typing-extensions", specifier = ">=4.10" },
     { name = "vllm-gguf-plugin", marker = "extra == 'extra-quant'", specifier = ">=0.0.2" },
     { name = "watchfiles" },

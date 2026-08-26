@@ -23,6 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.math_utils import cdiv
@@ -560,6 +561,15 @@ def _supports_varlen_paged_mqa_logits(
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
         and has_deep_gemm()
+    )
+
+
+def _should_build_paged_mqa_logits_metadata(num_states: int) -> bool:
+    """Whether decode should fill DeepGEMM paged-MQA schedule metadata."""
+    return (
+        current_platform.is_cuda()
+        and is_deep_gemm_supported()
+        and num_states in (32, 64)
     )
 
 
@@ -1477,9 +1487,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     requires_padding,
                 )
             else:
-                # DeepGEMM is required for the paged MQA logits on CUDA devices
+                # DeepGEMM's paged-MQA metadata supports Hopper/Blackwell pages.
                 schedule_metadata = self.scheduler_metadata_buffer
-                if current_platform.is_cuda() and has_deep_gemm():
+                if _should_build_paged_mqa_logits_metadata(
+                    self.kv_cache_spec.num_states
+                ):
                     metadata = get_paged_mqa_logits_metadata(
                         seq_lens,
                         self.kv_cache_spec.num_states,
