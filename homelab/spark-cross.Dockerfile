@@ -225,7 +225,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     exit $rc
 
 RUN mkdir -p /runtime-requirements
-COPY requirements/cuda.txt /runtime-requirements/cuda.txt
+COPY requirements/cuda.txt requirements/kv_connectors.txt /runtime-requirements/
 
 # Shuttle export: plain files on the build PVC via --output type=local in the
 # pipeline. Not part of the final image; exists solely to carry the tarballs

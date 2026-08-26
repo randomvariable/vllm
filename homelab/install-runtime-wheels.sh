@@ -3,6 +3,43 @@ set -eu
 
 PYTHON=/opt/venv/bin/python
 uv pip install --python "$PYTHON" -r /runtime-requirements/cuda.txt
+uv pip install --python "$PYTHON" -r /runtime-requirements/kv_connectors.txt
+
+KV_METADATA=$("$PYTHON" - <<'PYEOF'
+import importlib.metadata as metadata
+
+import torch
+
+cuda_version = torch.version.cuda
+if cuda_version is None:
+    raise SystemExit("torch.version.cuda is not set")
+
+print(
+    cuda_version.split(".", 1)[0],
+    metadata.version("nixl"),
+    metadata.version("mooncake-transfer-engine"),
+)
+PYEOF
+)
+IFS=' ' read -r CUDA_MAJOR NIXL_VERSION MOONCAKE_VERSION <<EOF
+$KV_METADATA
+EOF
+
+uv pip uninstall --python "$PYTHON" nixl-cu12 nixl-cu13 2>/dev/null || true
+uv pip install --python "$PYTHON" --no-deps "nixl-cu${CUDA_MAJOR}==${NIXL_VERSION}"
+
+if [ "$CUDA_MAJOR" = 13 ]; then
+    uv pip uninstall --python "$PYTHON" mooncake-transfer-engine
+    uv pip install --python "$PYTHON" \
+        "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+fi
+
+"$PYTHON" - <<'PYEOF'
+import importlib.metadata as metadata
+
+for package in ("lmcache", "mooncake-transfer-engine-cuda13", "nixl-cu13"):
+    print(f"{package}=={metadata.version(package)}")
+PYEOF
 uv pip install --python "$PYTHON" --no-deps /wheels-b12x/*.whl
 
 if ls /wheels-flashinfer/flashinfer_cubin-*.whl >/dev/null 2>&1; then
