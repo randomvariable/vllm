@@ -517,7 +517,7 @@ spec:
                 - {name: TEKTON_GIT_REF, value: $(params.git_ref)}
                 - {name: TEKTON_IMAGE_REF, value: $(params.image_ref)}
             - name: create-release
-              image: ghcr.io/cli/cli:2.78.0
+              image: alpine:3.22
               workingDir: $(workspaces.source.path)
               env:
                 - name: GH_TOKEN
@@ -530,6 +530,7 @@ spec:
                   refs/tags/homelabs-verified-*) ;;
                   *) exit 0 ;;
                 esac
+                apk add --no-cache github-cli >/dev/null
                 TAG="$(cat .release-tag)"
                 REPO="$(cat .release-repo)"
                 BODY="$(cat .release-body)"
