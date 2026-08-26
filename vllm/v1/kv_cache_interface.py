@@ -149,8 +149,10 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
-    # Whether scheduler prefix caching may reuse this cache group's blocks.
-    prefix_cacheable: bool = True
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return True
 
     @property
     def num_heads(self) -> int:
@@ -626,6 +628,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     cache_dtype_str: str | None = None
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
@@ -636,12 +639,17 @@ class MLAAttentionSpec(FullAttentionSpec):
         super().__post_init__()
         _apply_alignment_padding(self)
 
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
         dtype_set = set(spec.dtype for spec in specs)
         kv_quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
@@ -650,6 +658,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         dcp_kv_shard_count_set = set(spec.dcp_kv_shard_count for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
             and len(dtype_set) == 1
             and len(kv_quant_mode_set) == 1
             and len(tokens_per_state_set) == 1
@@ -676,6 +685,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
             cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             non_causal_multi_token_decode=any(
@@ -846,6 +856,30 @@ class SlidingWindowSpec(AttentionSpec):
             and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One block per request for uncompressed keys in the open QSA group."""
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        del vllm_config
+        return self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        del vllm_config, max_len
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1104,6 +1138,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
 
     @property
     def page_size_bytes(self) -> int:
