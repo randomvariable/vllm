@@ -212,6 +212,9 @@ class CudaGraphManager:
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
+        descs_by_token_lora: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
         exact_uniform_descs: defaultdict[
             tuple[int, int], list[BatchExecutionDescriptor]
         ] = defaultdict(list)
