@@ -149,6 +149,8 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    # Whether scheduler prefix caching may reuse this cache group's blocks.
+    prefix_cacheable: bool = True
 
     @property
     def num_heads(self) -> int:
@@ -959,6 +961,8 @@ class MambaSpec(KVCacheSpec):
     num_prefill_checkpoint_blocks: int = 0
     num_heads: int = 1
     tokens_per_state: int = -1
+    # PLE convolution states are identical on every tensor-parallel rank.
+    tp_replicated: bool = False
 
     @property
     def state_content_size_bytes(self) -> int:

@@ -1046,6 +1046,8 @@ class CustomAllreduce:
             return use_custom
         if self.world_size > 8:
             return False
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
         inp_size = inp.numel() * inp.element_size()
         rows = int(inp.shape[0]) if inp.ndim >= 2 else 1
         cutoff_applies = not (

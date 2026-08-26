@@ -69,6 +69,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     MambaSpec,
     get_kv_cache_dcp_shard_count,
@@ -635,9 +636,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         group_cp_sizes = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            slot_mapping_enabled.append(not isinstance(spec, CircularBufferSpec))
             # One local block covers `block_size * dcp_shard_count` tokens in
             # the global sequence. Replicated groups keep the full cache on
             # every rank instead.
@@ -710,6 +713,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
             group_cp_sizes=group_cp_sizes,
+            slot_mapping_enabled=slot_mapping_enabled,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,

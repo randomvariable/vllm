@@ -27,6 +27,7 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
         group_cp_sizes: list[int] | None = None,
+        slot_mapping_enabled: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -44,6 +45,12 @@ class BlockTables:
         assert len(group_cp_sizes) == len(block_sizes)
         self.group_cp_sizes = torch.tensor(
             group_cp_sizes, dtype=torch.int32, device=device
+        )
+        if slot_mapping_enabled is None:
+            slot_mapping_enabled = [True] * len(block_sizes)
+        assert len(slot_mapping_enabled) == len(block_sizes)
+        self.slot_mapping_enabled = torch.tensor(
+            slot_mapping_enabled, dtype=torch.bool, device=device
         )
 
         self.num_kv_cache_groups = len(self.block_sizes)
@@ -219,6 +226,7 @@ class BlockTables:
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.group_cp_sizes,
+            self.slot_mapping_enabled,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -303,6 +311,7 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     group_cp_sizes,  # [num_kv_cache_groups]
+    slot_mapping_enabled,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -339,6 +348,11 @@ def _compute_slot_mappings_kernel(
     num_blocks = tl.load(group_num_blocks_ptr + req_state_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
+    if not tl.load(slot_mapping_enabled + group_id):
+        for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < end_idx)
+        return
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         token_mask = offset < end_idx
