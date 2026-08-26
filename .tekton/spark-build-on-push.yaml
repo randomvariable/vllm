@@ -463,6 +463,7 @@ spec:
           - {name: revision, value: $(params.revision)}
           - {name: git_ref, value: $(params.git_ref)}
           - {name: image_ref, value: $(tasks.build-and-push.results.IMAGE_REF)}
+          - {name: github_release_secret, value: $(params.github_release_secret)}
         workspaces:
           - {name: source, workspace: source}
         taskSpec:
@@ -471,6 +472,7 @@ spec:
             - {name: revision, type: string}
             - {name: git_ref, type: string}
             - {name: image_ref, type: string}
+            - {name: github_release_secret, type: string}
           workspaces:
             - name: source
           steps:
@@ -520,7 +522,7 @@ spec:
               env:
                 - name: GH_TOKEN
                   valueFrom:
-                    secretKeyRef: {name: "{{ github_release_secret }}", key: token}
+                    secretKeyRef: {name: $(params.github_release_secret), key: token}
               script: |
                 #!/bin/sh
                 set -eu
