@@ -47,7 +47,7 @@ def _reserved_block_count(
     `num_lookahead_tokens`, where the speculator writes the KV of its drafts.
     """
     if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
-        kvcache_spec = kvcache_spec.first_spec
+        kvcache_spec = next(iter(kvcache_spec.kv_cache_specs.values()))
     if isinstance(kvcache_spec, CircularBufferSpec):
         # Circular caches keep one physical ring block for the request lifetime.
         return 1
