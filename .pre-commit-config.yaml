@@ -259,6 +259,14 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+  - id: check-api-contract
+    name: Check call-site kwargs against core API signatures
+    entry: python tools/pre_commit/check_api_contract.py
+    language: python
+    types: [python]
+    files: ^vllm/
+    exclude: ^vllm/entrypoints/openai/api_server\.py$
+    require_serial: true
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
