@@ -116,6 +116,16 @@ class MambaHybridModelState(DefaultModelState):
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
     ) -> tuple[list[int], MambaSpec]:
+        """Return all mamba group ids and the align-kernel reference spec.
+
+        A hybrid may legitimately host more than one mamba family (e.g.
+        qwen4_exp pairs GDN layers with a TP-replicated PLE short-conv
+        layer whose shapes and page size differ). Upstream asserted all
+        specs equal because its hybrids have exactly one family; here the
+        requirement is only that the non-replicated specs (the ones the
+        align-mode block tables and kernels address) agree among
+        themselves.
+        """
         if self._mamba_spec is None:
             group_ids: list[int] = []
             specs: list[MambaSpec] = []
@@ -125,9 +135,13 @@ class MambaHybridModelState(DefaultModelState):
                     group_ids.append(i)
                     specs.append(spec)
             assert specs, "no mamba layers in the model"
-            assert all(specs[0] == s for s in specs)
+            distinct = {s for s in specs if not s.tp_replicated}
+            assert len(distinct) == 1, (
+                "align mode requires exactly one non-replicated mamba spec "
+                f"family, got {len(distinct)}: {[s.mamba_type for s in distinct]}"
+            )
             self._mamba_group_ids = group_ids
-            self._mamba_spec = specs[0]
+            self._mamba_spec = next(iter(distinct))
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -233,6 +247,11 @@ class MambaHybridModelState(DefaultModelState):
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.max_query_len
+        if max_query_len is None:
+            max_query_len = (
+                input_batch.max_req_tokens
+                or input_batch.num_scheduled_tokens.max().item()
+            )
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
             max_seq_len = self.max_model_len
