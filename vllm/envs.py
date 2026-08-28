@@ -1901,6 +1901,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Debug/testing override: force the FP8-Marlin (emulation) NvFP4 MoE
+    # backend regardless of hardware support. Referenced by the NvFP4 MoE
+    # backend oracle when selecting between candidate backends.
+    "VLLM_TEST_FORCE_FP8_MARLIN": lambda: bool(
+        int(os.getenv("VLLM_TEST_FORCE_FP8_MARLIN", "0"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
