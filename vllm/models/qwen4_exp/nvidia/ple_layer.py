@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -184,6 +185,14 @@ def _get_ple_embedding_quant_method(
     prefix: str,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+
+    # Hybrid checkpoints (ModelOpt NVFP4 experts + FP8 PLE shards, e.g.
+    # RadixArk/Inferact Qwen3.8-Flash-Next-NVFP4) carry a model-level quant
+    # config that is not Fp8Config, so the isinstance gate below never
+    # activates and loading fails on ngram_embedding.weight_scale.
+    # QWEN4_PLE_FORCE_FP8=1 forces the FP8 PLE path for these layouts.
+    if os.environ.get("QWEN4_PLE_FORCE_FP8") == "1":
+        return Qwen4ExpPLEFp8EmbeddingMethod()
 
     if not isinstance(quant_config, Fp8Config):
         return None
