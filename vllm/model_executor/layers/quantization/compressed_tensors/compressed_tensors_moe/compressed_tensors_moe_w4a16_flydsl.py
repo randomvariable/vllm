@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     int4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.utils import mark_shuffled
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
 )
@@ -293,8 +294,7 @@ class CompressedTensorsW4A16FlydslMoEMethod(CompressedTensorsMoEMethod):
             w2_scale.contiguous(), requires_grad=False
         )
 
-        layer.w13_weight_packed.is_shuffled = True
-        layer.w2_weight_packed.is_shuffled = True
+        mark_shuffled(layer.w13_weight_packed, layer.w2_weight_packed)
         layer.is_aiter_converted = True
 
     def get_fused_moe_quant_config(

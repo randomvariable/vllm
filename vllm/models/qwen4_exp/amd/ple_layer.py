@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Iterable, Sequence
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -465,7 +466,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             dtype=model_config.dtype,
         )
         nn.init.zeros_(self.conv1d.weight)
-        self.conv1d.weight._no_reinit = True
+        # Dynamic marker consumed by Mamba-style weight init; no such field
+        # exists on torch.Tensor, so it is stamped rather than assigned.
+        cast(Any, self.conv1d.weight)._no_reinit = True
         self.kv_cache = (torch.tensor([]),)
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:

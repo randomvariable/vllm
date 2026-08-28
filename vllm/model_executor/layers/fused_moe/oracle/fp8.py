@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.utils import mark_shuffled
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     prepare_fp8_moe_layer_for_fi,
 )
@@ -476,14 +477,12 @@ def convert_to_fp8_moe_kernel_format(
         )
     elif fp8_backend == Fp8MoeBackend.AITER:
         w13, w2 = rocm_aiter_ops.shuffle_weights(w13, w2)
-        w13.is_shuffled = True
-        w2.is_shuffled = True
+        mark_shuffled(w13, w2)
     elif fp8_backend == Fp8MoeBackend.AITER_MXFP8:
         w13, w2, w13_scale, w2_scale = rocm_aiter_ops.shuffle_mxfp8_moe_weights(
             w13, w2, w13_scale, w2_scale
         )
-        w13.is_shuffled = True
-        w2.is_shuffled = True
+        mark_shuffled(w13, w2)
     elif fp8_backend == Fp8MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,

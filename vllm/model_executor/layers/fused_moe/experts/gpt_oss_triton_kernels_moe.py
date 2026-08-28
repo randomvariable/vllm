@@ -745,7 +745,7 @@ def make_routing_data(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_local_experts: int,
-) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+) -> tuple["RoutingData", "GatherIndx", "ScatterIndx"]:
     topk_ids = topk_ids.to(torch.int16)
     topk_weights = topk_weights.to(torch.bfloat16)
 
@@ -988,7 +988,7 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         num_local_experts: int,
-    ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+    ) -> tuple["RoutingData", "GatherIndx", "ScatterIndx"]:
         return make_routing_data(topk_ids, topk_weights, num_local_experts)
 
 

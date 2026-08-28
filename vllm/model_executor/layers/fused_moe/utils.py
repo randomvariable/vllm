@@ -3,7 +3,7 @@
 import functools
 from collections.abc import Iterable
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -737,3 +737,15 @@ def warn_if_moe_use_td_ineffective(
         reason,
     )
     _warned_moe_use_td_ineffective = True
+
+
+def mark_shuffled(*tensors: torch.Tensor) -> None:
+    """Stamp weights as already shuffled for the kernel that consumes them.
+
+    The flag is a dynamic marker on the tensor object (no such field exists on
+    torch.Tensor), read by the external shuffled-weight kernels rather than
+    by vLLM itself. Centralising the write keeps the dynamic-attribute cast in
+    one place instead of at every shuffle site.
+    """
+    for tensor in tensors:
+        cast(Any, tensor).is_shuffled = True

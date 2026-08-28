@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.utils import mark_shuffled
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -1075,8 +1076,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
             w13_weight, w2_weight
         )
-        shuffled_w13.is_shuffled = True
-        shuffled_w2.is_shuffled = True
+        mark_shuffled(shuffled_w13, shuffled_w2)
 
         return (
             shuffled_w13,
@@ -1140,8 +1140,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
                 .view(-1, n)
             )
 
-        w13_weight.is_shuffled = True
-        w2_weight.is_shuffled = True
+        mark_shuffled(w13_weight, w2_weight)
 
         return (
             w13_weight,
@@ -1571,8 +1570,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
                 guinterleave,
             )
             w2_scale = e8m0_shuffle(w2_scale_raw.view(-1, w2_scale_raw.shape[-1]))
-            w13.is_shuffled = True
-            w2.is_shuffled = True
+            mark_shuffled(w13, w2)
             return (w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
         from aiter.ops.shuffle import shuffle_scale as _shuf_s
@@ -1609,8 +1607,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             False,
         )
 
-        w13_weight.is_shuffled = True
-        w2_weight.is_shuffled = True
+        mark_shuffled(w13_weight, w2_weight)
 
         return (
             w13_weight,

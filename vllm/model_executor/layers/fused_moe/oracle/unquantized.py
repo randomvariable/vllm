@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.base import MoEKernelOracle
+from vllm.model_executor.layers.fused_moe.utils import mark_shuffled
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     align_moe_weights_for_fi,
     convert_moe_weights_to_flashinfer_trtllm_block_layout,
@@ -335,8 +336,7 @@ def convert_to_unquantized_kernel_format(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if unquantized_backend == UnquantizedMoeBackend.AITER:
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
-        w13_weight.is_shuffled = True
-        w2_weight.is_shuffled = True
+        mark_shuffled(w13_weight, w2_weight)
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
         if moe_config.is_act_and_mul:

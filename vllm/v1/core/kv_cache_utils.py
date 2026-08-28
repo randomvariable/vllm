@@ -35,10 +35,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
-    iter_layer_specs,
-    replace_as,
     get_kv_cache_dcp_shard_count,
     has_nondefault_kv_dcp_layout,
+    iter_layer_specs,
+    replace_as,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1067,7 +1067,7 @@ def get_max_concurrency_for_kv_cache_config(
         max_memory_usage_per_request = _max_memory_usage_bytes_from_groups(
             vllm_config, groups
         )
-        memory_per_block = _pool_bytes_per_block(vllm_config, groups)
+        memory_per_block = _pool_bytes_per_block(groups)
         num_blocks_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     else:
         num_blocks_per_request = sum(
