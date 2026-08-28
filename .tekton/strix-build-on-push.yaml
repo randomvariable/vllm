@@ -90,8 +90,30 @@ spec:
         workspaces:
           - name: output
             workspace: source
-      - name: build-and-push
+      # Same pre-build static gate as the spark pipeline: fail in seconds on
+      # call-site/attribute drift or undeclared envs refs, not after a build.
+      - name: static-gate
         runAfter: [clone]
+        timeout: 30m0s
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: static-gate
+              image: python:3.12-slim
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                pip install --quiet --no-cache-dir \
+                  mypy==1.20.2 regex types-cachetools types-setuptools \
+                  types-PyYAML types-requests types-torch pydantic
+                python tools/ci/static_gate.py
+      - name: build-and-push
+        runAfter: [static-gate]
         timeout: 8h0m0s
         workspaces:
           - name: source
