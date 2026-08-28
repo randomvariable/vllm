@@ -758,9 +758,23 @@ class QSAKeyStateCache(_QSAStateCache):
         super().__init__(head_size=storage_head_size, **kwargs)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
-            raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
-        if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
+        if kv_cache.ndim != 4 or kv_cache.dtype != torch.bfloat16:
+            raise ValueError("QSA raw cache must be 4D BF16 [B, tokens, heads, width]")
+        # The layout system hands back logical [B, H, N, C]; the QSA kernels
+        # consume token-major [B, N, H, C] (shape[1] >= compress_ratio,
+        # shape[2] == 1). With one head the two orders describe identical
+        # memory, so normalize with a zero-copy transpose instead of
+        # asserting an axis position that depends on the layout.
+        if kv_cache.shape[2] == 1:
+            if kv_cache.shape[1] < self.compress_ratio:
+                raise ValueError("QSA raw cache narrower than one compression group")
+        elif kv_cache.shape[1] == 1:
+            if kv_cache.shape[2] < self.compress_ratio:
+                raise ValueError("QSA raw cache narrower than one compression group")
+            kv_cache = kv_cache.transpose(1, 2)
+        else:
+            raise ValueError("QSA raw cache must hold exactly one head axis of size 1")
+        if kv_cache.shape[3] != self.head_size:
             raise ValueError("QSA raw cache does not match its packed BF16 cache spec")
         super().bind_kv_cache(kv_cache)
         self.key_cache = kv_cache[..., : self.key_head_size]
