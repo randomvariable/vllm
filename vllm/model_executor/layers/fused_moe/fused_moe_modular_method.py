@@ -28,6 +28,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _tuning_context_for(layer: "RoutedExperts") -> str | None:
+    """Human-readable tag for autotuner progress, e.g.
+    "model.layers.5.mlp.experts (layer 5)".
+
+    Returns None outside FlashInfer tuning sessions, so steady-state
+    forwards pay no string formatting.
+    """
+    from flashinfer.autotuner.autotuner import AutoTuner
+
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    if not AutoTuner.get().is_tuning_mode:
+        return None
+    name = layer.layer_name
+    try:
+        idx = extract_layer_index(name)
+    except ValueError:
+        return name
+    return f"{name} (layer {idx})"
+
+
 # --8<-- [start:modular_fused_moe]
 @CustomOp.register("modular_fused_moe")
 class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
@@ -73,11 +94,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     ):
         raise NotImplementedError
 
-    def get_fused_moe_quant_config(
-        self, layer: "RoutedExperts"
-    ) -> FusedMoEQuantConfig | None:
-        return self.moe_quant_config
-
     def apply(
         self,
         layer: "RoutedExperts",
@@ -87,17 +103,31 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=layer.expert_map,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-        )
+        from flashinfer.autotuner.autotuner import set_tuning_context
+
+        ctx = _tuning_context_for(layer)
+        if ctx is not None:
+            set_tuning_context(ctx)
+        try:
+            assert self.moe_kernel is not None
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=layer.expert_map,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+        finally:
+            if ctx is not None:
+                set_tuning_context("")
+
+    def get_fused_moe_quant_config(
+        self, layer: "RoutedExperts"
+    ) -> FusedMoEQuantConfig | None:
+        return self.moe_quant_config
