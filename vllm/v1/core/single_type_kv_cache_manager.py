@@ -836,28 +836,34 @@ class FullAttentionManager(SingleTypeKVCacheManager):
     ) -> None:
         """Cache the prompt tail when it ends inside a cache block.
 
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
+        Registers the final prompt hash boundary as a partial prefix-cache
+        entry; intermediate hash boundaries inside the same cache block are
+        intentionally skipped. Under EAGLE/MTP, also retain the predecessor
+        boundary: the hit-side lookup rewinds a matched tail by one hash
+        unit, so a short context-load probe occupying the final unit would
+        otherwise leave nothing to hit for a follow-up turn.
         """
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
+        tail_boundary = request.num_prompt_tokens // hash_block_size * hash_block_size
+        boundaries = [tail_boundary]
+        if self.use_eagle and tail_boundary > hash_block_size:
+            boundaries.append(tail_boundary - hash_block_size)
         blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
+        for boundary_tokens in boundaries:
+            if boundary_tokens == 0 or boundary_tokens > num_tokens:
+                continue
+            if boundary_tokens % self.block_size == 0:
+                continue
+            block_idx = boundary_tokens // self.block_size
+            if block_idx >= len(blocks):
+                continue
+            self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1898,17 +1904,17 @@ class MambaManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return None
-        if num_tokens % self.block_size == 0:
-            return None
-        if num_tokens % hash_block_size != 0:
-            return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        cache_boundary = request.num_prompt_tokens // hash_block_size * hash_block_size
+        if self.use_eagle and cache_boundary > 0:
+            # FullAttention retains the predecessor prompt hash, then the
+            # hit-side lookup rewinds that match by one more hash unit.
+            # Mamba cannot rewind a newer recurrent state, so cache the
+            # exact replay boundary.
+            cache_boundary = max(cache_boundary - 2 * hash_block_size, 0)
+        if num_tokens != cache_boundary:
             return None
 
-        block_idx = num_tokens // self.block_size
+        block_idx = cache_boundary // self.block_size
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
@@ -1919,7 +1925,7 @@ class MambaManager(SingleTypeKVCacheManager):
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
             block=source_block,
-            num_tokens=num_tokens,
+            num_tokens=cache_boundary,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
@@ -1930,7 +1936,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # in ``source_block`` but the next step's forward overwrites it. The
             # upcoming CoW copies it into a durable cow_block; record the req so
             # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            self._producer_partial_tail_reqs[request.request_id] = cache_boundary
         return partial_hash
 
 
