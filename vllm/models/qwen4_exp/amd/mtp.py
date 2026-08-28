@@ -49,6 +49,7 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
     _HC_WEIGHTS_MAPPER,
+    _MIXER_SKIP_MAPPER,
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
@@ -337,10 +338,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            weights,
+            mapper=self.hf_to_vllm_mapper | _MIXER_SKIP_MAPPER,
+        )
 
 
 @support_torch_compile(
@@ -438,10 +441,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names())
+        return loader.load_weights(
+            remap_weight_names(),
+            mapper=_MIXER_SKIP_MAPPER,
+        )
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

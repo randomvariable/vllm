@@ -153,6 +153,30 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
     }
 )
 
+# Non-persistent PLE state is rebuilt in __init__; the checkpoint has no
+# corresponding columns, so drop those keys before loading.
+_QWEN4_EXP_PLE_SKIP_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "hashstats_": None,
+        "token_lookup": None,
+    }
+)
+
+# The standalone MTP drafter owns `mtp.*` weights; the main model drops them.
+_MTP_SKIP_MAPPER = WeightsMapper(orig_to_new_prefix={"mtp.": None})
+
+# Text-only serving (--language-model-only) never constructs the vision tower;
+# drop its weights, keyed on the post-rename `visual.` prefix.
+_VISUAL_SKIP_MAPPER = WeightsMapper(orig_to_new_prefix={"visual.": None})
+
+# The MTP checkpoint stores the mixer's raw down/injection projections; the
+# fused runtime slot is rebuilt in __init__, so drop the raw columns.
+_MIXER_SKIP_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "hyper_connection_mixer.block_inject_weight": None,
+    }
+)
+
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
@@ -562,21 +586,16 @@ class Qwen4ExpModel(nn.Module):
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
+        # Non-persistent PLE state rebuilt in __init__; drop any ckpt
         # column for them.
-        skip_substrs = [
-            "hashstats_",
-            "token_lookup",
-            "hyper_connection_mixer.block_inject_weight",
-        ]
+        mapper = self.hf_to_vllm_mapper | _QWEN4_EXP_PLE_SKIP_MAPPER
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=skip_substrs,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(
             weights,
-            mapper=self.hf_to_vllm_mapper,
+            mapper=mapper,
         )
         return loaded
 
@@ -801,10 +820,12 @@ class Qwen4ExpForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            weights,
+            mapper=self.hf_to_vllm_mapper | _MTP_SKIP_MAPPER,
+        )
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -990,13 +1011,17 @@ class Qwen4ExpForConditionalGeneration(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # `visual.` only ever appears after the Qwen3VL prefix rename
+        # (`model.visual.` → `visual.`), so language-model-only mode drops
+        # it at the renamed position.
+        mapper = self.hf_to_vllm_mapper | _MTP_SKIP_MAPPER
+        if self.language_model_only:
+            mapper |= _VISUAL_SKIP_MAPPER
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["visual."] if self.language_model_only else None,
-            skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
