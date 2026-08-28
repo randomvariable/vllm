@@ -53,6 +53,10 @@ KNOWN_CALLABLES: dict[str, set[str]] = {
         "QKVParallelLinear",
     },
     "vllm.model_executor.layers.logits_processor": {"LogitsProcessor"},
+    "vllm.v1.worker.gpu.dp_utils": {
+        "dispatch_cg_and_sync_dp",
+        "sync_cudagraph_and_dp_padding",
+    },
 }
 
 
@@ -60,21 +64,33 @@ KNOWN_CALLABLES: dict[str, set[str]] = {
 class Signature:
     params: set[str] = field(default_factory=set)
     has_var_kw: bool = False
+    # *args present: positional-count check unreliable
+    has_var_pos: bool = False
+    # ordered positional-or-keyword parameter names (self/cls stripped)
+    pos_params: list[str] = field(default_factory=list)
+    # keyword-only parameter names
+    kwonly_params: list[str] = field(default_factory=list)
+    # parameter names that carry a default value
+    defaults: set[str] = field(default_factory=set)
 
 
 def _signature_of(node: ast.AST) -> Signature | None:
     if isinstance(node, ast.ClassDef):
         if _is_dataclass(node):
-            # dataclasses synthesize __init__ from annotated fields.
+            # dataclasses synthesize __init__ from annotated fields; defaults
+            # are not tracked (assume all acceptable to keep the check sound).
             fields = [
                 a.target.id
                 for a in node.body
                 if isinstance(a, ast.AnnAssign) and isinstance(a.target, ast.Name)
             ]
-            # kw_only fields are indistinguishable from keyword-friendly
-            # positional-or-keyword here; treating all as accepted kwargs is
-            # correct for drift detection.
-            return Signature(params=set(fields), has_var_kw=False)
+            sig = Signature(
+                params=set(fields),
+                has_var_kw=False,
+                pos_params=fields,
+                defaults=set(fields),
+            )
+            return sig
         init = next(
             (
                 n
@@ -89,10 +105,24 @@ def _signature_of(node: ast.AST) -> Signature | None:
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return None
     args = node.args
-    sig = Signature()
-    sig.params = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
-    sig.has_var_kw = args.kwarg is not None
-    return sig
+    posall = (*args.posonlyargs, *args.args)
+    pos_params = [a.arg for a in posall]
+    if pos_params and pos_params[0] in ("self", "cls"):
+        pos_params = pos_params[1:]
+    n_defaults = len(args.defaults)
+    tail_posall = posall[-n_defaults:] if n_defaults else ()
+    defaults = {a.arg for a in tail_posall}
+    defaults.update(
+        a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None
+    )
+    return Signature(
+        params={a.arg for a in (*posall, *args.kwonlyargs)},
+        has_var_kw=args.kwarg is not None,
+        has_var_pos=args.vararg is not None,
+        pos_params=pos_params,
+        kwonly_params=[a.arg for a in args.kwonlyargs],
+        defaults=defaults,
+    )
 
 
 def _is_dataclass(node: ast.ClassDef) -> bool:
@@ -172,11 +202,35 @@ def main() -> int:
             sig = signatures[name]
             if sig.has_var_kw:
                 continue
+            npos = len(node.args)
+            kw_args = {kw.arg for kw in node.keywords}
             for kw in node.keywords:
                 if kw.arg not in sig.params:
                     findings.append(
                         f"{path}:{node.lineno}: {name}() got an unexpected "
                         f"keyword argument '{kw.arg}'"
+                    )
+            if (
+                npos > len(sig.pos_params)
+                and not sig.has_var_kw
+                and not sig.has_var_pos
+            ):
+                findings.append(
+                    f"{path}:{node.lineno}: {name}() received {npos} "
+                    f"positional arguments but takes at most "
+                    f"{len(sig.pos_params)}"
+                )
+            for i, p in enumerate(sig.pos_params, start=1):
+                if i > npos and p not in kw_args and p not in sig.defaults:
+                    findings.append(
+                        f"{path}:{node.lineno}: {name}() missing required "
+                        f"positional argument '{p}'"
+                    )
+            for p in sig.kwonly_params:
+                if p not in kw_args and p not in sig.defaults:
+                    findings.append(
+                        f"{path}:{node.lineno}: {name}() missing required "
+                        f"keyword-only argument '{p}'"
                     )
 
     for line in findings:
