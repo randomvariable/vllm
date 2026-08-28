@@ -180,6 +180,17 @@ class KVCacheSpec:
     def num_states(self) -> int:
         return self.get_num_kernel_states(self.block_size)
 
+    @property
+    def storage_block_size(self) -> int:
+        """Tokens per block as physically stored.
+
+        Equals `block_size` for uncompressed specs. Compressed specs
+        (e.g. DeepSeek V4 sparse MLA) override this with
+        `block_size // compress_ratio`, packing `block_size` logical
+        tokens into fewer physical slots.
+        """
+        return self.block_size
+
     def get_num_kernel_states(self, kernel_block_size: int) -> int:
         if self.tokens_per_state > 0:
             return kernel_block_size // self.tokens_per_state
