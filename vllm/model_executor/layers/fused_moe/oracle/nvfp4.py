@@ -20,9 +20,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     nvfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.quantization.utils.b12x_moe import (
+    prepare_nvfp4_moe_layer_for_b12x,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
-    prepare_nvfp4_moe_layer_for_b12x,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
