@@ -437,27 +437,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.on_multi_step_decode_begin(num_reqs)
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        decode_fn = (
-            self._fused_multi_step_decode
-            if self.use_fused_multi_step_decode
-            else self._multi_step_decode
-        )
-        if decode_fn is self._multi_step_decode:
-            decode_fn(
+        if self.use_fused_multi_step_decode:
+            self._fused_multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
+        else:
+            self._multi_step_decode(
                 num_reqs,
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
                 input_batch.seq_lens_cpu_upper_bound,
                 num_speculative_tokens,
-            )
-        else:
-            decode_fn(
-                num_reqs,
-                dummy_run and skip_attn_for_dummy_run,
-                decode_batch_desc,
-                num_tokens_across_dp,
-                input_batch.seq_lens_cpu_upper_bound,
             )
         self.on_multi_step_decode_end(num_reqs)
 
