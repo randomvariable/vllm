@@ -222,7 +222,12 @@ def run_headless(args: argparse.Namespace):
         )
 
         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+        # Returns once a worker process exits. A dead worker must fail this
+        # process too: exiting 0 makes the crash indistinguishable from a clean
+        # shutdown to whatever supervises us.
         executor.start_worker_monitor(inline=True)
+        if executor.is_failed:
+            raise RuntimeError("Headless executor stopped because a worker died")
         return
 
     host = parallel_config.data_parallel_master_ip
@@ -257,6 +262,9 @@ def run_headless(args: argparse.Namespace):
             logger.info("Waiting up to %d seconds for processes to exit", timeout)
         engine_manager.shutdown(timeout=timeout)
         logger.info("Shutting down.")
+
+    if (failed_proc_name := engine_manager.failed_proc_name) is not None:
+        raise RuntimeError(f"Engine core process {failed_proc_name} died unexpectedly")
 
 
 def run_multi_api_server(args: argparse.Namespace):

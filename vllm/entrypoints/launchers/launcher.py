@@ -159,7 +159,6 @@ async def serve_http(
 
     try:
         await server_task
-        return dummy_shutdown()
     except asyncio.CancelledError:
         port = uvicorn_kwargs["port"]
         process = find_process_using_port(port)
@@ -175,6 +174,16 @@ async def serve_http(
     finally:
         shutdown_task.cancel()
         watchdog_task.cancel()
+
+    # uvicorn returned on its own rather than being cancelled by the shutdown
+    # handler. Absent a signal, the only thing that stops the server is the
+    # watchdog reacting to a dead engine, and that must fail the process:
+    # exiting 0 makes a crash indistinguishable from a clean shutdown to
+    # whatever supervises us. A requested shutdown stops the engine
+    # deliberately -- which also marks it errored -- so skip the check there.
+    if not shutdown_event.is_set():
+        raise_if_engine_dead(app.state.engine_client)
+    return dummy_shutdown()
 
 
 async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
@@ -197,9 +206,29 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
     because handler must first return to close the connection
     for this request.
     """
-    engine_errored = engine.errored and not engine.is_running
-    if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
+    if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_is_dead(engine):
         server.should_exit = True
+
+
+def engine_is_dead(engine: EngineClient) -> bool:
+    """Whether the engine has failed and is no longer running."""
+    return engine.errored and not engine.is_running
+
+
+def raise_if_engine_dead(engine: EngineClient) -> None:
+    """Turn a dead engine into a non-zero process exit.
+
+    Raises:
+        RuntimeError: If the engine died. The caller is expected to let this
+            propagate so the process exits non-zero.
+    """
+    if not engine_is_dead(engine):
+        return
+    logger.error(
+        "[shutdown] API server: engine died, exiting non-zero. See the engine "
+        "traceback above for the root cause."
+    )
+    raise RuntimeError("API server stopped because the engine died")
 
 
 def create_server_socket(
