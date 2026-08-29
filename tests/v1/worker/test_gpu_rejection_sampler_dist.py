@@ -6,10 +6,11 @@ Rejection sampling only preserves the target distribution if the draft
 proposal, the acceptance uniform, and the recovery Gumbel noise are
 independent. The rejection sampler keys the acceptance uniform and the
 recovery noise for position P by Philox offset P, so the draft's Gumbel
-stream (draft_gumbel_pos) must live in a disjoint offset range: keying the
-draft by offset P as well makes the recovery draw reuse the exact noise
-vector that selected the rejected draft token, inflating draft-favored
-tokens (TV distance ~0.0125 vs a ~0.003 noise floor in this setup).
+stream must live in a disjoint offset range: keying the draft by offset P as
+well makes the recovery draw reuse the exact noise vector that selected the
+rejected draft token, inflating draft-favored tokens (TV distance ~0.0125 vs
+a ~0.003 noise floor in this setup). `is_drafting=True` is what moves the
+draft draw onto that disjoint range.
 """
 
 import pytest
@@ -18,7 +19,6 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
-from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
 VOCAB_SIZE = 32768
 NUM_REQS = 4096
@@ -79,8 +79,9 @@ def test_probabilistic_draft_output_distribution():
             idx_mapping,
             temperature,
             seeds,
-            draft_gumbel_pos(draft_row_pos),
+            draft_row_pos,
             apply_temperature=True,
+            is_drafting=True,
             logits_cache=draft_logits.view(NUM_REQS, -1),
             logits_cache_col=draft_step,
         )

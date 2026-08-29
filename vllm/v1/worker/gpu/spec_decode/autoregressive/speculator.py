@@ -461,7 +461,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        sample_src_positions: torch.Tensor,
         idx_mapping: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
@@ -472,7 +472,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if draft_logits is not None:
             return self._sample_probabilistic_draft(
                 logits=logits,
-                positions=positions,
+                sample_src_positions=sample_src_positions,
                 idx_mapping=idx_mapping,
                 temperature=temperature,
                 seeds=seeds,

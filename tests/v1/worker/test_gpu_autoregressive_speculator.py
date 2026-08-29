@@ -483,7 +483,9 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
-def test_probabilistic_draft_sampler_owns_disjoint_philox_offset(monkeypatch):
+
+
+def test_probabilistic_draft_sampler_marks_the_draw_as_drafting(monkeypatch):
     captured = {}
 
     def fake_gumbel_sample(
@@ -506,7 +508,7 @@ def test_probabilistic_draft_sampler_owns_disjoint_philox_offset(monkeypatch):
 
     speculator._sample_probabilistic_draft(
         logits=torch.zeros(2, 5),
-        positions=positions,
+        sample_src_positions=positions,
         idx_mapping=torch.arange(2),
         temperature=torch.ones(2),
         seeds=torch.tensor([7, 11], dtype=torch.int64),
@@ -515,9 +517,10 @@ def test_probabilistic_draft_sampler_owns_disjoint_philox_offset(monkeypatch):
         active_rows=active_rows,
     )
 
-    torch.testing.assert_close(
-        captured["positions"], positions + 1 + (1 << 30), rtol=0, atol=0
-    )
+    # The disjoint draft offset now lives in the Gumbel kernel, keyed off
+    # is_drafting, so the sampler must forward the positions untouched.
+    torch.testing.assert_close(captured["positions"], positions, rtol=0, atol=0)
+    assert captured["is_drafting"] is True
     assert captured["apply_temperature"] is True
     assert captured["logits_cache_active_rows"] is active_rows
 
@@ -528,7 +531,7 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
     def fake_sample_probabilistic_draft(
         self,
         logits,
-        positions,
+        sample_src_positions,
         idx_mapping,
         temperature,
         seeds,
@@ -536,7 +539,7 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
         draft_logits,
         active_rows=None,
     ):
-        captured["positions"] = positions
+        captured["positions"] = sample_src_positions
         captured["active_rows"] = active_rows
         return torch.zeros(logits.shape[0], dtype=torch.int64)
 
@@ -555,7 +558,7 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
 
     speculator.sample_draft(
         hidden_states=torch.zeros(2, 3),
-        positions=positions,
+        sample_src_positions=positions,
         idx_mapping=torch.arange(2),
         temperature=torch.ones(2),
         seeds=torch.tensor([7, 11], dtype=torch.int64),
