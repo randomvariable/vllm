@@ -102,11 +102,7 @@ logger = init_logger(__name__)
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
-    return (
-        2
-        if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
-        else 1
-    )
+    return 2 if use_v2_model_runner and spec_config is not None else 1
 
 
 def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:
@@ -159,6 +155,7 @@ def runtime_kernel_warmup(worker: "Worker") -> None:
     )
 
     run_runtime_kernel_warmup(worker)
+
 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
