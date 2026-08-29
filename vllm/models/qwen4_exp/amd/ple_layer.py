@@ -974,10 +974,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         layer_attn_metadata = attn_metadata.get(self.prefix)
         if layer_attn_metadata is None:
-            raise RuntimeError(
-                f"Missing short-conv metadata for layer '{self.prefix}'. "
-                "This would bypass conv-state updates and is not allowed."
-            )
+            # Profile / CUDA-graph capture runs exclude MambaSpec groups from
+            # the attention groups (model_runner.py), so no per-layer metadata
+            # is built here. Take the cheap warmup path, matching the GDN
+            # layers; conv state is not updated.
+            return self._short_conv_fallback(inputs)
         if not isinstance(layer_attn_metadata, PleShortConvAttentionMetadata):
             raise TypeError(
                 "Expected PleShortConvAttentionMetadata for layer "
