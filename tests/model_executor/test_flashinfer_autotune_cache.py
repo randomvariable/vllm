@@ -132,54 +132,67 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
     return calls
 
 
-def test_flashinfer_autotune_dummy_run_skips_pre_kv_v2_attention() -> None:
+def _autotune_dummy_run_kwargs(runner) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+    runner._dummy_run = lambda **kwargs: calls.append(kwargs)
+    kernel_warmup._run_flashinfer_autotune_dummy_runs(runner)
+    return calls
+
+
+def _autotune_runner(*, use_v2: bool, kv_initialized: bool = False) -> SimpleNamespace:
     runner = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
-        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        vllm_config=SimpleNamespace(
+            use_v2_model_runner=use_v2,
+            kernel_config=SimpleNamespace(linear_backend="flashinfer"),
+        ),
     )
+    if kv_initialized:
+        runner.block_tables = object()
+    return runner
 
-    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
 
-    assert kwargs == {
-        "num_tokens": 8192,
-        "skip_eplb": True,
-        "is_profile": True,
-        "randomize_inputs": True,
-        "skip_attn": True,
-    }
+def test_flashinfer_autotune_dummy_run_skips_pre_kv_v2_attention() -> None:
+    assert _autotune_dummy_run_kwargs(_autotune_runner(use_v2=True)) == [
+        {
+            "num_tokens": 8192,
+            "skip_eplb": True,
+            "is_profile": True,
+            "randomize_inputs": True,
+            "skip_attn": True,
+        }
+    ]
 
 
 def test_flashinfer_autotune_dummy_run_keeps_attention_after_kv_init() -> None:
-    runner = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
-        vllm_config=SimpleNamespace(use_v2_model_runner=True),
-        block_tables=object(),
-    )
+    runner = _autotune_runner(use_v2=True, kv_initialized=True)
 
-    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
-
-    assert kwargs == {
-        "num_tokens": 8192,
-        "skip_eplb": True,
-        "is_profile": True,
-        "randomize_inputs": True,
-    }
+    assert _autotune_dummy_run_kwargs(runner) == [
+        {
+            "num_tokens": 8192,
+            "skip_eplb": True,
+            "is_profile": True,
+            "randomize_inputs": True,
+        }
+    ]
 
 
 def test_flashinfer_autotune_dummy_run_keeps_v1_signature() -> None:
-    runner = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
-        vllm_config=SimpleNamespace(use_v2_model_runner=False),
-    )
+    assert _autotune_dummy_run_kwargs(_autotune_runner(use_v2=False)) == [
+        {
+            "num_tokens": 8192,
+            "skip_eplb": True,
+            "is_profile": True,
+            "randomize_inputs": True,
+        }
+    ]
 
-    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
 
-    assert kwargs == {
-        "num_tokens": 8192,
-        "skip_eplb": True,
-        "is_profile": True,
-        "randomize_inputs": True,
-    }
+def test_flashinfer_autotune_adds_bf16_cutedsl_token_count() -> None:
+    runner = _autotune_runner(use_v2=False)
+    runner.vllm_config.kernel_config.linear_backend = "flashinfer_cutedsl"
+
+    assert [c["num_tokens"] for c in _autotune_dummy_run_kwargs(runner)] == [8192, 32]
 
 
 def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:

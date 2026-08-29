@@ -4,7 +4,7 @@ import gc
 import itertools
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -344,7 +344,6 @@ class CudaGraphManager:
                     descs_by_token_lora[(desc.num_tokens, num_active_loras)].append(
                         desc
                     )
-
 
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -1092,9 +1091,7 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state.encoder_runner.clear()
     # Detach profiling KV tensors held by attention layers. The layers live
     # in the static forward context for compiled models.
-    layers: list[Any] = list(
-        runner.compilation_config.static_forward_context.values()
-    )
+    layers: list[Any] = list(runner.compilation_config.static_forward_context.values())
     if (model := getattr(runner, "model", None)) is not None:
         layers = list(itertools.chain(layers, model.modules()))
     for layer in layers:

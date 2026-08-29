@@ -214,8 +214,6 @@ def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
 
 
-
-
 def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> str:
     if dummy_run:
         return "dummy"
@@ -1839,7 +1837,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         with record_function_or_nullcontext("vllm:v2/target/dispatch"):
-            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+            batch_desc, dp_sync = dispatch_cg_and_sync_dp(
                 self.cudagraph_manager,
                 num_reqs,
                 num_toks,
@@ -2144,6 +2142,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        state_num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2166,7 +2167,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _maybe_flush_kquant_capture()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
-        num_spec_tokens_to_schedule = execute_model_state.num_spec_tokens_to_schedule
+        num_spec_tokens_to_schedule = state_num_spec_tokens_to_schedule
         if self.verification_capacity_manager is not None:
             num_spec_tokens_to_schedule = (
                 self.verification_capacity_manager.recommended_draft_depth(
