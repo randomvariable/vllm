@@ -1,0 +1,16 @@
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 252,904,935,1041,1046
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 153-162,233-243,300,604-615,796-810,948-964
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c58179b0a3619116253bb039d64d6f0bc3eca94b",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
