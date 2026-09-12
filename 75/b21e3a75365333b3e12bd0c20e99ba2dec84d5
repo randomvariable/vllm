@@ -1,0 +1,14 @@
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 961-1001
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "75b21e3a75365333b3e12bd0c20e99ba2dec84d5",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
