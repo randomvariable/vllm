@@ -1,0 +1,14 @@
+tests/model_executor/test_qwen3_omni.py
+  h_15da545fc8cfbe 358,372-375
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "db73f300f97a70e29811ff3212da19cbce36e271",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
