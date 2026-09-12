@@ -1,0 +1,14 @@
+csrc/spinloop.cpp
+  h_15da545fc8cfbe 5,7,10-13,27-47,81-224,226,261-268,271-275,343-358,361-372,375,379-382,387-391,404-405,409-418
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "44734bbd074f1a474500e5121e87577ec6a78ab6",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
