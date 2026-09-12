@@ -1,0 +1,20 @@
+csrc/spinloop.cpp
+  h_15da545fc8cfbe 30,79-88,156,207-210,266,272-274,345,358-359
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 961-1001,1054-1064
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 805,829-832
+vllm/envs.py
+  h_15da545fc8cfbe 2321-2326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "249a70554d72fb3de615a8afa6cea41483fd57ce",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
