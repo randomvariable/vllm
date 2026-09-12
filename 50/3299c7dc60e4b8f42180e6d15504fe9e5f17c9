@@ -1,0 +1,24 @@
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 961-1010,1021-1023,1053,1055-1056,1060,1063-1073
+  h_15da545fc8cfbe 17-18,260-263,265-306,794-960,1011-1020,1024-1052,1054,1057-1059,1061-1062
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 112-134,165-167,169,621-623,787-788,793-795,817,841-844
+  h_15da545fc8cfbe 6,135-164,168,170-197,221,225-229,235,273-277,279-289,309,617-620,765-766,785-786,789-792,796,838-840,917-925,927-947
+docs/configuration/env_vars.md
+  h_15da545fc8cfbe 16-17
+  h_15da545fc8cfbe 10-15
+vllm/envs.py
+  h_15da545fc8cfbe 25,777-783,2329-2335
+  h_15da545fc8cfbe 21-24,746-776
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "503299c7dc60e4b8f42180e6d15504fe9e5f17c9",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
