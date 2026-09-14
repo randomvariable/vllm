@@ -1,0 +1,14 @@
+vllm/model_executor/kernels/linear/scaled_mm/b12x.py
+  h_15da545fc8cfbe 195,427
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5047406a00b72fdb474e02589b3e51dc218c8338",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
