@@ -1,0 +1,16 @@
+vllm/model_executor/warmup/b12x_prepare.py
+  h_15da545fc8cfbe 432-433,437-451,453,456-458,461-462
+vllm/v1/worker/b12x_startup.py
+  h_15da545fc8cfbe 41,77-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5fc4877af44d4b399da669d9a47965ad05db7af1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
