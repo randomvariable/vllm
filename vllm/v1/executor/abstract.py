@@ -58,7 +58,10 @@ def _aggregate_b12x_progress(outcomes, *, expected_ranks=None):
         "total_candidates": (
             sum(item.total_candidates for item in progress)
             if all(item.total_candidates is not None for item in progress)
-            and (expected_ranks is None or {rank for rank, _ in ranked} == set(expected_ranks))
+            and (
+                expected_ranks is None
+                or {rank for rank, _ in ranked} == set(expected_ranks)
+            )
             else None
         ),
         "compilations": sum(item.compilations for item in progress),
@@ -176,12 +179,17 @@ class Executor(ABC):
         from vllm.platforms import current_platform
         from vllm.utils.b12x import has_b12x
 
-        if not (has_b12x() and current_platform.is_cuda()
-                and current_platform.is_device_capability_family(120)):
+        if not (
+            has_b12x()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
             yield
             return
-        if (not self.vllm_config.kernel_config.enable_b12x_autotune
-                or os.environ.get("B12X_AUTOTUNE", "1") == "0"):
+        if (
+            not self.vllm_config.kernel_config.enable_b12x_autotune
+            or os.environ.get("B12X_AUTOTUNE", "1") == "0"
+        ):
             self.cancel_b12x_autotuning()
             yield
             return
@@ -205,6 +213,7 @@ class Executor(ABC):
         from queue import Empty, SimpleQueue
 
         import torch.distributed as dist
+
         from vllm.utils.network_utils import get_ip
 
         display = output = None
@@ -228,6 +237,7 @@ class Executor(ABC):
             )
             if any(item.get("native") for item in outcomes):
                 from b12x.preparation import PreparationDisplay
+
                 from vllm.utils.system_utils import undecorated_log_stream
 
                 stream = undecorated_log_stream(sys.stderr)
@@ -238,7 +248,8 @@ class Executor(ABC):
                     stream = output.stream or stream
                 phase_number = {"weights": 1, "state": 2}[stage]
                 display = PreparationDisplay(
-                    global_rank=0, stream=stream,
+                    global_rank=0,
+                    stream=stream,
                     title=f"b12x / kernel autotuning (phase {phase_number}/2)",
                     cancel_available=bool(
                         getattr(self, "_b12x_keyboard", None)
@@ -249,7 +260,10 @@ class Executor(ABC):
             if not all(bool(item.get("done")) for item in outcomes):
                 address = get_ip()
                 store = dist.TCPStore(
-                    address, 0, is_master=True, wait_for_workers=False,
+                    address,
+                    0,
+                    is_master=True,
+                    wait_for_workers=False,
                     timeout=timedelta(seconds=30),
                 )
                 stopped = threading.Event()
@@ -283,15 +297,20 @@ class Executor(ABC):
                             if display is not None:
                                 snapshots = [
                                     pickle.loads(store.get(f"progress/{rank}"))
-                                    for rank in ranks if store.check([f"progress/{rank}"])
+                                    for rank in ranks
+                                    if store.check([f"progress/{rank}"])
                                 ]
-                                progress = _aggregate_b12x_progress(snapshots, expected_ranks=ranks)
+                                progress = _aggregate_b12x_progress(
+                                    snapshots, expected_ranks=ranks
+                                )
                                 if progress is not None and not progress.done:
                                     display.update(progress)
                     except BaseException as error:
                         reporting_errors.append(error)
 
-                reporter = threading.Thread(target=report_progress, name="b12x-progress", daemon=True)
+                reporter = threading.Thread(
+                    target=report_progress, name="b12x-progress", daemon=True
+                )
                 reporter.start()
                 try:
                     if self._b12x_autotuning_cancel.is_set():
@@ -312,6 +331,15 @@ class Executor(ABC):
                 if output is not None:
                     output.stop()
                     drain_local_output()
+                native = [bool(item.get("native")) for item in outcomes]
+                if any(native) and not all(native):
+                    raise RuntimeError(
+                        "b12x preparation world is asymmetrically native: "
+                        "outcomes "
+                        f"{[bool(item.get('native')) for item in outcomes]} "
+                        "by rank order; the native ranks would prepare "
+                        "single-sided and never authorize collectives."
+                    )
                 if display is not None:
                     progress = _aggregate_b12x_progress(outcomes)
                     if progress is not None:
@@ -329,9 +357,7 @@ class Executor(ABC):
                 try:
                     self.collective_rpc("abort_b12x_preparation")
                 except BaseException as cleanup_error:
-                    error.add_note(
-                        f"b12x preparation abort failed: {cleanup_error!r}"
-                    )
+                    error.add_note(f"b12x preparation abort failed: {cleanup_error!r}")
             raise
         finally:
             try:
