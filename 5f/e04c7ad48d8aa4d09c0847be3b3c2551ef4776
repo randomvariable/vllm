@@ -1,0 +1,18 @@
+tests/v1/worker/test_b12x_native_guard.py
+  h_15da545fc8cfbe 1-75
+vllm/v1/executor/abstract.py
+  h_15da545fc8cfbe 208-218
+vllm/v1/worker/b12x_startup.py
+  h_15da545fc8cfbe 76,235-236,264-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5fe04c7ad48d8aa4d09c0847be3b3c2551ef4776",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
