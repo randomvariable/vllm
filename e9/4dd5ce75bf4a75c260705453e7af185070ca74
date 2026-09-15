@@ -1,0 +1,16 @@
+vllm/distributed/device_communicators/b12x_roce_all_reduce.py
+  h_15da545fc8cfbe 207,238-245
+vllm/model_executor/warmup/b12x_prepare.py
+  h_15da545fc8cfbe 40-45,418,434-459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e94dd5ce75bf4a75c260705453e7af185070ca74",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
