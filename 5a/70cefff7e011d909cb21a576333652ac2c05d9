@@ -1,0 +1,18 @@
+tests/config/test_speculative_draft_hf_overrides.py
+  h_15da545fc8cfbe 45-75
+tests/models/test_qwen3_8_flash_next_qsa.py
+  h_15da545fc8cfbe 516-536
+vllm/config/speculative.py
+  h_15da545fc8cfbe 1041-1059,1086-1099,1301-1303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5a70cefff7e011d909cb21a576333652ac2c05d9",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
