@@ -43,6 +43,37 @@ def test_dict_overrides_are_not_forwarded_to_draft():
 
 
 @pytest.mark.cpu_test
+def test_mtp_draft_receives_target_dict_overrides():
+    """An in-model MTP draft shares the target's positional geometry."""
+    target_hf_overrides = {
+        "text_config": {
+            "max_position_embeddings": 1048576,
+            "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
+        },
+    }
+    override = SpeculativeConfig.get_draft_hf_overrides("mtp", target_hf_overrides)
+    assert callable(override)
+    text_config = _make_hf_config(
+        max_position_embeddings=262144,
+        rope_parameters={"rope_type": "default"},
+        hc_count=4,
+        mtp_num_hidden_layers=2,
+        num_attention_heads=4,
+    )
+    source = _make_hf_config(
+        architectures=["Qwen3_8FlashNextForCausalLM"],
+        model_type="qwen3_8_flash_next",
+        text_config=text_config,
+    )
+
+    out = override(source)
+
+    assert out.model_type == "qwen3_8_flash_next_mtp"
+    assert out.text_config.max_position_embeddings == 1048576
+    assert out.text_config.rope_parameters == {"rope_type": "yarn", "factor": 4.0}
+
+
+@pytest.mark.cpu_test
 def test_none_overrides_fall_back_to_arch_mapping():
     composed = SpeculativeConfig.compose_draft_hf_overrides(None)
     assert composed is SpeculativeConfig.hf_config_override

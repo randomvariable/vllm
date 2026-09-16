@@ -513,6 +513,27 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
+def test_qsa_prefill_binding_accepts_pass_one_at_one_million_tokens() -> None:
+    """Pass one uses a prefill plan at the target context ceiling."""
+    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner.max_decode_rows = 16
+    owner.max_seq_len = 1048576
+    prefill_plan = object()
+    owner._qsa_prefill_bindings = (
+        qsa_module._QSAContextPlan(
+            max_seq_len=1048576,
+            caps=None,
+            plan=prefill_plan,
+        ),
+    )
+    owner._qsa_decode_context = None
+
+    assert (
+        owner._qsa_binding_for_workload(rows=17, max_seq_len=1048576).plan
+        is prefill_plan
+    )
+
+
 def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
     rows = 2
     query = torch.randn(rows, 6, 256, dtype=torch.bfloat16)

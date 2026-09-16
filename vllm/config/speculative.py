@@ -1039,6 +1039,25 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def _apply_mtp_dict_hf_override(
+        target_hf_overrides: dict[str, Any],
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        hf_config = SpeculativeConfig.hf_config_override(hf_config)
+        for key, value in target_hf_overrides.items():
+            target = getattr(hf_config, key, None)
+            if isinstance(value, dict) and target is not None:
+                if isinstance(target, dict):
+                    target.update(value)
+                    continue
+                if hasattr(target, "__dict__"):
+                    for nested_key, nested_value in value.items():
+                        setattr(target, nested_key, nested_value)
+                    continue
+            setattr(hf_config, key, value)
+        return hf_config
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
     ) -> Callable[[PretrainedConfig], PretrainedConfig]:
@@ -1063,6 +1082,20 @@ class SpeculativeConfig:
         return functools.partial(
             SpeculativeConfig._apply_composed_hf_override, target_hf_overrides
         )
+
+    @staticmethod
+    def get_draft_hf_overrides(
+        method: str,
+        target_hf_overrides: HfOverrides | None,
+    ) -> HfOverrides:
+        if method == "medusa":
+            return {"model_type": "medusa"}
+        if method == "mtp" and isinstance(target_hf_overrides, dict):
+            return functools.partial(
+                SpeculativeConfig._apply_mtp_dict_hf_override,
+                target_hf_overrides,
+            )
+        return SpeculativeConfig.compose_draft_hf_overrides(target_hf_overrides)
 
     @staticmethod
     def _is_custom_proposer_path(model: str | None) -> bool:
@@ -1265,15 +1298,9 @@ class SpeculativeConfig:
                 # detect them. When the method is explicitly "medusa", inject
                 # model_type so MedusaConfig.from_pretrained is used instead.
                 draft_hf_overrides: HfOverrides
-                if self.method == "medusa":
-                    draft_hf_overrides = {"model_type": "medusa"}
-                else:
-                    # Compose any callable hf_overrides set on the target so the
-                    # draft config receives the same transform (e.g. the test
-                    # shrink). Dict overrides stay target-only.
-                    draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                        self.target_model_config.hf_overrides
-                    )
+                draft_hf_overrides = SpeculativeConfig.get_draft_hf_overrides(
+                    self.method, self.target_model_config.hf_overrides
+                )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
