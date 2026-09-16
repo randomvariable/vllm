@@ -1,0 +1,14 @@
+vllm/models/deepseek_v4/nvidia/b12x.py
+  h_15da545fc8cfbe 639
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4d2e645e218ee77e10b7fe5bd98126782216d7b1",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
