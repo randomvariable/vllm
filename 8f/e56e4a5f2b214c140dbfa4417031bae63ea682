@@ -1,0 +1,14 @@
+vllm/models/deepseek_v4/attention.py
+  h_15da545fc8cfbe 978
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8fe56e4a5f2b214c140dbfa4417031bae63ea682",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
