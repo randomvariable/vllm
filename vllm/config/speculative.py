@@ -1035,6 +1035,7 @@ class SpeculativeConfig:
         target_hf_overrides: Callable[[PretrainedConfig], PretrainedConfig],
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
+        """Apply the draft normalization before a target config transform."""
         hf_config = SpeculativeConfig.hf_config_override(hf_config)
         return target_hf_overrides(hf_config)
 
@@ -1043,6 +1044,7 @@ class SpeculativeConfig:
         target_hf_overrides: dict[str, Any],
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
+        """Apply target patches without replacing the MTP discriminator."""
         hf_config = SpeculativeConfig.hf_config_override(hf_config)
         for key, value in target_hf_overrides.items():
             if key in {"architectures", "model_type"}:
@@ -1090,6 +1092,7 @@ class SpeculativeConfig:
         method: str,
         target_hf_overrides: HfOverrides | None,
     ) -> HfOverrides:
+        """Return overrides appropriate for the selected draft method."""
         if method == "medusa":
             return {"model_type": "medusa"}
         if method == "mtp" and isinstance(target_hf_overrides, dict):
@@ -1112,6 +1115,7 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        """Validate speculative settings and construct the draft configuration."""
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
