@@ -46,6 +46,8 @@ def test_dict_overrides_are_not_forwarded_to_draft():
 def test_mtp_draft_receives_target_dict_overrides():
     """An in-model MTP draft shares the target's positional geometry."""
     target_hf_overrides = {
+        "architectures": ["Qwen3_8FlashNextForCausalLM"],
+        "model_type": "qwen3_8_flash_next",
         "text_config": {
             "max_position_embeddings": 1048576,
             "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
@@ -69,6 +71,7 @@ def test_mtp_draft_receives_target_dict_overrides():
     out = override(source)
 
     assert out.model_type == "qwen3_8_flash_next_mtp"
+    assert out.architectures == ["Qwen3_8FlashNextMTP"]
     assert out.text_config.max_position_embeddings == 1048576
     assert out.text_config.rope_parameters == {"rope_type": "yarn", "factor": 4.0}
 

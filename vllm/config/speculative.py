@@ -1045,6 +1045,8 @@ class SpeculativeConfig:
     ) -> PretrainedConfig:
         hf_config = SpeculativeConfig.hf_config_override(hf_config)
         for key, value in target_hf_overrides.items():
+            if key in {"architectures", "model_type"}:
+                continue
             target = getattr(hf_config, key, None)
             if isinstance(value, dict) and target is not None:
                 if isinstance(target, dict):
