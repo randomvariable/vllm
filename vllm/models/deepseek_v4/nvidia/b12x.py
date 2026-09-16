@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x compressed sparse MLA for DeepSeek V4."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
-from dataclasses import replace
 from functools import cache
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import torch
 
@@ -34,23 +31,13 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
-    b12x_layer,
-    b12x_layer_prefix,
     get_b12x_compressed_sparse_mla,
     get_b12x_mhc,
-    get_b12x_scratch_buffers,
     get_b12x_wo_projection,
-    register_b12x_layer,
     set_b12x_preparation_provider,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import (
-    LayerNameType,
-    _encode_layer_name,
-    _resolve_layer_name,
-    current_stream,
-    direct_register_custom_op,
-)
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -65,8 +52,6 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
-    from b12x.preparation import Plan
-
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -86,14 +71,7 @@ def _require_b12x_compressed_sparse_mla() -> Any:
         raise RuntimeError(
             "B12x compressed sparse MLA is not supported on this device."
         )
-    for name in (
-        "Caps",
-        "plan",
-        "bind",
-        "run",
-        "invocation_from_descriptors",
-        "split_chunks_for_contract",
-    ):
+    for name in ("Caps", "plan", "run", "split_chunks_for_contract"):
         getattr(module, name)
     return module
 
@@ -106,7 +84,7 @@ def _require_b12x_wo_projection() -> Any:
         )
     if not module.is_supported():
         raise RuntimeError("B12x output projection is not supported on this device.")
-    for name in ("Caps", "plan", "pack_weights", "bind_inv_rope", "run_inv_rope"):
+    for name in ("pack_weights", "run_inv_rope"):
         getattr(module, name)
     return module
 
@@ -164,8 +142,8 @@ class B12xMHCResidual:
         self._run_pre = module.run_pre
         self._run_post = module.run_post
         self._run_post_pre = module.run_post_pre
-        self._plans: dict[tuple[str, int], Plan] = {}
-        self._plan_key: tuple[tuple[int, ...], bool] | None = None
+        self._plans: dict[tuple[str, int], object] = {}
+        self._plan_key: tuple[int, ...] | None = None
 
         expected_hc_mult = int(module.MULT)
         if hc_mult != expected_hc_mult:
@@ -188,17 +166,53 @@ class B12xMHCResidual:
             )
         self.split_k = total_k // self.block_k
 
-    def _plan_for(self, operation: str, tokens: int) -> Plan:
+    def _plan_for(self, operation: str, tokens: int, device=None) -> object:
         tokens = int(tokens)
         exact = self._plans.get((operation, tokens))
         if exact is not None:
             return exact
         capacity = max((rows for op, rows in self._plans if op == operation), default=0)
-        if 0 <= tokens <= capacity and capacity:
+        if tokens <= capacity and capacity:
             return self._plans[(operation, capacity)]
-        raise RuntimeError(
-            f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {capacity}"
+        # Profiling and other pre-preparation callers execute against a live
+        # batch before the weights-stage provider declares any plan. Build an
+        # on-demand plan for this bucket; require_prepared lazily materializes
+        # it with the default configuration (a warning, not an error, outside
+        # a frozen session), and the served path keeps using the prepared plan.
+        from b12x.preparation import FrozenMapping
+
+        plan_operation = (
+            "post_pre" if operation in ("post_pre", "post_pre_bf16") else operation
         )
+        invocation = FrozenMapping(
+            {
+                "operation": plan_operation,
+                "has_norm_weight": plan_operation != "post",
+                "norm_weight_dtype": "bfloat16",
+                "has_fn_bf16": operation == "post_pre_bf16",
+                "lagged_mix": False,
+                "bf16x2_eligible": True,
+                "output_mode": "functional",
+                "rms_eps": self.rms_eps,
+                "hc_eps": self.hc_eps,
+                "sinkhorn_iters": self.sinkhorn_iters,
+                "norm_eps": self.rms_eps,
+                "block_k": self.block_k,
+                "block_h": self.block_h,
+            }
+        )
+        plan = self._plan_factory(
+            self._caps(
+                device=device,
+                dtype=torch.bfloat16,
+                max_tokens=max(tokens, 1),
+                hidden_size=self.hidden_size,
+                split_k=self.split_k,
+            ),
+            invocation=invocation,
+        )
+        self._plans[(operation, max(tokens, 1))] = plan
+        return plan
 
     def run_pre(
         self,
@@ -220,7 +234,7 @@ class B12xMHCResidual:
             sinkhorn_iters=self.sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
-            plan=self._plan_for("pre", int(residual.shape[0])),
+            plan=self._plan_for("pre", int(residual.shape[0]), residual.device),
         )
 
     def run_post_pre(
@@ -255,6 +269,7 @@ class B12xMHCResidual:
             plan=self._plan_for(
                 "post_pre_bf16" if hc_fn_bf16 is not None else "post_pre",
                 tokens,
+                residual.device,
             ),
         )
 
@@ -270,19 +285,20 @@ class B12xMHCResidual:
             residual,
             post,
             comb,
-            plan=self._plan_for("post", int(residual.shape[0])),
+            plan=self._plan_for("post", int(residual.shape[0]), residual.device),
         )
 
-    def _request_name(self, layer: torch.nn.Module, operation: str, tokens: int) -> str:
+    def _request_name(self, layer: object, operation: str, tokens: int) -> str:
         return f"deepseek_v4.mhc.{id(layer):x}.{operation}.m{tokens}"
 
     def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload
+        self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
         """Declare every real mHC operand after decoder weights are published."""
         from b12x.preparation import FrozenMapping
 
         parameters = (
+            layer.hc_attn_fn_broadcast,
             layer.hc_attn_fn,
             layer.hc_ffn_fn,
             layer.hc_ffn_fn_bf16,
@@ -296,23 +312,16 @@ class B12xMHCResidual:
         if any(parameter is None or parameter.is_meta for parameter in parameters):
             return ()
 
-        tokens_to_prepare = tuple(
-            sorted({workload.max_tokens, *workload.fixed_token_counts})
-        )
-        broadcast = layer.hc_attn_fn_broadcast
-        has_broadcast = broadcast is not None and not broadcast.is_meta
-        key = (tokens_to_prepare, has_broadcast)
+        key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
         if not self._plans or self._plan_key != key:
-            plans: dict[tuple[str, int], Plan] = {}
-            for tokens in tokens_to_prepare:
+            plans: dict[tuple[str, int], object] = {}
+            for tokens in key:
                 for operation, plan_operation, has_fn_bf16 in (
                     ("pre", "pre", False),
                     ("post_pre", "post_pre", False),
                     ("post_pre_bf16", "post_pre", True),
                     ("post", "post", False),
                 ):
-                    if operation == "pre" and not has_broadcast:
-                        continue
                     norm = (
                         layer.attn_norm
                         if operation in ("pre", "post_pre")
@@ -354,7 +363,8 @@ class B12xMHCResidual:
                 prepare_call=self._prepare_call(layer, operation, tokens),
                 benchmark_call=self._prepare_call(layer, operation, tokens),
             )
-            for operation, tokens in self._plans
+            for tokens in key
+            for operation in ("pre", "post_pre", "post_pre_bf16", "post")
         ]
         return (
             B12xPreparationUnit(
@@ -366,7 +376,7 @@ class B12xMHCResidual:
             ),
         )
 
-    def _prepare_call(self, layer: torch.nn.Module, operation: str, tokens: int):
+    def _prepare_call(self, layer: object, operation: str, tokens: int):
         """Prime/benchmark only borrowed checkpoint tensors and fresh activations."""
 
         def prepare(state):
@@ -489,16 +499,6 @@ def _c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
     return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
 
 
-def _c128a_profile_widths(max_width: int) -> tuple[int, ...]:
-    """Widths emitted by C128 metadata's power-of-two, capacity-capped views."""
-    widths = {max_width}
-    width = _C128A_TOPK_ALIGNMENT
-    while width < max_width:
-        widths.add(width)
-        width *= 2
-    return tuple(sorted(widths))
-
-
 @cache
 def _max_q_chunks(
     max_rows: int,
@@ -560,6 +560,17 @@ def _cache_page_view(
     )
 
 
+def _descriptor_from_tensor(tensor: torch.Tensor) -> dict[str, object]:
+    """Mirror b12x `_tensor_metadata` without importing private helpers."""
+    pointer = tensor.data_ptr()
+    return {
+        "shape": tuple(int(value) for value in tensor.shape),
+        "stride": tuple(int(value) for value in tensor.stride()),
+        "alignment": min(16, pointer & -pointer) if pointer else 16,
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+    }
+
+
 def _cache_page_view_key(
     cache: torch.Tensor,
     page_size: int,
@@ -588,13 +599,20 @@ def _run_compressed_sparse_mla(
     indexed_indices: torch.Tensor | None,
     indexed_lens: torch.Tensor | None,
     indexed_page_size: int | None,
-    plan: Plan,
+    mode: Literal["decode", "extend"],
+    decode_row_capacity: int | None = None,
 ) -> None:
-    from b12x.preparation import require_prepared
-
     module = _require_b12x_compressed_sparse_mla()
-    heads = int(q.shape[1])
-    require_prepared(plan, "attention.compressed_sparse_mla", q.device)
+    rows, heads = int(q.shape[0]), int(q.shape[1])
+    if (
+        mode == "decode"
+        and decode_row_capacity is not None
+        and rows > int(decode_row_capacity)
+    ):
+        raise ValueError(
+            f"B12x decode rows {rows} exceed the declared capacity "
+            f"{decode_row_capacity}"
+        )
 
     q = q.contiguous()
     swa_indices = swa_indices.contiguous()
@@ -604,18 +622,56 @@ def _run_compressed_sparse_mla(
     if indexed_lens is not None:
         indexed_lens = indexed_lens.contiguous()
 
-    binding = module.bind(
-        plan,
-        scratch=get_b12x_scratch_buffers(plan),
+    width = int(swa_indices.shape[-1])
+    if indexed_indices is not None:
+        width += int(indexed_indices.shape[-1])
+    max_chunks_per_row = module.split_chunks_for_contract(
+        rows=max(rows, 1),
+        width=max(width, 1),
+        decode_row_capacity=decode_row_capacity,
+    )
+    # plan() keys the compile identity on the caller's storage ABI
+    # (b12x >=77351c13), so describe the exact operands bound below.
+    invocation = module.invocation_from_tensors(
+        q=q,
+        swa_k_cache=swa_k_cache,
+        indexed_k_cache=indexed_k_cache,
+    )
+    indexed_width_serving = (
+        int(indexed_indices.shape[-1]) if indexed_indices is not None else 0
+    )
+    plan = module.plan(
+        module.Caps(
+            device=q.device,
+            num_q_heads=heads,
+            max_q_rows=max(rows, 1),
+            max_width=max(width, 1),
+            swa_width=max(int(width) - indexed_width_serving, 0),
+            indexed_width=indexed_width_serving,
+            head_dim=_DSV4_HEAD_DIM,
+            v_head_dim=_DSV4_HEAD_DIM,
+            page_size=int(swa_page_size),
+            indexed_page_size=(
+                int(indexed_page_size) if indexed_page_size is not None else None
+            ),
+            max_chunks_per_row=max_chunks_per_row,
+            decode_row_capacity=decode_row_capacity,
+        ),
+        invocation=invocation,
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *((s.shape, s.dtype) for s in plan.scratch_specs())
+    )
+    binding = plan.bind(
+        scratch=scratch,
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lens,
         indexed_indices=indexed_indices,
         indexed_lengths=indexed_lens,
     )
-    retain_cuda_graph_capture_resource(binding)
+    binding.scratch.mode = mode
     module.run(
-        plan=plan,
         binding=binding,
         swa_k_cache=swa_k_cache,
         swa_page_size=int(swa_page_size),
@@ -656,33 +712,6 @@ class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
         return (capability.major, capability.minor) in ((12, 0), (12, 1))
 
 
-def _b12x_dsv4_wo_projection(
-    o: torch.Tensor,
-    positions: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    layer = b12x_layer(_resolve_layer_name(layer_name))
-    layer._run_b12x_wo_projection(o, positions, output)
-
-
-def _b12x_dsv4_wo_projection_fake(
-    o: torch.Tensor,
-    positions: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    pass
-
-
-direct_register_custom_op(
-    op_name="b12x_dsv4_wo_projection",
-    op_func=_b12x_dsv4_wo_projection,
-    mutates_args=["output"],
-    fake_impl=_b12x_dsv4_wo_projection_fake,
-)
-
-
 class DeepseekV4B12xAttention(DeepseekV4Attention):
     backend_cls = DeepseekV4B12xSparseMLABackend
     swa_backend_cls = DeepseekSparseSWAB12xBackend
@@ -706,8 +735,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         self.vllm_config = vllm_config
         self._b12x_cache_page_views: dict[object, torch.Tensor] = {}
         self._b12x_wo_projection_weights: Any | None = None
-        self._b12x_wo_plans: dict[int, Any] = {}
-        self._b12x_mla_plans: dict[tuple[str, int, int, int], Plan] = {}
+        self._b12x_wo_plans: dict[int, object] = {}
         super().__init__(vllm_config, *args, **kwargs)
 
     @classmethod
@@ -763,7 +791,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         return groups, group_width, rank, hidden
 
     def setup_b12x_wo_projection(self) -> None:
-        set_b12x_preparation_provider(self, self)
         if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
             return
         if self._b12x_wo_projection_weights is not None:
@@ -787,24 +814,19 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             rank=rank,
             hidden=hidden,
         )
-        prefix = b12x_layer_prefix(self)
-        self._b12x_wo_layer_name = _encode_layer_name(prefix)
-        register_b12x_layer(prefix, self)
 
-    def _b12x_wo_plan(self, rows: int):
-        plan = self._b12x_wo_plans.get(rows)
+    def _b12x_wo_plan(self, tokens: int):
+        if self._b12x_wo_projection_weights is None:
+            raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
+        module = _require_b12x_wo_projection()
+        weights = self._b12x_wo_projection_weights
+        table = self.rotary_emb.cos_sin_cache
+        plan = self._b12x_wo_plans.get(tokens)
         if plan is None:
-            weights = self._b12x_wo_projection_weights
-            if weights is None:
-                raise RuntimeError(
-                    "B12x WO-A/WO-B weights were not packed after loading."
-                )
-            module = _require_b12x_wo_projection()
-            table = self.rotary_emb.cos_sin_cache
             plan = module.plan(
                 module.Caps(
                     device=table.device,
-                    max_tokens=rows,
+                    max_tokens=tokens,
                     groups=weights.groups,
                     group_width=weights.group_width,
                     rank=weights.rank,
@@ -819,47 +841,40 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                     cos_sin_dtype=str(table.dtype).removeprefix("torch."),
                 ),
             )
-            self._b12x_wo_plans[rows] = plan
+            self._b12x_wo_plans[tokens] = plan
         return plan
 
     def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload
+        self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
-        from b12x.preparation import PreparedCall
-
-        if layer is not self:
-            raise ValueError("B12x attention preparation owner mismatch")
-        if workload.stage == "state":
-            if self.indexer is not None and self.indexer.k_cache.kv_cache.numel():
-                self.indexer.indexer_op.set_b12x_index_cache(
-                    self.indexer.k_cache.kv_cache,
-                    num_q_heads=self.indexer.n_head,
-                )
-            return self._b12x_mla_preparation_units(workload)
-        if workload.stage != "weights" or self._b12x_wo_projection_weights is None:
+        """Declare inv-RoPE WO plans so preparation primes them."""
+        if self._b12x_wo_projection_weights is None:
             return ()
-        weights = self._b12x_wo_projection_weights
-        table = self.rotary_emb.cos_sin_cache
+        counts = tuple(sorted(set(workload.token_counts)))
 
         def prepare(state):
-            rows = state.query.max_tokens
+            from b12x.preparation import PreparedCall
+
+            device = self.rotary_emb.cos_sin_cache.device
             source = torch.empty(
-                (rows, self.n_local_heads, self.head_dim),
+                (state.query.max_tokens, self.n_local_heads, self.head_dim),
                 dtype=torch.bfloat16,
-                device=table.device,
+                device=device,
             )
-            positions = torch.arange(rows, dtype=torch.int64, device=table.device)
-            positions.remainder_(table.shape[0])
+            positions = torch.arange(
+                state.query.max_tokens, dtype=torch.int64, device=device
+            )
+            positions.remainder_(self.rotary_emb.cos_sin_cache.shape[0])
             scratch = tuple(
-                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                torch.empty(spec.shape, dtype=spec.dtype, device=device)
                 for spec in state._scratch_state.scratch_specs()
             )
             binding = state.bind_inv_rope(
                 scratch=scratch,
                 o=source,
                 positions=positions,
-                cos_sin_cache=table,
-                weights=weights,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                weights=self._b12x_wo_projection_weights,
                 heads_per_group=self.n_local_heads // self.n_local_groups,
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
@@ -867,344 +882,28 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             return PreparedCall(
                 run=lambda: state.run_inv_rope(binding),
                 produce=lambda: source.normal_(std=0.25),
-                owners=(weights, table),
+                owners=(
+                    self._b12x_wo_projection_weights,
+                    self.rotary_emb.cos_sin_cache,
+                ),
             )
 
-        requests = tuple(
+        requests = [
             self._b12x_wo_plan(rows).request(
-                name=f"{self.prefix}.wo.m{rows}",
+                name=f"deepseek_v4.wo.m{rows}",
                 prepare_call=prepare,
                 benchmark_call=prepare,
             )
-            for rows in workload.token_counts
-        )
+            for rows in counts
+        ]
         return (
             B12xPreparationUnit(
                 name="DeepseekV4WOProjection",
-                key=self.prefix,
-                requests=requests,
+                key=(id(self), counts),
+                requests=tuple(requests),
                 stage="weights",
                 autotune=not workload.eager_only,
             ),
-        )
-
-    def _b12x_mla_preparation_units(
-        self, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        swa_cache = self.swa_cache_layer.kv_cache
-        indexed_cache = self.kv_cache if self.compress_ratio > 1 else None
-        if swa_cache.numel() == 0 or (
-            indexed_cache is not None and indexed_cache.numel() == 0
-        ):
-            return ()
-        swa_page_size = int(self.swa_cache_layer.block_size)
-        indexed_page_size = (
-            int(self.vllm_config.cache_config.block_size) // self.compress_ratio
-            if indexed_cache is not None
-            else swa_page_size
-        )
-        caches = (swa_cache,) if indexed_cache is None else (swa_cache, indexed_cache)
-        cache_key = tuple(
-            _cache_page_view_key(cache, page_size)
-            for cache, page_size in zip(caches, (swa_page_size, indexed_page_size))
-        )
-        key = (
-            cache_key,
-            workload.max_tokens,
-            workload.max_seqs,
-            workload.fixed_token_counts,
-        )
-        if key != getattr(self, "_b12x_mla_plan_key", None):
-            self._b12x_cache_page_views.clear()
-            self._b12x_mla_plans = {}
-            self._b12x_mla_plan_key = key
-        swa_cache = self._get_cache_page_view(swa_cache, swa_page_size, "swa_k_cache")
-        if indexed_cache is not None:
-            indexed_cache = self._get_cache_page_view(
-                indexed_cache, indexed_page_size, "indexed_k_cache"
-            )
-        indexed_widths: tuple[int, ...]
-        if self.compress_ratio == 4:
-            assert self.topk_indices_buffer is not None
-            indexed_widths = (int(self.topk_indices_buffer.shape[-1]),)
-        elif self.compress_ratio > 1:
-            indexed_widths = _c128a_profile_widths(
-                _c128a_topk_width(self.max_model_len, self.compress_ratio)
-            )
-        else:
-            indexed_widths = (0,)
-        decode_widths = {int(self.window_size)}
-        spec = self.vllm_config.speculative_config
-        if spec is not None and spec.use_dspark():
-            decode_widths.add(
-                get_dspark_swa_index_width(
-                    self.window_size, spec.num_speculative_tokens or 0
-                )
-            )
-        decode_rows = min(
-            workload.max_tokens,
-            max(
-                workload.max_seqs,
-                *workload.fixed_token_counts,
-                _get_dspark_decode_row_capacity(self.vllm_config) or 0,
-            ),
-        )
-        self._b12x_mla_prefill_rows = workload.max_tokens
-        regimes = [
-            ("decode", rows, width)
-            for rows in range(1, decode_rows + 1)
-            for width in sorted(decode_widths)
-        ]
-        regimes.append(
-            (
-                "extend",
-                workload.max_tokens,
-                int(self.window_size + self.max_image_tokens),
-            )
-        )
-        module = _require_b12x_compressed_sparse_mla()
-
-        def descriptor(tensor):
-            return dict(
-                shape=tuple(tensor.shape),
-                stride=tuple(tensor.stride()),
-                alignment=min(16, tensor.data_ptr() & -tensor.data_ptr()),
-                dtype=str(tensor.dtype).removeprefix("torch."),
-            )
-
-        requests = []
-        for mode, rows, swa_width in regimes:
-            for indexed_width in indexed_widths:
-                plan_key = (mode, rows, swa_width, indexed_width)
-                plan = self._b12x_mla_plans.get(plan_key)
-                if plan is None:
-                    plan = module.plan(
-                        module.Caps(
-                            device=swa_cache.device,
-                            num_q_heads=self.padded_heads,
-                            max_q_rows=rows,
-                            max_width=swa_width + indexed_width,
-                            mode=mode,
-                            swa_width=swa_width,
-                            indexed_width=indexed_width,
-                            swa_page_size=swa_page_size,
-                            indexed_page_size=indexed_page_size,
-                            decode_row_capacity=(
-                                _get_dspark_decode_row_capacity(self.vllm_config)
-                                if mode == "decode"
-                                else None
-                            ),
-                            use_cuda_graph=mode == "decode",
-                        ),
-                        invocation=module.invocation_from_descriptors(
-                            q=dict(
-                                shape=(rows, self.padded_heads, _DSV4_HEAD_DIM),
-                                stride=(
-                                    self.padded_heads * _DSV4_HEAD_DIM,
-                                    _DSV4_HEAD_DIM,
-                                    1,
-                                ),
-                                alignment=16,
-                                dtype="bfloat16",
-                            ),
-                            swa_cache=descriptor(swa_cache),
-                            indexed_cache=(
-                                None
-                                if indexed_cache is None
-                                else descriptor(indexed_cache)
-                            ),
-                            attn_sink_present=True,
-                            output_mode="provided",
-                        ),
-                    )
-                    self._b12x_mla_plans[plan_key] = plan
-                prepare = self._b12x_mla_call(swa_cache, indexed_cache)
-                requests.append(
-                    plan.request(
-                        name=f"{self.prefix}.mla.{mode}.m{rows}.s{swa_width}.i{indexed_width}",
-                        prepare_call=prepare,
-                        benchmark_call=prepare,
-                    )
-                )
-        return (
-            B12xPreparationUnit(
-                name="DeepseekV4CompressedMLA",
-                key=(self.prefix, key),
-                requests=tuple(requests),
-                stage="state",
-                autotune=not workload.eager_only,
-            ),
-        )
-
-    def _b12x_mla_call(self, swa_cache, indexed_cache):
-        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
-        borrowers = 0
-
-        def prepare(state):
-            nonlocal borrowers
-            from b12x.preparation import PreparedCall
-
-            query = state.query
-            device = swa_cache.device
-            q = torch.empty(
-                (query.query_rows, query.num_q_heads, _DSV4_HEAD_DIM),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            output = torch.empty_like(q)
-            scratch = tuple(
-                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-                for spec in state.scratch_plan.scratch_specs()
-            )
-            cache_prefixes = []
-            producers = []
-            identity_rope = torch.zeros((1, 64), dtype=torch.float32, device=device)
-            identity_rope[:, :32] = 1
-
-            def cache_inputs(cache, page_size, width):
-                pages = min(cache.shape[0], cdiv(width, page_size))
-                live = cache[:pages]
-                cache_prefixes.append(live)
-                count = min(width, pages * page_size)
-                source = torch.empty(
-                    (count, _DSV4_HEAD_DIM), dtype=torch.bfloat16, device=device
-                )
-                slots = torch.arange(count, dtype=torch.int64, device=device)
-                positions = torch.zeros(count, dtype=torch.int64, device=device)
-                q_output = torch.empty(
-                    (count, 8, _DSV4_HEAD_DIM), dtype=torch.bfloat16, device=device
-                )
-                producers.append((source, cache, slots, page_size, positions, q_output))
-                indices = torch.full(
-                    (query.query_rows, width), -1, dtype=torch.int32, device=device
-                )
-                indices[:, :count] = slots.to(torch.int32)
-                lengths = torch.full(
-                    (query.query_rows,), count, dtype=torch.int32, device=device
-                )
-                return indices, lengths
-
-            swa_indices, swa_lengths = cache_inputs(
-                swa_cache, query.swa_page_size, query.swa_width
-            )
-            indexed_indices = indexed_lengths = None
-            if indexed_cache is not None:
-                indexed_indices, indexed_lengths = cache_inputs(
-                    indexed_cache, query.indexed_page_size, query.indexed_width
-                )
-            binding = state.bind_for_preparation(
-                scratch=scratch,
-                q=q,
-                swa_indices=swa_indices,
-                swa_lengths=swa_lengths,
-                indexed_indices=indexed_indices,
-                indexed_lengths=indexed_lengths,
-            )
-            if borrowers == 0:
-                snapshots.extend((live, live.clone()) for live in cache_prefixes)
-            borrowers += 1
-
-            def produce():
-                q.normal_(std=0.25)
-                for (
-                    source,
-                    page_cache,
-                    slots,
-                    page_size,
-                    positions,
-                    q_output,
-                ) in producers:
-                    source.normal_(std=0.25)
-                    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                        source.unsqueeze(1),
-                        source,
-                        q_output,
-                        page_cache,
-                        slots,
-                        positions,
-                        identity_rope,
-                        1e-6,
-                        page_size,
-                    )
-
-            def restore():
-                nonlocal borrowers
-                for live, saved in snapshots:
-                    live.copy_(saved)
-                borrowers -= 1
-                if borrowers == 0:
-                    snapshots.clear()
-
-            return PreparedCall(
-                run=lambda: state.run(
-                    binding,
-                    swa_k_cache=swa_cache,
-                    indexed_k_cache=indexed_cache,
-                    swa_page_size=query.swa_page_size,
-                    indexed_page_size=query.indexed_page_size,
-                    attn_sink=self.attn_sink,
-                    sm_scale=self.scale,
-                    out=output,
-                ),
-                produce=produce,
-                reset=lambda: output.fill_(float("nan")),
-                restore=restore,
-                output=output,
-                owners=(swa_cache, indexed_cache, self.attn_sink),
-            )
-
-        return prepare
-
-    def _b12x_mla_plan(self, mode, rows, swa_indices, indexed_indices):
-        planned_rows = rows if mode == "decode" else self._b12x_mla_prefill_rows
-        key = (
-            mode,
-            planned_rows,
-            int(swa_indices.shape[-1]),
-            0 if indexed_indices is None else int(indexed_indices.shape[-1]),
-        )
-        plan = self._b12x_mla_plans.get(key)
-        if plan is None:
-            raise RuntimeError(
-                f"B12x compressed MLA has no prepared declaration for {key}"
-            )
-        if rows > plan.query.query_rows:
-            raise ValueError(
-                f"B12x compressed MLA {mode} rows {rows} exceed declared capacity "
-                f"{plan.query.query_rows}"
-            )
-        return plan
-
-    def _run_b12x_wo_projection(
-        self, o: torch.Tensor, positions: torch.Tensor, output: torch.Tensor
-    ) -> None:
-        from b12x.preparation import require_prepared
-
-        rows = int(o.shape[0])
-        plan = self._b12x_wo_plan(rows)
-        require_prepared(plan, "gemm.wo_projection", o.device)
-        module = _require_b12x_wo_projection()
-        binding = module.bind_inv_rope(
-            plan,
-            scratch=get_b12x_scratch_buffers(plan),
-            o=o,
-            positions=positions,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache,
-            weights=self._b12x_wo_projection_weights,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-        )
-        binding = replace(
-            binding,
-            output=output.as_strided(
-                (rows, self.hidden_size, 1),
-                (self.hidden_size, 1, rows * self.hidden_size),
-            ),
-        )
-        retain_cuda_graph_capture_resource(binding)
-        module.run_inv_rope(
-            binding=binding, plan=plan, stream=current_stream().cuda_stream
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -1221,25 +920,41 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             )
         if self._b12x_wo_projection_weights is None:
             raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
-        out = torch.empty(
-            (o.shape[0], self.hidden_size), dtype=torch.bfloat16, device=o.device
+        from dataclasses import replace as _replace_binding
+
+        from b12x.preparation import require_prepared
+
+        tokens = o.shape[0]
+        module = _require_b12x_wo_projection()
+        plan = self._b12x_wo_plan(tokens)
+        require_prepared(plan, "gemm.wo_projection", o.device)
+        binding = module.bind_inv_rope(
+            plan,
+            scratch=current_workspace_manager().get_simultaneous(
+                *((s.shape, s.dtype) for s in plan.scratch_specs())
+            ),
+            o=o,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            weights=self._b12x_wo_projection_weights,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
         )
-        torch.ops.vllm.b12x_dsv4_wo_projection(
-            o, positions, out, self._b12x_wo_layer_name
+        output = torch.empty_strided(
+            (tokens, self.hidden_size, 1),
+            (self.hidden_size, 1, tokens * self.hidden_size),
+            dtype=torch.bfloat16,
+            device=o.device,
+        )
+        binding = _replace_binding(binding, output=output)
+        retain_cuda_graph_capture_resource(binding)
+        out = module.run_inv_rope(
+            binding=binding, plan=plan, stream=current_stream().cuda_stream
         )
         if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out
-
-    def reserve_profile_scratch(self) -> None:
-        super().reserve_profile_scratch()
-        device = self.q_norm.weight.device
-        if device.type == "cuda":
-            # Reserve every layer type before compiled profile execution can
-            # skip its attention body. This tensor describes heads/device only.
-            self._reserve_profile_workspace(
-                torch.empty((0, self.padded_heads, _DSV4_HEAD_DIM), device=device)
-            )
 
     def _get_cache_page_view(
         self,
@@ -1252,13 +967,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         if view is None:
             view = _cache_page_view(cache, page_size, name)
             self._b12x_cache_page_views[key] = view
-        return view
 
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
-        from b12x.attention.compressed_sparse_mla._scratch import (
-            plan_compressed_sparse_mla_scratch,
-        )
-
         module = _require_b12x_compressed_sparse_mla()
         indexed_width = 0
         if self.compress_ratio == 4:
@@ -1272,24 +982,16 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 self.compress_ratio,
             )
 
-        indexed_widths = (
-            _c128a_profile_widths(indexed_width)
-            if self.compress_ratio > 4
-            else (indexed_width,)
-        )
-        swa_widths = {
-            int(self.window_size),
-            int(self.window_size) + self.max_image_tokens,
-        }
+        swa_width = int(self.window_size) + self.max_image_tokens
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_dspark():
-            swa_widths.add(
+            swa_width = max(
+                swa_width,
                 get_dspark_swa_index_width(
                     int(self.window_size),
                     speculative_config.num_speculative_tokens or 0,
-                )
+                ),
             )
-        swa_width = max(swa_widths)
         width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
         decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
@@ -1298,36 +1000,104 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             width=width,
             decode_row_capacity=decode_row_capacity,
         )
-        # Split count is not monotonic in index width: a shorter prefix may
-        # use 12-token chunks while a longer prefix uses 64-token chunks.
-        # Cover every metadata width, not only the longest supported context.
-        max_q_chunks = max(
-            _max_q_chunks(
-                rows,
-                max(swa + indexed, 1),
-                module.split_chunks_for_contract,
-                decode_row_capacity,
-            )
-            for swa in swa_widths
-            for indexed in indexed_widths
+        max_q_chunks = _max_q_chunks(
+            rows,
+            width,
+            module.split_chunks_for_contract,
+            decode_row_capacity,
         )
-        # Allocation profiling needs geometry, not an executable declaration
-        # tied to live cache storage or an autotuning preparation session.
-        plan = plan_compressed_sparse_mla_scratch(
+        page_size = int(self.swa_cache_layer.block_size)
+        # plan() keys the compile identity on the caller's storage ABI
+        # (b12x >=77351c13). Memory profiling pass 1 runs before any KV cache is
+        # allocated (the minimal profiling cache binds only inside
+        # _profile_deepseek_v4_attention), so when the SWA layer still holds its
+        # empty placeholder, synthesize the descriptors from the layer's static
+        # geometry instead of reading a live tensor. Reserved workspace sizing
+        # depends only on Caps, so the synthesized shape never changes what the
+        # reservation holds.
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        page_nbytes = page_size * _DSV4_CACHE_BYTES_PER_TOKEN
+        swa_meta = (
+            {
+                "shape": (1, page_nbytes),
+                "stride": (page_nbytes, 1),
+                "alignment": 16,
+                "dtype": str(self.swa_cache_layer.dtype).removeprefix("torch."),
+            }
+            if swa_kv_cache.ndim < 2
+            else None
+        )
+        if indexed_width:
+            indexed_page_nbytes = (
+                page_size // self.compress_ratio
+            ) * _DSV4_CACHE_BYTES_PER_TOKEN
+            indexed_meta = {
+                "shape": (1, indexed_page_nbytes),
+                "stride": (indexed_page_nbytes, 1),
+                "alignment": 16,
+                "dtype": str(self.swa_cache_layer.dtype).removeprefix("torch."),
+            }
+        else:
+            indexed_meta = None
+        invocation = module.invocation_from_descriptors(
+            q=_descriptor_from_tensor(q),
+            swa_cache=(
+                swa_meta
+                if swa_meta is not None
+                else _descriptor_from_tensor(
+                    self._get_cache_page_view(
+                        swa_kv_cache,
+                        page_size,
+                        "swa_k_cache",
+                    )
+                )
+            ),
+            indexed_cache=(
+                indexed_meta
+                if indexed_meta is not None
+                else (
+                    _descriptor_from_tensor(
+                        self._get_cache_page_view(
+                            compressed_cache,
+                            page_size // self.compress_ratio,
+                            "indexed_k_cache",
+                        )
+                    )
+                    if (compressed_cache := self.kv_cache) is not None
+                    and self.compress_ratio > 1
+                    else None
+                )
+            ),
+            attn_sink_present=False,
+            return_lse=False,
+            lse_scale="base2",
+            output_mode="internal",
+        )
+        plan = module.plan(
             module.Caps(
                 device=q.device,
                 num_q_heads=int(q.shape[1]),
                 max_q_rows=rows,
                 max_width=width,
+                # Split-width declaration keeps Caps.indexed_width equal to the
+                # local indexed_width that gates the descriptor below. The
+                # legacy both-None normalization would instead set
+                # Caps.indexed_width = max_width, forcing the cache descriptor
+                # present even when this layer declares none.
+                swa_width=max(width - indexed_width, 0),
+                indexed_width=indexed_width,
                 head_dim=_DSV4_HEAD_DIM,
                 v_head_dim=_DSV4_HEAD_DIM,
-                page_size=int(self.swa_cache_layer.block_size),
+                page_size=page_size,
                 max_chunks_per_row=max_chunks_per_row,
                 max_q_chunks=max_q_chunks,
                 decode_row_capacity=decode_row_capacity,
-            )
+            ),
+            invocation=invocation,
         )
-        current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+        current_workspace_manager().get_simultaneous(
+            *((s.shape, s.dtype) for s in plan.scratch_specs())
+        )
 
     def forward_mqa(
         self,
@@ -1386,7 +1156,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         *,
         compressed_cache: torch.Tensor | None,
         sparse_metadata: DeepseekV4FlashMLAMetadata | None,
-        swa_metadata: DeepseekSparseSWAMetadata,
+        swa_metadata: "DeepseekSparseSWAMetadata",
         token_slice: slice,
         decode: bool,
     ) -> tuple[
@@ -1439,7 +1209,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         output: torch.Tensor,
         compressed_cache: torch.Tensor | None,
         sparse_metadata: DeepseekV4FlashMLAMetadata | None,
-        swa_metadata: DeepseekSparseSWAMetadata,
+        swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
         num_tokens = swa_metadata.num_decode_tokens
         indexed_cache, indexed_indices, indexed_lens, indexed_page_size = (
@@ -1471,12 +1241,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             indexed_indices=indexed_indices,
             indexed_lens=indexed_lens,
             indexed_page_size=indexed_page_size,
-            plan=self._b12x_mla_plan(
-                "decode",
-                int(q.shape[0]),
-                swa_metadata.decode_swa_indices,
-                indexed_indices,
-            ),
+            mode="decode",
+            decode_row_capacity=_get_dspark_decode_row_capacity(self.vllm_config),
         )
 
     def _forward_prefill(
@@ -1486,7 +1252,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         output: torch.Tensor,
         compressed_cache: torch.Tensor | None,
         sparse_metadata: DeepseekV4FlashMLAMetadata | None,
-        swa_metadata: DeepseekSparseSWAMetadata,
+        swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
         num_decode_tokens = swa_metadata.num_decode_tokens
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -1552,10 +1318,5 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                     else None
                 ),
                 indexed_page_size=indexed_page_size,
-                plan=self._b12x_mla_plan(
-                    "extend",
-                    query_end - query_start,
-                    swa_metadata.prefill_swa_indices,
-                    indexed_indices,
-                ),
+                mode="extend",
             )
