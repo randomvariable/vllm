@@ -1,0 +1,16 @@
+vllm/models/deepseek_v4/attention.py
+  h_15da545fc8cfbe 978
+vllm/models/deepseek_v4/nvidia/b12x_indexer.py
+  h_15da545fc8cfbe 205,209-211,313-317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "934e19e6904fce4d9119616e9a80aea3215d3194",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
