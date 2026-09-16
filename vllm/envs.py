@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
     VLLM_MIMO_L2_PREFETCH: bool = False
+    VLLM_QWEN3_8_HC_PREFILL_MODE: str = "off"
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1882,6 +1883,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Shard BF16 HyperConnection projections with FP32 down-projection outputs.
     "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
+    "VLLM_QWEN3_8_HC_PREFILL_MODE": lambda: os.getenv(
+        "VLLM_QWEN3_8_HC_PREFILL_MODE", "off"
     ),
     # MiMo-V2: prefetch upcoming decode weights into L2 on a side stream
     # during FULL CUDA-graph decode (cache hints only; numerics unchanged).
