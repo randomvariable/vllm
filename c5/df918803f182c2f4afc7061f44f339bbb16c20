@@ -1,0 +1,14 @@
+tests/config/test_speculative_draft_hf_overrides.py
+  h_15da545fc8cfbe 74-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c5df918803f182c2f4afc7061f44f339bbb16c20",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
