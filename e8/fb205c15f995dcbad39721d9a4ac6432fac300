@@ -1,0 +1,14 @@
+tests/models/qwen4_exp/test_b12x_qsa.py
+  h_15da545fc8cfbe 519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e8fb205c15f995dcbad39721d9a4ac6432fac300",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
