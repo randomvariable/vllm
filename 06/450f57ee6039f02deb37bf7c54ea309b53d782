@@ -1,0 +1,24 @@
+csrc/spinloop.cpp
+  h_15da545fc8cfbe 5,7,10-13,27-47,81-226,228,263-270,273-277,345-360,363-374,377,381-384,389-393,406-407,411-420
+docs/configuration/env_vars.md
+  h_15da545fc8cfbe 10-21
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 17-18,252,261-265,267-268,270-275,277-279,286-287,797-1340
+tests/test_envs.py
+  h_15da545fc8cfbe 46-54
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 6,9,24,115-309,333,335-346,349-356,362,400-408,410-428,431,449,465,722-723,735-746,782-789,797,866,884,926-927,933-948,950-951,954-956,966-968,978-992,997-998,1015-1021,1042-1049,1104-1120,1122-1123,1127,1137-1138,1145-1153,1155-1183,1185-1186,1204-1209,1272-1283
+vllm/envs.py
+  h_15da545fc8cfbe 21-26,763-805,2451-2458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "06450f57ee6039f02deb37bf7c54ea309b53d782",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
