@@ -1,0 +1,22 @@
+docs/configuration/env_vars.md
+  h_15da545fc8cfbe 14,16-18
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 262-279,286-287,809-832,835-926,937,959,965-978,986,995,1007-1008,1056-1115,1150-1153,1156,1168,1197,1204,1222
+tests/test_envs.py
+  h_15da545fc8cfbe 46-54
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 243-244,248-254,667-673,814-816,831,851,854-865,886-890,917-918
+vllm/envs.py
+  h_15da545fc8cfbe 26,763-768,2458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3d8113e993c71307c26ec7c30bbde96d45d49ccc",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
