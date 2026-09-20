@@ -1,0 +1,30 @@
+tests/models/test_glm5next_pooled_indexer.py
+  h_15da545fc8cfbe 777,779,815-825
+tests/v1/attention/test_b12x_sparse_mla_api.py
+  h_15da545fc8cfbe 5,75-201,1436-1492,1651-1687,2455
+tests/v1/attention/test_mla_backends.py
+  h_15da545fc8cfbe 349-351,375-463
+tests/v1/attention/test_sparse_mla_backends.py
+  h_15da545fc8cfbe 6,3772-3773,3781,3788-3790
+vllm/model_executor/layers/attention/mla_attention.py
+  h_15da545fc8cfbe 920-922,1144-1155,1620-1631
+vllm/model_executor/layers/attention/sparse_mla_attention.py
+  h_15da545fc8cfbe 207-212,215-216,634,653,696-700,702
+vllm/models/deepseek_v4/nvidia/b12x_indexer.py
+  h_15da545fc8cfbe 350-354
+vllm/models/glm5next/nvidia/pooled_indexer.py
+  h_15da545fc8cfbe 398
+vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+  h_15da545fc8cfbe 1172-1174,1510-1524,1531-1535,1538-1540,1553-1555,1749-1752
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0071b9ea4a186d47e5321ea5119f065946817daf",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
