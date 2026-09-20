@@ -1,0 +1,36 @@
+tests/v1/core/test_boundary_admission_horizon.py
+  h_15da545fc8cfbe 5-6,12-16,23,99-185,191
+tests/v1/core/test_contiguous_kv_packing.py
+  h_15da545fc8cfbe 75
+tests/v1/core/test_kv_cache_utils.py
+  h_15da545fc8cfbe 2656-2691,3282,3420,4279-4344
+tests/v1/worker/test_gpu_model_runner.py
+  h_15da545fc8cfbe 1833,1836,1847-1858,1862,1876,1878,1880,1883-1891,1901
+tests/v1/worker/test_gpu_model_runner_v2.py
+  h_15da545fc8cfbe 399,402,413-423,427,437,444,446,448,451-459,470
+tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+  h_15da545fc8cfbe 145,219-261,415-416,545-548,565,586-590,603-604,610-623
+tests/v1/worker/test_gpu_worker.py
+  h_15da545fc8cfbe 402-413,420-422,432-433,436-439,441,444,488-490,525,527,536,598-599
+vllm/v1/core/kv_cache_utils.py
+  h_15da545fc8cfbe 1008-1015,1079-1093,1121-1123,1777-1779,2808-2811,2835-2837,2852
+vllm/v1/worker/gpu/cudagraph_utils.py
+  h_15da545fc8cfbe 1184,1257,1259-1264,1314-1320
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 205,1114-1116,1123-1124,1133-1135
+vllm/v1/worker/gpu_model_runner.py
+  h_15da545fc8cfbe 6647-6649,6666-6669
+vllm/v1/worker/gpu_worker.py
+  h_15da545fc8cfbe 653-658,697-720
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e915191be41a9f183854ab5a4c98ceaf2da1c44d",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
