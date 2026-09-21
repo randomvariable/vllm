@@ -1,0 +1,14 @@
+vllm/v1/core/sched/scheduler.py
+  h_15da545fc8cfbe 430-436
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6fa72b86465958669f47a832186c8e83cb437ebe",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
