@@ -1,0 +1,20 @@
+tests/model_executor/test_qwen_triton_warmup.py
+  h_15da545fc8cfbe 4-5,9,12,17,21-31,58-102,104-105,117,120-159
+vllm/config/kernel.py
+  h_15da545fc8cfbe 250-251
+vllm/model_executor/warmup/kernel_warmup.py
+  h_15da545fc8cfbe 189-193
+vllm/model_executor/warmup/qwen_triton_warmup.py
+  h_15da545fc8cfbe 144-146,250-253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c1a8a38c49576d2d078958f4923420d52a2c4872",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
