@@ -1,0 +1,42 @@
+scripts/serve-ds4-flash-dspark-tp2-rdma.sh
+  h_15da545fc8cfbe 14-16,55-56,303-304
+scripts/serve-ds4-flash-dspark-tp4-rdma.sh
+  h_15da545fc8cfbe 8-9,18-24,26-27,29-31,33,71,73-74,78,84-85,120-127,374-375,377,384-402,427,435,452,473,475,518-519
+scripts/serve-ds41-flash-dspark-tp3-rdma.sh
+  h_15da545fc8cfbe 1-23
+scripts/serve-glm53-flash-nvfp4-tp2-rdma.sh
+  h_15da545fc8cfbe 16-18,104-105,588-589
+scripts/serve-glm53-nvfp4-tp4-rdma.sh
+  h_15da545fc8cfbe 21-22,24-26,81-83,107-108,203-210,482-483,485,493-505,529
+scripts/serve-qwen38-flash-next-nvfp4-tp2-rdma.sh
+  h_15da545fc8cfbe 15-17,60,317-318
+scripts/spark-roce-qos.sh
+  h_15da545fc8cfbe 1-16
+scripts/spark-switch-network.md
+  h_15da545fc8cfbe 1-156
+tests/models/qwen4_exp/test_b12x_model.py
+  h_15da545fc8cfbe 102,136,160-204,216,263
+tests/models/qwen4_exp/test_b12x_qsa.py
+  h_15da545fc8cfbe 300-305,512-545,582
+tests/models/qwen4_exp/test_b12x_weight_loading.py
+  h_15da545fc8cfbe 13,18-23,25,40-99
+vllm/envs.py
+  h_15da545fc8cfbe 212,1746-1749
+vllm/model_executor/warmup/qwen_triton_warmup.py
+  h_15da545fc8cfbe 256-258,268
+vllm/models/qwen4_exp/nvidia/b12x_qsa.py
+  h_15da545fc8cfbe 1188-1194,1216,1409-1411,1415-1416,1418-1419
+vllm/models/qwen4_exp/nvidia/hyperconnection.py
+  h_15da545fc8cfbe 25,31-37,43,65-66,81-194,207-217,233-261,263,265,269,271,275,278-280,295-297,310-312,334-351,373-389,484,486-488,523-527,562-567,573-578,625-628,632-633,665-704
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ab3a6dfe15e8826216600742d6609fa6a9cfc1a9",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
