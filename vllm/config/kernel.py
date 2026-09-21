@@ -247,7 +247,8 @@ class KernelConfig:
     """Deprecated: run legacy CuTeDSL warmup providers."""
 
     enable_jit_warmup: bool = True
-    """If True, run JIT compile warmup during kernel warmup."""
+    """If True, run JIT compile warmup during kernel warmup. Covers the
+    registry-registered compile keys and the runner-owned Triton warmups."""
 
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
