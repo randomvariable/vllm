@@ -46,6 +46,7 @@ class _QwenGDNWarmupConfig:
     state_stride_token: int
     state_dtype: torch.dtype
 
+
     @property
     def conv_dim(self) -> int:
         return 2 * self.h * self.k + self.hv * self.v
@@ -134,6 +135,7 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+
         )
 
     if found_layer:
@@ -230,6 +232,7 @@ def _warm_fused_post_conv_kernel(
             apply_l2norm=True,
             output_g_exp=False,
         )
+
 
 
 def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
