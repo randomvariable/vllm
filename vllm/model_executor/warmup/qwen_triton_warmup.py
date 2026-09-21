@@ -49,8 +49,6 @@ class _QwenGDNWarmupConfig:
     norm_bias: torch.Tensor | None
     norm_eps: float
     norm_group_size: int
-    norm_before_gate: bool
-    norm_activation: str
 
     @property
     def conv_dim(self) -> int:
@@ -143,7 +141,9 @@ def _qwen_gdn_warmup_config(
             norm_weight=layer.norm.weight,
             norm_bias=layer.norm.bias,
             norm_eps=float(layer.norm.eps),
-            norm_group_size=int(layer.norm.group_size or (hv * int(layer.head_v_dim))),
+            # RMSNormGated treats group_size=None as group_size=hidden_size, which
+            # is the width of the norm weight, not the whole multi-head feature.
+            norm_group_size=int(layer.norm.group_size or layer.norm.weight.shape[0]),
         )
 
     if found_layer:
@@ -247,8 +247,10 @@ def _warm_layer_norm_kernel(device: torch.device, config: _QwenGDNWarmupConfig) 
         layer_norm_fwd,
     )
 
-    feature_size = int(config.hv * config.v)
-    group_size = min(int(config.norm_group_size), feature_size)
+    # layer_norm_fwd indexes the norm weight by global column, so the synthetic
+    # activation has to be exactly as wide as the loaded weight.
+    feature_size = int(config.norm_weight.shape[0])
+    group_size = int(config.norm_group_size)
     lengths = (1, 2, 16, 32, 128, 1024)
     for length in lengths:
         x = torch.empty((length, feature_size), dtype=config.conv_dtype, device=device)

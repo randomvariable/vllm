@@ -186,9 +186,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             time.perf_counter() - jit_warmup_start,
         )
 
-    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
-    qwen_vl_triton_warmup(worker.model_runner)
-    mamba_triton_warmup(worker.model_runner)
+        # These launch real kernels instead of going through the registry, so they
+        # sit outside the timed block but still honour the JIT-warmup opt-out.
+        qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+        qwen_vl_triton_warmup(worker.model_runner)
+        mamba_triton_warmup(worker.model_runner)
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
