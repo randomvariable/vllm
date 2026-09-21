@@ -253,7 +253,9 @@ def _warm_layer_norm_kernel(device: torch.device, config: _QwenGDNWarmupConfig) 
     group_size = int(config.norm_group_size)
     lengths = (1, 2, 16, 32, 128, 1024)
     for length in lengths:
-        x = torch.empty((length, feature_size), dtype=config.conv_dtype, device=device)
+        x = torch.empty(
+            (length * config.hv, config.v), dtype=config.conv_dtype, device=device
+        )
         z = torch.empty_like(x)
         out = torch.empty_like(x)
         layer_norm_fwd(
@@ -263,7 +265,7 @@ def _warm_layer_norm_kernel(device: torch.device, config: _QwenGDNWarmupConfig) 
             config.norm_eps,
             z=z,
             out=out,
-            group_size=group_size,
+            group_size=config.norm_group_size,
             norm_before_gate=config.norm_before_gate,
             is_rms_norm=True,
             activation=config.norm_activation,
