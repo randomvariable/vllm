@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.model_executor.warmup.kernel_warmup as kernel_warmup_module
 from vllm.model_executor.warmup.qwen_triton_warmup import (
     _FLA_POST_CONV_WARMUP_LENGTHS,
     _qwen_gdn_warmup_config,
@@ -16,6 +17,17 @@ from vllm.model_executor.warmup.qwen_triton_warmup import (
     _warm_layer_norm_kernel,
 )
 from vllm.platforms import current_platform
+
+_GATED_RUNNER_WARMUPS = frozenset(
+    {
+        "qwen_triton_warmup",
+        "qwen_vl_triton_warmup",
+        "mamba_triton_warmup",
+        "kimi_k3_triton_warmup",
+        "watermark_sample_warmup",
+        "qwen4_exp_qsa_triton_warmup",
+    }
+)
 
 
 def _cuda_gdn_config() -> _QwenGDNWarmupConfig:
@@ -50,6 +62,49 @@ def _cuda_gdn_config() -> _QwenGDNWarmupConfig:
     )
 
 
+class _PerHeadNorm:
+    """Mirrors RMSNormGated(head_v_dim, group_size=None) in qwen_gdn_linear_attn."""
+
+    def __init__(self, v: int) -> None:
+        self.weight = torch.ones(v, dtype=torch.bfloat16)
+        self.bias = None
+        self.eps = 1e-6
+        self.group_size = None
+        self.norm_before_gate = True
+        self.activation = "silu"
+
+
+def _fake_gdn_layer(h: int, hv: int, k: int, v: int, tp_size: int) -> SimpleNamespace:
+    conv_dim = 2 * (h // tp_size) * k + (hv // tp_size) * v
+    return SimpleNamespace(
+        num_k_heads=h,
+        num_v_heads=hv,
+        head_k_dim=k,
+        head_v_dim=v,
+        conv_kernel_size=4,
+        tp_size=tp_size,
+        norm=_PerHeadNorm(v),
+        A_log=torch.zeros(hv // tp_size, dtype=torch.float32),
+        dt_bias=torch.zeros(hv // tp_size, dtype=torch.float32),
+        kv_cache=(
+            torch.zeros(2, conv_dim, 3, dtype=torch.bfloat16),
+            torch.zeros(2, hv // tp_size, k, v, dtype=torch.float32),
+        ),
+    )
+
+
+def test_qwen_gdn_norm_warmup_matches_per_head_weight_width() -> None:
+    # Qwen GDN normalizes per value head, so the warmed activation must be as wide
+    # as the norm weight. Sizing it from the stacked heads makes layer_norm_fwd
+    # reject the weight and aborts EngineCore init.
+    hv, v = 48, 128
+    config = _qwen_gdn_warmup_config(
+        {"layers.0.linear_attn": _fake_gdn_layer(32, hv, 128, v, tp_size=1)}
+    )
+    assert config is not None
+    assert config.norm_group_size == config.norm_weight.shape[0] == v
+
+
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA is required")
 def test_qwen_gdn_prefill_warmup_kernels_compile_on_gpu() -> None:
     config = _cuda_gdn_config()
@@ -64,40 +119,41 @@ def test_qwen_gdn_prefill_warmup_kernels_compile_on_gpu() -> None:
     torch.accelerator.synchronize(device)
 
 
-def test_qwen_gdn_norm_warmup_preserves_per_head_shape(monkeypatch) -> None:
-    """TP4 heads share a 128-wide norm weight, not a 1536-wide weight."""
-    from vllm.third_party.flash_linear_attention.ops import layernorm_guard
+@pytest.mark.parametrize("enable_jit_warmup", [False, True])
+def test_kernel_warmup_honours_jit_warmup_flag(monkeypatch, enable_jit_warmup):
+    """Runner-owned Triton warmups launch kernels, so they must obey the same
+    opt-out as the registry warmups instead of running unconditionally."""
+    ran: list[str] = []
 
-    norm = SimpleNamespace(
-        weight=torch.ones(128),
-        bias=None,
-        eps=1e-6,
-        group_size=None,
-        norm_before_gate=True,
-        activation="silu",
+    def record(name):
+        def _warmup(*args, **kwargs):
+            ran.append(name)
+
+        return _warmup
+
+    worker = SimpleNamespace(
+        use_v2_model_runner=True,
+        model_runner=SimpleNamespace(
+            jit_warmup_registry=SimpleNamespace(warmup=record("registry"))
+        ),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(
+                enable_jit_warmup=enable_jit_warmup,
+                enable_cutedsl_warmup=False,
+            ),
+            model_config=SimpleNamespace(),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        get_model=lambda: None,
     )
-    layer = SimpleNamespace(
-        num_k_heads=16,
-        num_v_heads=48,
-        head_k_dim=128,
-        head_v_dim=128,
-        conv_kernel_size=4,
-        tp_size=4,
-        norm=norm,
-        A_log=torch.zeros(12),
-        dt_bias=torch.zeros(12),
-        kv_cache=(torch.empty(1, 2560, 3), torch.empty(1, 12, 128, 128)),
+
+    for name in _GATED_RUNNER_WARMUPS:
+        monkeypatch.setattr(kernel_warmup_module, name, record(name))
+    for name in ("_warmup_bf16x3_router_gemm", "_warmup_ll_bf16_router_gemm"):
+        monkeypatch.setattr(kernel_warmup_module, name, record(name))
+
+    kernel_warmup_module.kernel_warmup(worker, process_local_only=True)  # type: ignore[arg-type]
+
+    assert set(ran) & _GATED_RUNNER_WARMUPS == (
+        set(_GATED_RUNNER_WARMUPS) if enable_jit_warmup else set()
     )
-    config = _qwen_gdn_warmup_config({"linear_attn": layer})
-    assert config is not None
-    calls = []
-
-    def check_norm(x, weight, bias, eps, *, z, out, group_size, **kwargs):
-        assert x.shape[1] == weight.numel() == group_size == 128
-        assert x.shape[0] % 12 == 0
-        assert z.shape == out.shape == x.shape
-        calls.append(x.shape[0])
-
-    monkeypatch.setattr(layernorm_guard, "layer_norm_fwd", check_norm)
-    _warm_layer_norm_kernel(torch.device("cpu"), config)
-    assert calls and min(calls) == 12

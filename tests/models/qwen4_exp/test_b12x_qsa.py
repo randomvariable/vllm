@@ -845,6 +845,7 @@ def test_qsa_selector_fork_requires_one_full_graph(
 
 
 def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
+    """Prefill plan capacities cover each requested context ceiling."""
     assert qsa_module._qsa_prefill_context_capacities(262144, 4096) == (
         4096,
         8192,
