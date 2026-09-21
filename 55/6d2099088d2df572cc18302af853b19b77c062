@@ -1,0 +1,132 @@
+benchmarks/benchmark_b12x_plan_lookup.py
+  h_15da545fc8cfbe 1-81
+csrc/spinloop.cpp
+  h_15da545fc8cfbe 5,7,10-13,27-47,81-226,228,263-270,273-277,345-360,363-374,377,381-384,389-393,406-407,411-420
+docs/configuration/env_vars.md
+  h_15da545fc8cfbe 10-21
+docs/features/tool_calling.md
+  h_15da545fc8cfbe 341-382
+tests/config/test_speculative_draft_hf_overrides.py
+  h_15da545fc8cfbe 25-26,48-82
+tests/distributed/test_b12x_pcie_all_reduce.py
+  h_15da545fc8cfbe 61,65,328,337-419
+tests/distributed/test_shm_broadcast.py
+  h_15da545fc8cfbe 17-18,252,261-265,267-268,270-275,277-279,286-287,797-1340
+tests/entrypoints/openai/test_tool_calls_serialization.py
+  h_15da545fc8cfbe 18-19,21,23-27,158-380
+tests/kernels/mamba/test_gdn_prefill_b12x.py
+  h_15da545fc8cfbe 13,31-49,347,350,378,408,471-475,623-624
+tests/kernels/moe/test_b12x.py
+  h_15da545fc8cfbe 9,69-270,1136,1184-1185,1191-1192,1195,1200
+tests/kernels/quantization/test_nvfp4_marlin_scale_factor.py
+  h_15da545fc8cfbe 1-255
+tests/model_executor/kernels/test_b12x_linear.py
+  h_15da545fc8cfbe 10,496-497,937-944,959-960,967-968,1069,1091,1095-1097,1891-2006,2743,2767-2769,2774-2777
+tests/model_executor/test_b12x_warmup.py
+  h_15da545fc8cfbe 386-410
+tests/model_executor/test_qwen_triton_warmup.py
+  h_15da545fc8cfbe 9,21-31,65-107,122-126,128-147,150-153,155-159
+tests/models/qwen4_exp/test_b12x_qsa.py
+  h_15da545fc8cfbe 848
+tests/models/test_glm5next_indexer_storage.py
+  h_15da545fc8cfbe 1-194
+tests/models/test_glm5next_model.py
+  h_15da545fc8cfbe 312-387,2648-2808
+tests/models/test_glm5next_pooled_indexer.py
+  h_15da545fc8cfbe 13,23-26,666,696-754,829-830,833-839,880-882,886-887,890-892,1048-1049,1096-1222
+tests/parser/engine/test_deepseek_v4.py
+  h_15da545fc8cfbe 24,40-41,46,55-143,308-311,381-384
+tests/test_envs.py
+  h_15da545fc8cfbe 46-54
+tests/tokenizers_/fixtures/deepseek_v41/encoding.json
+  h_15da545fc8cfbe 1-410
+tests/tokenizers_/test_deepseek_v41.py
+  h_15da545fc8cfbe 7,14,190-253
+tests/v1/attention/test_b12x_v41_workspace.py
+  h_15da545fc8cfbe 7,12,323-325,335-336,341,345,360-375,395,404,441-593,704-770,796,913,916-923,925-935,959-962,1070,1080-1183,1190,1203,1250-1252,1259-1267,1643-1645,1710-1713,1719-1722,1762-1774,1776-1789,1839
+tests/v1/attention/test_ds4_workspace_envelope.py
+  h_15da545fc8cfbe 5,11-14,20-24,26-30,32-61,63,65-75,77-86,88-114
+tests/v1/sample/test_topk_topp_sampler.py
+  h_15da545fc8cfbe 3-4,18,80,82,84,87-88,90-100,107
+tests/v1/spec_decode/test_dflash2.py
+  h_15da545fc8cfbe 17-18,30,48,52-53,56-57,66-67,165,173-174,193-270
+tests/v1/worker/test_workspace.py
+  h_15da545fc8cfbe 4,53,56,60,62,175-290,320-392
+vllm/config/kernel.py
+  h_15da545fc8cfbe 250-251
+vllm/config/speculative.py
+  h_15da545fc8cfbe 1091,1095-1120,1147-1167,1181,1370-1372
+vllm/distributed/device_communicators/b12x_pcie_all_reduce.py
+  h_15da545fc8cfbe 251,600-601,607,636,671-672,689,696-697,713,721,743,755-795,804-808,813,828,986
+vllm/distributed/device_communicators/shm_broadcast.py
+  h_15da545fc8cfbe 6,9,24,115-309,333,335-346,349-356,362,400-408,410-428,431,449,465,722-723,735-746,782-789,797,866,884,926-927,933-948,950-951,954-956,966-968,978-992,997-998,1015-1021,1042-1049,1104-1120,1122-1123,1127,1137-1138,1145-1153,1155-1183,1185-1186,1204-1209,1272-1283
+vllm/entrypoints/openai/chat_completion/protocol.py
+  h_15da545fc8cfbe 7,55,191-195,219-223,549,554-561,566,568-570,575-582,948-958
+vllm/envs.py
+  h_15da545fc8cfbe 21-26,766-808,2466-2473
+vllm/model_executor/layers/fused_moe/b12x.py
+  h_15da545fc8cfbe 13,70-75,89,134-157,159,172-177,230,236-322,765-768,771-775,792,815,836,851
+vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+  h_15da545fc8cfbe 3,301-314
+vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+  h_15da545fc8cfbe 1172-1194,2372-2380,2390,2393,3068,3072,3074,3079,3083
+vllm/model_executor/layers/mamba/ops/b12x_gdn_prefill.py
+  h_15da545fc8cfbe 72-76,129,149,152,259,266-270,281,287
+vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+  h_15da545fc8cfbe 42-55,61-62,64-71,393-394,396,443-450,452,454-458,460,469-477,480
+vllm/model_executor/models/qwen3_dflash.py
+  h_15da545fc8cfbe 30-31,518-520,597-600,609-625,633-634,639
+vllm/model_executor/warmup/b12x_prepare.py
+  h_15da545fc8cfbe 232,259-264,338,340-346,351-353,359-363,370-374,474-481,527,530,532,568,652,666
+vllm/model_executor/warmup/kernel_warmup.py
+  h_15da545fc8cfbe 189-193
+vllm/model_executor/warmup/qwen_triton_warmup.py
+  h_15da545fc8cfbe 144-146,250-253
+vllm/models/deepseek_v4/nvidia/b12x.py
+  h_15da545fc8cfbe 435-452,473,507,511,1304-1305
+vllm/models/deepseek_v4_1/attention.py
+  h_15da545fc8cfbe 1457-1464,1467,1479,1538-1539,1711,1714,1731-1733
+vllm/models/deepseek_v4_1/b12x_layers.py
+  h_15da545fc8cfbe 589-591
+vllm/models/deepseek_v4_1/nvidia/dspark.py
+  h_15da545fc8cfbe 189
+vllm/models/glm5next/common/multimodal.py
+  h_15da545fc8cfbe 7,28,49-55,181-184,206-224,239,244-246,255,257-305,312,355-372,433,494,703-734,788-825
+vllm/models/glm5next/nvidia/attention.py
+  h_15da545fc8cfbe 25,66,175
+vllm/models/glm5next/nvidia/model.py
+  h_15da545fc8cfbe 99,336,393,965-969,974,994
+vllm/models/glm5next/nvidia/mtp.py
+  h_15da545fc8cfbe 339-409
+vllm/models/glm5next/nvidia/mtp_draft_head.py
+  h_15da545fc8cfbe 33-43,105
+vllm/models/glm5next/nvidia/pooled_indexer.py
+  h_15da545fc8cfbe 54-102,120,185-195,207,374,383,401,456,491,528-529,574-583,601-602,619,632-634,639,679,683,685,691,724,731
+vllm/tokenizers/deepseek_v41.py
+  h_15da545fc8cfbe 26-33
+vllm/tokenizers/deepseek_v41_encoding.py
+  h_15da545fc8cfbe 14-15,60-61,71
+vllm/utils/b12x.py
+  h_15da545fc8cfbe 97,107-110,218
+vllm/utils/tool_names.py
+  h_15da545fc8cfbe 1-70
+vllm/v1/worker/b12x_startup.py
+  h_15da545fc8cfbe 45,51,304-305,309-312,314-322
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 81,477-480,1013-1021,1023-1032,1074
+vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+  h_15da545fc8cfbe 185-192
+vllm/v1/worker/workspace.py
+  h_15da545fc8cfbe 181-197,249-273,277,281-282,291,296-297,371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "556d2099088d2df572cc18302af853b19b77c062",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
