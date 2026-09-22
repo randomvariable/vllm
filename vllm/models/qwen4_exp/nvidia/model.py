@@ -237,6 +237,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
+                prefill_checkpoint_blocks=int(envs.VLLM_QWEN3_8_PREFILL_COALESCE),
                 overlap_input_projections=uses_b12x(vllm_config)
                 and envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
