@@ -22,3 +22,7 @@ vLLM exports cumulative `vllm:shm_broadcast_blocked_waits_total` and `vllm:shm_b
 ```python
 --8<-- "vllm/envs.py:env-vars-definition"
 ```
+
+## B12X preparation control
+
+During B12X startup preparation, ranks exchange authorization metadata through a shared store. `VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS` bounds each blocking read on that store (default `600`). The deadline is explicit per read: the underlying store handle keeps PyTorch's backend default timeout, and the distributed timeout options do not change it. Raise the value when a cold first boot compiles kernels for longer than the default, for example `3600` on a group reserved for experiments.
