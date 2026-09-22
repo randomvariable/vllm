@@ -1,0 +1,18 @@
+docs/configuration/env_vars.md
+  h_15da545fc8cfbe 25-28
+vllm/envs.py
+  h_15da545fc8cfbe 27,810-816,2482-2484
+vllm/v1/worker/b12x_startup.py
+  h_15da545fc8cfbe 17,20-21,41-50,152-154,239-241,257-259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d9e52bdf466308d98bfdcd8af302c2b2b6d4864d",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
