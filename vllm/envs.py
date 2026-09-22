@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA: float = 0.25
     VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS: float = 1.0
     VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN: bool = False
+    VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS: int = 600
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -807,6 +808,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # write latency for fewer wakeups on a writer blocked by slow readers.
     "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS": lambda: float(
         os.environ.get("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", "1.0")
+    ),
+    # Deadline in seconds for blocking metadata reads on the B12X
+    # preparation control store. The store handle keeps PyTorch's backend
+    # default timeout, so preparation exchanges pass this explicitly per
+    # call. Affects startup-time preparation only.
+    "VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS": lambda: int(
+        os.environ.get("VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS", "600")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -2487,6 +2495,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA",
         "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS",
         "VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN",
+        # Startup-only preparation store deadline; cannot affect a compiled
+        # graph, so keep it out of the compile cache key.
+        "VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",

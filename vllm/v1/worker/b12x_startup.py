@@ -14,7 +14,10 @@ import os
 import pickle
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from typing import TYPE_CHECKING, cast
+
+from vllm import envs
 
 if TYPE_CHECKING:
     from b12x.preparation import TuningCacheRequirement, TuningRequirement
@@ -33,6 +36,28 @@ def _scoped_key(key: str, ranks: tuple[int, ...]) -> str:
 
 def _unscoped_key(key: str) -> str:
     return key.split("|", 1)[1]
+
+
+def _control_read_timeout() -> timedelta:
+    """Explicit deadline for waits on the preparation control store.
+
+    The control store wraps the world TCPStore handle, whose default timeout
+    is PyTorch's backend default and is not influenced by the distributed
+    timeout options, so blocking reads pass their deadline explicitly.
+    """
+    return timedelta(seconds=envs.VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS)
+
+
+def _control_get(store, key: str) -> bytes:
+    """Wait for ``key`` with the control deadline, then read it.
+
+    ``Store.get`` accepts only the key and blocks for the handle's own
+    timeout, which stays at PyTorch's backend default, so the explicit
+    deadline is enforced by ``wait`` first and the read is issued only
+    once the key is present.
+    """
+    store.wait([key], _control_read_timeout())
+    return store.get(key)
 
 
 class B12xPreparationCoordinator:
@@ -136,7 +161,7 @@ class B12xPreparationCoordinator:
                 self._control.set("stop", b"1")
             self._stop |= self._control.check(["stop"])
             if self._control.check(["failed"]):
-                self._error = pickle.loads(self._control.get("failed"))
+                self._error = pickle.loads(_control_get(self._control, "failed"))
                 self._safe_close()
         try:
             with self._timing.span("local") if self._timing else nullcontext():
@@ -221,7 +246,7 @@ class B12xPreparationCoordinator:
         self._control.set(f"{prefix}/{self.global_rank}", pickle.dumps(payload))
         if self.global_rank == self.world_ranks[0]:
             gathered = [
-                pickle.loads(self._control.get(f"{prefix}/{rank}"))
+                pickle.loads(_control_get(self._control, f"{prefix}/{rank}"))
                 for rank in self.world_ranks
             ]
             try:
@@ -237,7 +262,7 @@ class B12xPreparationCoordinator:
                     done=False,
                 )
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
-        return pickle.loads(self._control.get(f"{prefix}/decision"))
+        return pickle.loads(_control_get(self._control, f"{prefix}/decision"))
 
     def _decision(self, gathered):
         self._validate_domain(gathered)
