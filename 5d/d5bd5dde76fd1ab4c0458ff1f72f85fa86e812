@@ -1,0 +1,14 @@
+vllm/models/qwen4_exp/nvidia/model.py
+  h_15da545fc8cfbe 240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5dd5bd5dde76fd1ab4c0458ff1f72f85fa86e812",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
