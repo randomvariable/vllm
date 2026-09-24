@@ -1,0 +1,20 @@
+tests/model_executor/test_qwen_triton_warmup.py
+  h_15da545fc8cfbe 16,118
+vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+  h_15da545fc8cfbe 1029-1034
+vllm/models/qwen3_8_flash_next/hc_prefill.py
+  h_15da545fc8cfbe 7
+vllm/models/qwen4_exp/amd/model.py
+  h_15da545fc8cfbe 5,11,70,81,83-85,318-319,534
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fe8b327bcd9f9c664f10260b4468a8004dc0461e",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
