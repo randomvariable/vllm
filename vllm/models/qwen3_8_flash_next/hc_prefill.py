@@ -4,8 +4,8 @@
 
 from vllm.models.qwen4_exp.common.hc_prefill import *  # noqa: F401,F403
 from vllm.models.qwen4_exp.common.hc_prefill import (  # noqa: F401
+    RowOwnership,
     configure,
     eligible,
     report,
-    RowOwnership,
 )
