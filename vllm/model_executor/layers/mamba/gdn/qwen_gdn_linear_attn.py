@@ -1026,10 +1026,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         for capacity, plan in self._b12x_prefill_plans.items():
             request = plan.request(
                 name=f"{self._b12x_preparation_prefix}.gdn.prefill.{capacity}",
-                prepare_call=lambda state,
-                capacity=capacity: self._prepare_b12x_gdn_prefill(state, capacity),
-                benchmark_call=lambda state,
-                capacity=capacity: self._benchmark_b12x_gdn_prefill(state, capacity),
+                prepare_call=lambda state, capacity=capacity: (
+                    self._prepare_b12x_gdn_prefill(state, capacity)
+                ),
+                benchmark_call=lambda state, capacity=capacity: (
+                    self._benchmark_b12x_gdn_prefill(state, capacity)
+                ),
             )
             units.append(
                 B12xPreparationUnit(

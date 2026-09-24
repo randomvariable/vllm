@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
@@ -66,6 +67,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.models.qwen4_exp.common import hc_prefill
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -76,8 +78,11 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm.models.qwen4_exp.common import hc_prefill
+from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .ple_layer import Qwen4ExpPLELayer
+from .qsa import Qwen4ExpQSAAttention
 
 
 def without_modelopt_fp4(
@@ -310,8 +315,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 prev_block_output = prev_injection = None
 
-        if hc_owner is not None:
-            hidden_states = hc_owner.gather(hidden_states)
+            if hc_owner is not None:
+                hidden_states = hc_owner.gather(hidden_states)
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -526,6 +531,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        ple_prefetched: bool = False,
         hc_prefill_eager: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
