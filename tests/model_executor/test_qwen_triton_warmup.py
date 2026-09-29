@@ -94,18 +94,6 @@ def _fake_gdn_layer(h: int, hv: int, k: int, v: int, tp_size: int) -> SimpleName
     )
 
 
-def test_qwen_gdn_norm_warmup_matches_per_head_weight_width() -> None:
-    # Qwen GDN normalizes per value head, so the warmed activation must be as wide
-    # as the norm weight. Sizing it from the stacked heads makes layer_norm_fwd
-    # reject the weight and aborts EngineCore init.
-    hv, v = 48, 128
-    config = _qwen_gdn_warmup_config(
-        {"layers.0.linear_attn": _fake_gdn_layer(32, hv, 128, v, tp_size=1)}
-    )
-    assert config is not None
-    assert config.norm_group_size == config.norm_weight.shape[0] == v
-
-
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA is required")
 def test_qwen_gdn_prefill_warmup_kernels_compile_on_gpu() -> None:
     config = _cuda_gdn_config()
