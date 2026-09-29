@@ -56,41 +56,6 @@ def _cuda_gdn_config() -> _QwenGDNWarmupConfig:
         dt_bias=torch.zeros(hv, dtype=torch.float32, device=device),
         state_stride_token=hv * v * k,
         state_dtype=torch.float32,
-        norm_weight=torch.ones(v, dtype=torch.bfloat16, device=device),
-        norm_bias=None,
-        norm_eps=1e-6,
-        norm_group_size=v,
-    )
-
-
-class _PerHeadNorm:
-    """Mirrors RMSNormGated(head_v_dim, group_size=None) in qwen_gdn_linear_attn."""
-
-    def __init__(self, v: int) -> None:
-        self.weight = torch.ones(v, dtype=torch.bfloat16)
-        self.bias = None
-        self.eps = 1e-6
-        self.group_size = None
-        self.norm_before_gate = True
-        self.activation = "silu"
-
-
-def _fake_gdn_layer(h: int, hv: int, k: int, v: int, tp_size: int) -> SimpleNamespace:
-    conv_dim = 2 * (h // tp_size) * k + (hv // tp_size) * v
-    return SimpleNamespace(
-        num_k_heads=h,
-        num_v_heads=hv,
-        head_k_dim=k,
-        head_v_dim=v,
-        conv_kernel_size=4,
-        tp_size=tp_size,
-        norm=_PerHeadNorm(v),
-        A_log=torch.zeros(hv // tp_size, dtype=torch.float32),
-        dt_bias=torch.zeros(hv // tp_size, dtype=torch.float32),
-        kv_cache=(
-            torch.zeros(2, conv_dim, 3, dtype=torch.bfloat16),
-            torch.zeros(2, hv // tp_size, k, v, dtype=torch.float32),
-        ),
     )
 
 
