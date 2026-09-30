@@ -1,0 +1,16 @@
+tests/kernels/moe/test_b12x.py
+  h_15da545fc8cfbe 1680-1681,1694-1699,1701,1962,1979,1989,2008,2016-2018,2022,2048,2061,2069,2094-2097
+vllm/model_executor/layers/fused_moe/b12x.py
+  h_15da545fc8cfbe 384,438-439,598,602-603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e01feeca67dd0df5a477470ffbf6e8526df19028",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
