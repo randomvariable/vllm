@@ -1,0 +1,28 @@
+docs/features/quantization/b12x.md
+  h_15da545fc8cfbe 20-22,78-114,125
+tests/kernels/moe/test_b12x.py
+  h_15da545fc8cfbe 41,58,375,464-466,518-520,1107-1110,1154-1174,1245,1255-1260,1286-1298,1348,1368-1378,1428-1436,1439-1441,1454-1468,1490-1501,1537-1543,1560-1574,1634-1636,1638-1639,1651-1657,1677-2107
+tests/v1/spec_decode/test_draft_moe_backend_override.py
+  h_15da545fc8cfbe 21-25,46,55
+vllm/config/kernel.py
+  h_15da545fc8cfbe 277
+vllm/model_executor/layers/fused_moe/b12x.py
+  h_15da545fc8cfbe 27,49,253,261-262,381-387,409,594-611,640,839-845,849
+vllm/model_executor/layers/fused_moe/oracle/fp8.py
+  h_15da545fc8cfbe 68-71,597-598,601
+vllm/model_executor/layers/fused_moe/oracle/mxfp8.py
+  h_15da545fc8cfbe 30-34,44,77-80
+vllm/model_executor/layers/quantization/modelopt.py
+  h_15da545fc8cfbe 1228-1234,1431-1434
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "da61df22f2b99d5fce191c90fda808fbb3855c91",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
