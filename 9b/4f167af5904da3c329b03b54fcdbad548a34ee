@@ -1,0 +1,22 @@
+tests/kernels/moe/test_b12x.py
+  h_15da545fc8cfbe 457-461,517-521,1122-1127,1295,1375,1571-1576,1760,1807,1842,1847
+tests/v1/spec_decode/test_draft_moe_backend_override.py
+  h_15da545fc8cfbe 54
+vllm/model_executor/layers/fused_moe/b12x.py
+  h_15da545fc8cfbe 250-254,350-357,562-566,649,848-853
+vllm/model_executor/layers/fused_moe/oracle/fp8.py
+  h_15da545fc8cfbe 505-511
+vllm/model_executor/layers/quantization/modelopt.py
+  h_15da545fc8cfbe 1396-1402
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9b4f167af5904da3c329b03b54fcdbad548a34ee",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
