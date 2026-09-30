@@ -1,0 +1,14 @@
+docs/features/quantization/b12x.md
+  h_15da545fc8cfbe 83-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2c4f43d62a5eec532f21ac037c82569789c72e3e",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
