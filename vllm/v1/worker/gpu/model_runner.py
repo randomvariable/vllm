@@ -1229,6 +1229,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         lora_capture_hook=create_lora_capture_hook(
                             self.lora_config, self
                         ),
+                        capture_logits=self._capture_logits_in_graphs(),
                     )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
@@ -1241,7 +1242,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.cudagraph_manager.captured_full_batch_shapes(),
                         )
                     self.kv_connector.reset_capture_state()
-
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
@@ -1259,6 +1259,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _capture_logits_in_graphs(self) -> bool:
+        """Whether FULL decode graphs can own the target head and its logits.
+
+        The captured head is the same ``compute_logits`` call ``sample`` makes,
+        so only layouts where that call is a plain single-rank projection of
+        every decode position qualify.
+        """
+        if not envs.VLLM_CUDAGRAPH_CAPTURE_LOGITS:
+            return False
+        unsupported = [
+            reason
+            for reason, present in (
+                ("pipeline parallelism", not self.is_last_pp_rank),
+                ("pooling models", self.is_pooling_model),
+                (
+                    "tensor parallelism",
+                    self.parallel_config.tensor_parallel_size > 1,
+                ),
+                ("batch-sharded sampling", self.batch_sharder is not None),
+                ("prefill context parallelism", self.pcp_manager is not None),
+                ("LoRA", self.lora_config is not None),
+            )
+            if present
+        ]
+        if unsupported:
+            logger.warning_once(
+                "VLLM_CUDAGRAPH_CAPTURE_LOGITS is ignored with %s.",
+                ", ".join(unsupported),
+            )
+            return False
+        return True
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1716,10 +1748,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        logits: torch.Tensor | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
+            assert logits is None, "captured logits are never batch-sharded"
             # Shard the inputs along the batch dimension to sample in parallel
             # across TP ranks.
             input_batch, sorted_logits_indices, grammar_output, shard_metadata = (
@@ -1732,7 +1766,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             local_logits = self.model.compute_logits_local(sample_hidden_states)
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
-        else:
+        elif logits is None:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
@@ -2191,6 +2225,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
+        captured_logits = None
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -2200,6 +2235,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 **connector_kwargs, attn_metadata=attn_metadata
             )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            # Uniform decode samples every token, so the replayed logits cover
+            # exactly the sampled positions in order.
+            if input_batch.logits_indices.shape[0] == input_batch.num_tokens:
+                captured_logits = self.cudagraph_manager.fullgraph_logits(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2285,6 +2324,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.num_speculative_steps
                 )
             ),
+            logits=(
+                None
+                if captured_logits is None
+                else captured_logits[: input_batch.num_tokens]
+            ),
         )
 
         if not self.is_last_pp_rank:
@@ -2320,6 +2364,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         boundary_logits_only = self.execute_model_state.boundary_logits_only
         boundary_aux_block_id = self.execute_model_state.boundary_aux_block_id
+        captured_logits = self.execute_model_state.logits
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2355,7 +2400,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, captured_logits
         )
 
         if self.pp_handler is not None:
@@ -2724,6 +2769,8 @@ class ExecuteModelState(NamedTuple):
     num_spec_tokens_to_schedule: int
     boundary_logits_only: bool = False
     boundary_aux_block_id: int = 0
+    # Target logits replayed by the FULL graph, in logits_indices order.
+    logits: torch.Tensor | None = None
 
 
 class BatchReqState(NamedTuple):

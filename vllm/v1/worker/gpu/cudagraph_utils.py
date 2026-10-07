@@ -875,6 +875,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        # Target logits replayed by uniform-decode FULL graphs, keyed by the
+        # padded token counts whose graphs computed them.
+        self.logits: torch.Tensor | None = None
+        self.logits_token_counts: set[int] = set()
 
     def capture(
         self,
@@ -889,6 +893,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
+        capture_logits: bool = False,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -934,6 +939,27 @@ class ModelCudaGraphManager(CudaGraphManager):
                     )
                 for k, v in intermediate_tensors.tensors.items():
                     self.intermediate_tensors[k][:num_tokens] = v
+
+        # Every token of a uniform decode batch is a sampled position, so its
+        # logits are a contiguous prefix and can live inside the graph.
+        logits_rows = max(
+            (
+                desc.num_tokens
+                for desc in self._capture_descs.get(CUDAGraphMode.FULL, ())
+                if desc.uniform_token_count is not None
+            ),
+            default=0,
+        )
+
+        def store_capture_logits(num_tokens: int, model: nn.Module) -> None:
+            assert self.hidden_states is not None
+            logits = model.compute_logits(self.hidden_states[:num_tokens])
+            if self.logits is None:
+                # First call is a warmup outside capture; size for the largest
+                # uniform graph so every later graph writes the same buffer.
+                self.logits = logits.new_empty((logits_rows, logits.shape[-1]))
+            self.logits[:num_tokens] = logits
+            self.logits_token_counts.add(num_tokens)
 
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -1043,10 +1069,22 @@ class ModelCudaGraphManager(CudaGraphManager):
                     return None
 
                 store_capture_output(num_tokens, model_output)
+                if capture_logits and desc.uniform_token_count is not None:
+                    store_capture_logits(num_tokens, model)
 
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+
+    def fullgraph_logits(self, desc: BatchExecutionDescriptor) -> torch.Tensor | None:
+        """Logits the last FULL replay of ``desc`` computed, if it captured them."""
+        if (
+            self.logits is None
+            or desc.uniform_token_count is None
+            or desc.num_tokens not in self.logits_token_counts
+        ):
+            return None
+        return self.logits[: desc.num_tokens]
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
