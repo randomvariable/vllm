@@ -1,0 +1,18 @@
+vllm/envs.py
+  h_15da545fc8cfbe 217,1852-1856
+vllm/v1/worker/gpu/cudagraph_utils.py
+  h_15da545fc8cfbe 878-881,896,943-963,1072-1073,1079-1088
+vllm/v1/worker/gpu/model_runner.py
+  h_15da545fc8cfbe 1232,1263-1294,1751,1756,1769,2228,2238-2241,2327-2331,2367,2403,2772-2773
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb19cfa9a80265cc708abb998efd641a1d1cc5f0",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
