@@ -221,7 +221,6 @@ if TYPE_CHECKING:
     VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
-    VLLM_QWEN4_EXP_HC_LL_BF16: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_DS41_MARKOV_NVFP4: bool = False
@@ -1899,9 +1898,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
     "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
-    ),
-    "VLLM_QWEN4_EXP_HC_LL_BF16": lambda: bool(
-        int(os.getenv("VLLM_QWEN4_EXP_HC_LL_BF16", "1"))
     ),
     # Reuse uniform speculative metadata in the shared GDN/KDA backend.
     "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(

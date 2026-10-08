@@ -282,36 +282,6 @@ class HyperConnectionWorkspace(nn.Module):
         )
 
 
-_HC_LL_BF16_STATE: bool | None = None
-
-
-def _hc_ll_bf16_supported() -> bool:
-    """Whether HC skinny bf16 projections use the CuTe ``ll_bf16_gemm``.
-
-    On family-120 Blackwell (SM120 RTX PRO 6000, SM121 GB10) the HC
-    down/up projections are ``torch.mm`` calls that cuBLASLt answers with
-    Ampere ``cutlass_80_wmma_tensorop_bf16`` kernels. Measured on GB10 CSF
-    decode: ~125 such launches and ~9.6 ms per step (~22% of device time).
-    The CuTe DSL dot-product/split-K kernels (PDL; CTA clusters exist from
-    sm_90 on 120/121) replace them at the same precision contract
-    (bf16 x bf16 -> fp32). SM90/SM100 keep their existing dispatch.
-    """
-    global _HC_LL_BF16_STATE
-    if _HC_LL_BF16_STATE is None:
-        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
-            is_available,
-        )
-        from vllm.platforms import current_platform
-
-        _HC_LL_BF16_STATE = bool(
-            envs.VLLM_QWEN4_EXP_HC_LL_BF16
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-            and is_available()
-        )
-    return _HC_LL_BF16_STATE
-
-
 class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
@@ -419,12 +389,6 @@ class GatedResidual(nn.Module):
             )
         )
         object.__setattr__(self, "_workspace", workspace)
-        self._use_ll_bf16_mix = bool(
-            self.tp_size == 1
-            and _hc_ll_bf16_supported()
-            and self.hyper_hidden_size % 8 == 0
-            and self.lora_rank % 8 == 0
-        )
         self._preparation_prefix = prefix or "qwen4_exp.hyperconnection"
         self._plans: dict[str, object] = {}
         if workspace is not None and not getattr(
@@ -664,33 +628,12 @@ class GatedResidual(nn.Module):
             )
         return self.workspace.bind(self._plan_for(operation), hidden_states.shape[0])
 
-    def _ll_bf16_mm(
-        self, x: torch.Tensor, weight: torch.Tensor, cast_to: torch.dtype
-    ) -> torch.Tensor:
-        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
-            ll_bf16_gemm,
-        )
-
-        out = ll_bf16_gemm(x, weight)
-        return out if out.dtype == cast_to else out.to(cast_to)
-
     def _mix_normalized(self, normalized: torch.Tensor):
         if self.tp_size > 1:
             return self._mix_sharded(normalized)
         api = _hyperconnection_api() if self.workspace is not None else None
-        use_ll = (
-            self._use_ll_bf16_mix
-            and normalized.dtype == torch.bfloat16
-            and normalized.is_contiguous()
-        )
         if self.use_combine:
-            down_linear = self.input_mix_weight_down_block_inject
-            if use_ll:
-                down_and_injection = self._ll_bf16_mm(
-                    normalized, down_linear.weight, torch.bfloat16
-                )
-            else:
-                down_and_injection = down_linear(normalized)
+            down_and_injection = self.input_mix_weight_down_block_inject(normalized)
             projected_down = down_and_injection[:, : self.lora_rank]
             injection_start = self.lora_rank
             # The projection owner stays live through the downstream residual
@@ -699,13 +642,7 @@ class GatedResidual(nn.Module):
                 :, injection_start : injection_start + self.hc_count
             ]
         else:
-            down_linear = self.input_mix_weight_down
-            if use_ll:
-                projected_down = self._ll_bf16_mm(
-                    normalized, down_linear.weight, torch.bfloat16
-                )
-            else:
-                projected_down = down_linear(normalized)
+            projected_down = self.input_mix_weight_down(normalized)
             injection = None
 
         bottleneck = (
@@ -715,11 +652,7 @@ class GatedResidual(nn.Module):
             if api is not None
             else hc_silu(projected_down, self.hc_count)
         )
-        up_linear = self.input_mix_weight_up
-        if use_ll and bottleneck.dtype == torch.bfloat16 and bottleneck.is_contiguous():
-            gate_logits = self._ll_bf16_mm(bottleneck, up_linear.weight, torch.bfloat16)
-        else:
-            gate_logits = up_linear(bottleneck)
+        gate_logits = self.input_mix_weight_up(bottleneck)
         block_input = (
             api.run_gate_mean(
                 normalized, gate_logits, binding=self._binding(normalized, "gate_mean")
