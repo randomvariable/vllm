@@ -1,0 +1,18 @@
+vllm/envs.py
+  h_15da545fc8cfbe 224,1903-1905
+vllm/model_executor/layers/fused_moe/router/gate_linear.py
+  h_15da545fc8cfbe 64-68,74
+vllm/models/qwen4_exp/nvidia/hyperconnection.py
+  h_15da545fc8cfbe 285-314,422-427,667-676,681-685,687-693,702-708,718-722
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e98311cc18f957e3416233821b0fed1684f2a9cd",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
