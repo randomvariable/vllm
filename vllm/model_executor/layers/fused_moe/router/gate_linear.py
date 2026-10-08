@@ -61,12 +61,17 @@ class GateLinear(ReplicatedLinear):
                 output_size,
             ) in ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES
         is_blackwell_rtx = current_platform.is_device_capability((12, 0))
+        # GB10 (DGX Spark, SM121) has the same CuTe ll_bf16 eligibility as
+        # SM120: PDL and CTA clusters exist on both (clusters from sm_90,
+        # both 120 and 121); only tcgen05/two-CTA-pair forms are excluded.
+        # The cuBLAS graph-pool lifetime guard below stays SM120-only.
+        is_sm121 = current_platform.is_device_capability((12, 1))
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
         )
         self._can_use_ll_bf16 = (
             current_platform.is_cuda()
-            and (is_hopper or is_blackwell or is_blackwell_rtx)
+            and (is_hopper or is_blackwell or is_blackwell_rtx or is_sm121)
             and not bias
         )
 
