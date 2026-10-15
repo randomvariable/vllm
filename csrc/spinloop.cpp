@@ -13,6 +13,7 @@ extern "C" {
 
 #if defined(__linux__)
   #include <linux/futex.h>
+  #include <sys/prctl.h>
   #include <sys/syscall.h>
   #include <unistd.h>
 #endif
@@ -436,10 +437,10 @@ static uint32_t* park_word(Py_buffer* view, Py_ssize_t index) {
 }
 
 static long futex(uint32_t* addr, int op, uint32_t val,
-                  const struct timespec* timeout) {
+                  const struct timespec* timeout, uint32_t val3) {
   // Shared (not FUTEX_PRIVATE) futex: the words live in a mapping shared
   // between processes.
-  return syscall(SYS_futex, addr, op, val, timeout, NULL, 0);
+  return syscall(SYS_futex, addr, op, val, timeout, NULL, val3);
 }
 
 // park_prepare(buf, i): mark reader i parked, then fence so its slot
@@ -479,6 +480,10 @@ static double monotonic_s(void) {
 // core out of idle states whose target residency exceeds it, so a wake in
 // that window avoids a deep-state exit. Each slice boundary costs one
 // timer wake-up in this loop, without returning to Python.
+//
+// Sliced waits use FUTEX_WAIT_BITSET with an absolute CLOCK_MONOTONIC
+// deadline, so re-arming does not accumulate rounding, and the thread's
+// timer slack is tightened so the slices are not deferred.
 static PyObject* method_park_wait(PyObject* self, PyObject* args) {
   (void)self;
   Py_buffer view;
@@ -490,26 +495,29 @@ static PyObject* method_park_wait(PyObject* self, PyObject* args) {
   uint32_t* word = park_word(&view, index);
   if (word != NULL) {
     Py_BEGIN_ALLOW_THREADS;
+    if (slice_s > 0) prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
     double start = monotonic_s();
     while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1) {
       double elapsed = monotonic_s() - start;
       double left = timeout_s >= 0 ? timeout_s - elapsed : -1;
       if (timeout_s >= 0 && left <= 0) break;
       bool sliced = slice_s > 0 && elapsed < shallow_s;
-      if (sliced) {
-        double s = slice_s;
-        if (left >= 0 && left < s) s = left;
-        struct timespec ts = to_timespec(s);
-        futex(word, FUTEX_WAIT, 1, &ts);
-        continue;
+      if (!sliced && left < 0) {
+        futex(word, FUTEX_WAIT, 1, NULL, 0);
+        break;
       }
-      if (left >= 0) {
-        struct timespec ts = to_timespec(left);
-        futex(word, FUTEX_WAIT, 1, &ts);
-      } else {
-        futex(word, FUTEX_WAIT, 1, NULL);
+      double sleep_s = sliced ? slice_s : left;
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      struct timespec deadline = to_timespec(sleep_s);
+      deadline.tv_sec += ts.tv_sec;
+      deadline.tv_nsec += ts.tv_nsec;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec += 1;
       }
-      break;
+      futex(word, FUTEX_WAIT_BITSET, 1, &deadline, FUTEX_BITSET_MATCH_ANY);
+      if (!sliced) break;
     }
     __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
     Py_END_ALLOW_THREADS;
@@ -549,7 +557,7 @@ static PyObject* method_wake_parked(PyObject* self, PyObject* args) {
   for (Py_ssize_t i = 0; i < n; i++) {
     if (__atomic_load_n(&words[i], __ATOMIC_RELAXED) != 0 &&
         __atomic_exchange_n(&words[i], 0, __ATOMIC_SEQ_CST) != 0) {
-      futex(&words[i], FUTEX_WAKE, INT32_MAX, NULL);
+      futex(&words[i], FUTEX_WAKE, INT32_MAX, NULL, 0);
       woken++;
     }
   }
