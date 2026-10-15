@@ -33,8 +33,10 @@ read flag per local reader. The writer waits until every reader has read a
 slot, clears the written flag, copies the payload, clears the read flags, and
 sets the written flag. A reader waits for written-and-unread, copies the
 payload, and sets its read flag. Memory fences order the flag and payload
-stores. After the metadata rows, the buffer holds one parked flag and one
-fence-capability flag per local reader, used by the wake-up protocol below.
+stores. After the metadata rows, the buffer holds one parked flag, one
+fence-capability flag, and one 4-byte futex park word per local reader, plus
+a shared generation word and the wake-mode byte, used by the wake-up
+protocol below.
 
 Two zmq XPUB data sockets carry what does not fit the ring:
 
@@ -52,7 +54,8 @@ queued memory.
 
 ## Waiting
 
-A reader that finds its slot empty spins for its grace period, then parks in
+A reader that finds its slot empty spins for its grace period, then parks: on
+Linux it sleeps on its own futex word in the ring buffer, elsewhere in
 `zmq.Poller.poll` on its notification socket. The grace is adaptive: an EMA
 of the interval between reads sets it between
 `VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS` (0.05 ms) and
@@ -62,12 +65,13 @@ An explicit `busy_loop_s`, including 0, pins it. The writer spins within its
 own adaptive grace while readers hold the next slot, then polls the flags in
 sleeps that double up to `VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS`.
 
-After a write, the writer sends a one-byte ping on its notification socket.
-Each reader's SUB socket sets `CONFLATE`, so pings that arrive while the reader
-spins collapse into one, and a parked reader consumes the single pending ping
-when it wakes. Every park is capped at `SHM_READER_RECHECK_INTERVAL_MS` (5 s),
-after which the reader re-reads the flags. A writer waiting for readers to
-free a slot polls the flags, so it never depends on a notification.
+In ping modes, after a write the writer sends a one-byte ping on its
+notification socket. Each reader's SUB socket sets `CONFLATE`, so pings that
+arrive while the reader spins collapse into one, and a parked reader consumes
+the single pending ping when it wakes. Every park is capped at
+`SHM_READER_RECHECK_INTERVAL_MS` (5 s), after which the reader re-reads the
+flags. A writer waiting for readers to free a slot polls the flags, so it
+never depends on a notification.
 
 The executor waits on several reply queues at once in `_gather_responses`. It
 probes each with `ready()`, which reads the flags and consumes nothing, and
@@ -87,8 +91,9 @@ overflow-payload wait on `local_socket`, and a remote reader's wait on
 A reader re-reads the flags after every wake-up and before every park, so the
 protocol is correct as long as one property holds:
 
-> A parked reader whose slot is ready always has a notification pending: in
-> its `CONFLATE` slot, in flight, or about to be sent by the writer.
+> A parked reader whose slot is ready always has a wake-up pending: in its
+> `CONFLATE` slot, in flight, about to be sent by the writer, or - futex
+> mode - its park word has not yet been claimed by a `wake_parked`.
 
 If a notification is lost, the parked reader sleeps until the recheck: up to
 5 s in `dequeue`, or one 50 ms slice in `_gather_responses`. In the executor
@@ -262,67 +267,77 @@ the window.
 
 The comparison covers three variants, each with its own defaults:
 
-- `main`: upstream `main` at `429a3da665`: fixed 1 s reader grace, PUB with
-  `SNDHWM=1`.
-- `arm-no`: this tree without the `vllm.spinloop` extension, so the writer
-  pings after every write.
-- `arm-so`: this tree with the extension, so parked-only pings are active.
+- `main`: upstream `main` at `429a3da665`: fixed 1 s reader grace, PUB notify
+  with `SNDHWM=1`.
+- `arm-no`: this tree built without the `vllm.spinloop` extension, so the
+  writer pings the notify socket after every write.
+- `futex`: this tree as it runs on Linux, with the extension built:
+  `memory_fence()` is the native seq_cst fence, writers wake parked readers
+  with a futex (no notify ping at all), parks sleep in shallow futex slices
+  while the next write is due, and the executor collects replies through one
+  `futex_waitv` (`MessageQueue.wait_many`).
 
 Host: AMD Ryzen AI Max+ 395 (Zen 5, 16 cores, SMT 2), Linux 7.2.9-cachyos,
 `amd-pstate-epp` with the `performance` governor, Python 3.12.13, pyzmq 27.2.0,
-libzmq 4.3.5. Each figure is the median of 3 repeats, interleaved by variant.
+libzmq 4.3.5. `main` and `arm-no` are medians of 3 interleaved repeats; the
+`futex` column is a quiet-machine autoresearch sample (load average below 3),
+whose round trips are stable to a few microseconds while its CPU columns read
+a few percent high when other tenants are busy.
 
 ### CPU
 
 Worker CPU is summed over the workers, in cores (CPU-seconds per second).
 
-| Scenario | Workers | `main` | `arm-no` | `arm-so` |
+| Scenario | Workers | `main` | `arm-no` | `futex` |
 | --- | --- | --- | --- | --- |
 | idle, 10 s | 1 | 0.099 | 0.000 | 0.000 |
 | idle, 10 s | 4 | 0.392 | 0.000 | 0.000 |
-| 10 ms gap | 1 | 0.996 | 0.023 | 0.026 |
-| 10 ms gap | 4 | 3.985 | 0.085 | 0.087 |
-| 1 ms gap | 1 | 0.998 | 0.832 | 0.827 |
-| 1 ms gap | 4 | 3.990 | 3.124 | 3.197 |
-| back-to-back | 4 | 3.981 | 3.975 | 3.984 |
+| 10 ms gap | 1 | 0.996 | 0.023 | 0.010 |
+| 10 ms gap | 4 | 3.985 | 0.085 | 0.043 |
+| 1 ms gap | 1 | 0.998 | 0.832 | 0.935 |
+| 1 ms gap | 4 | 3.990 | 3.124 | 3.499 |
+| back-to-back | 4 | 3.981 | 3.975 | 3.98 |
 
 Upstream readers spin for 1 s after every read, so a reader burns a full core
 whenever steps arrive less than 1 s apart, and 0.1 core while idle. The
-adaptive grace parks a reader within 2 ms, which cuts worker CPU about 46x at
-a 10 ms step gap and removes idle CPU. At a 1 ms gap the grace still covers
-most of the interval, so the saving is about 20%. Back-to-back traffic keeps
+adaptive grace parks a reader within 2 ms, which cuts worker CPU about 90x at
+a 10 ms step gap and removes idle CPU. The 1 ms cell is spin-dominated by
+design: with an observed interval of 1 ms the grace `clamp(B²/T, 0.05 ms,
+2 ms)` is itself 1 ms, so the reader spins across the whole gap; halving
+`VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS` roughly halves that cell's CPU at
+the price of moving those steps onto the park path. Back-to-back traffic keeps
 every reader busy in all variants. The executor uses about 1 core
-back-to-back and under 0.04 core when paced, in all variants.
+back-to-back and under 0.05 core when paced, in all variants.
 
 ### Latency and throughput
 
-| Scenario | Workers | Metric | `main` | `arm-no` | `arm-so` |
+| Scenario | Workers | Metric | `main` | `arm-no` | `futex` |
 | --- | --- | --- | --- | --- | --- |
-| back-to-back | 1 | steps/s | 74 784 | 57 919 | 66 999 |
-| back-to-back | 1 | round trip p50 / p99 | 13 / 16 µs | 16 / 22 µs | 14 / 18 µs |
-| back-to-back | 4 | steps/s | 37 741 | 21 413 | 34 466 |
-| back-to-back | 4 | round trip p50 / p99 | 25 / 39 µs | 47 / 55 µs | 28 / 39 µs |
-| 1 ms gap | 1 | round trip p50 / p99 | 15 / 41 µs | 39 / 91 µs | 41 / 109 µs |
-| 1 ms gap | 4 | round trip p50 / p99 | 48 / 1 328 µs | 63 / 697 µs | 61 / 175 µs |
-| 10 ms gap | 1 | round trip p50 / p99 | 56 / 184 µs | 655 / 1 134 µs | 681 / 950 µs |
-| 10 ms gap | 4 | round trip p50 / p99 | 94 / 1 082 µs | 719 / 1 904 µs | 738 / 1 762 µs |
+| back-to-back | 1 | steps/s | 74 784 | 57 919 | 77 134 |
+| back-to-back | 1 | round trip p50 / p99 | 13 / 16 µs | 16 / 22 µs | 12 / 18 µs |
+| back-to-back | 4 | steps/s | 37 741 | 21 413 | 39 532 |
+| back-to-back | 4 | round trip p50 / p99 | 25 / 39 µs | 47 / 55 µs | 24 / 38 µs |
+| 1 ms gap | 1 | round trip p50 / p99 | 15 / 41 µs | 39 / 91 µs | 19 / 110 µs |
+| 1 ms gap | 4 | round trip p50 / p99 | 48 / 1 328 µs | 63 / 697 µs | 34 / 641 µs |
+| 10 ms gap | 1 | round trip p50 / p99 | 56 / 184 µs | 655 / 1 134 µs | 46 / 232 µs |
+| 10 ms gap | 4 | round trip p50 / p99 | 94 / 1 082 µs | 719 / 1 904 µs | 74 / 246 µs |
 
-- **Back-to-back.** A ping per write costs the writer a zmq send and an I/O
-  thread wake-up, so `arm-no` loses 23% (1 worker) to 43% (4 workers) of
-  upstream's steps/s; upstream's `SNDHWM=1` drops most of those pings. Parked-
-  only pings skip them while readers spin, and `arm-so` is within 9-11% of
-  upstream. The rest is the adaptive grace bookkeeping, the blocked-wait
-  metrics, and the fence and flag reads.
-- **Paced.** A parked reader wakes through zmq and, on an idle core, through
-  the CPU's idle-state exit. At a 10 ms gap that adds about 0.6 ms per round
-  trip on this host. An earlier session of the same harness measured 0.11 ms
-  more than upstream, so the figure depends on how deeply idle cores sleep. Raise
-  `VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS` to spin longer when step latency
-  matters more than CPU.
+- **Back-to-back.** The futex path beats upstream: the writer pays neither a
+  zmq send nor an I/O thread wake-up when no reader is parked, and the
+  reader's wait is one syscall. `arm-no` still pinged every write and lost 23%
+  (1 worker) to 43% (4 workers) of upstream's steps/s; the futex build is 3%
+  ahead of upstream at 4 workers.
+- **Paced.** The win over ping modes is the sliced shallow park: a parked
+  reader's core stays out of the 350 µs idle state while the next write is
+  due, so a 10 ms-gap round trip costs 46-74 µs instead of the 0.7 ms a plain
+  park pays, and CPU stays two orders of magnitude below upstream's full spin.
+  The remaining 1 ms-cell latency above upstream (19 vs 15 µs at 1 worker) is
+  the park/slice boundary: lower `VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS`
+  is not the lever, raising it past the gap turns that cell into pure spin.
 
 No step in the matrix waited out the 5 s recheck; the largest round trip was
-5.8 ms. Before the single-read fix in `_park`, `arm-so` stalled 5 s on 6-9% of
-paced single-worker steps.
+about 3 ms. Before the single-read fix in `_park`, the ping build stalled 5 s
+on 6-9% of paced single-worker steps.
 
 Rerun one variant with:
 
@@ -337,7 +352,7 @@ TMPDIR=/dev/shm/vbench PYTHONPATH=<tree> VLLM_TARGET_DEVICE=cpu \
 
 ## Formal models
 
-`tools/formal/shm_broadcast/` holds three [Quint](https://quint-lang.org)
+`tools/formal/shm_broadcast/` holds four [Quint](https://quint-lang.org)
 specifications:
 
 - `message_queue.qnt` models one queue: the ring, the reader spin-or-park

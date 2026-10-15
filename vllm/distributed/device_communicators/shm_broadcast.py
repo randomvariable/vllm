@@ -1148,10 +1148,11 @@ class MessageQueue:
                     written_flag = metadata_buffer[0]
                     return not (written_flag and read_count != self.buffer.n_reader)
 
-                if not check() and blocked_wait_start is None:
+                free_now = check()
+                if not free_now and blocked_wait_start is None:
                     blocked_wait_start = time.monotonic()
 
-                if SPINLOOP_EXT_ENABLED and not check():
+                if SPINLOOP_EXT_ENABLED and not free_now:
                     # The native extension treats a timeout <= 1e-9 as
                     # unlimited, so skip the spin once the budget is gone.
                     now = time.monotonic()
@@ -1171,12 +1172,7 @@ class MessageQueue:
                             timeout=native_timeout_s,
                         )
 
-                if not check():
-                    # this block is written and not read by all readers
-                    # for writers, `self.current_idx` is the next block to write
-                    # if this block is not ready to write,
-                    # we need to wait until it is read by all readers
-
+                if not free_now and not check():
                     # Spin only while within the adaptive grace; once it
                     # expires, poll in doubling sleep steps (capped at
                     # VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS).
@@ -1326,10 +1322,11 @@ class MessageQueue:
                     written_flag = metadata_buffer[0]
                     return not (not written_flag or read_flag)
 
-                if not check() and blocked_wait_start is None:
+                ready_now = check()
+                if not ready_now and blocked_wait_start is None:
                     blocked_wait_start = time.monotonic()
 
-                if not check():
+                if not ready_now and not check():
                     # this block is either
                     # (1) not written
                     # (2) already read by this reader
