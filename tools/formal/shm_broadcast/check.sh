@@ -22,6 +22,8 @@ export TMPDIR=$PWD/.tmp JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$PWD/.tmp"
 # spec module invariants expected(ok|violation) apalache-steps
 checks=(
   "paths pathsFixed inOrder,noLoss,progress ok 10"
+  "message_queue futexFenced noLostWakeup,ringSafe ok 10"
+  "message_queue futexUnfenced noLostWakeup,ringSafe violation 9"
   "paths pathsCancel inOrder,noLoss,progress violation 12"
   "message_queue skipIdleFenced noLostWakeup,ringSafe ok 10"
   "message_queue hwm1NoThrottle noLostWakeup,ringSafe ok 10"
@@ -50,19 +52,23 @@ run() {
   local id=$1 be=$2 spec=$3 main=$4 invs=$5 want=$6 steps=$7 out got text
   local -a inv
   IFS=, read -ra inv <<<"$invs"
-  out=.runs/$be-$main.txt
+  out=$PWD/.runs/$be-$main.txt
   local start=$SECONDS
   # Every quint verify starts its own Apalache server (the TLC backend uses
-  # it to compile), so each check needs a private port to run in parallel.
+  # it to compile), so each check needs a private port, and a private working
+  # and temp directory: TLC unpacks its standard modules into java.io.tmpdir.
+  local dir=$PWD/.runs/work-$id
+  rm -rf "$dir" && mkdir -p "$dir/tmp"
+  local -a cmd=(quint verify "../../$spec.qnt" --main "$main"
+    --server-endpoint "localhost:$((8900 + id))" --invariants "${inv[@]}")
   if [[ $be == tlc ]]; then
-    quint verify "$spec.qnt" --main "$main" --backend tlc \
-      --server-endpoint "localhost:$((8900 + id))" \
-      --invariants "${inv[@]}" >"$out" 2>&1
+    cmd+=(--backend tlc)
   else
-    quint verify "$spec.qnt" --main "$main" --max-steps "$steps" \
-      --server-endpoint "localhost:$((8900 + id))" \
-      --invariants "${inv[@]}" >"$out" 2>&1
+    cmd+=(--max-steps "$steps")
   fi
+  (cd "$dir" && TMPDIR=$dir/tmp JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$dir/tmp" \
+    "${cmd[@]}") >"$out" 2>&1
+  rm -rf "$dir"
   # Classify by the reported outcome, not the exit code: quint also exits 1
   # on tool errors.
   text=$(<"$out")

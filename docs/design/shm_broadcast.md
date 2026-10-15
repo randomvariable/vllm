@@ -175,11 +175,46 @@ details carry the correctness:
 | IBM Z (s390x) | `bcr 15,0` |
 | RISC-V | `fence rw,rw` |
 
-Each reader records in its fence-capability flag whether it has `full_fence`
-before it subscribes. The writer reads the flags in `wait_until_ready` and
-enables parked-only pings only if it and every local reader can fence.
-Otherwise, for example on XPU builds or Python 3.10 where the extension is
-not built, the writer pings after every write.
+### Futex wake
+
+On Linux the extension also exports futex park and wake calls on 4-byte
+words in the ring buffer, one per local reader. The handshake is the same,
+with the parked flag replaced by the futex word and the notify ping by a
+futex wake:
+
+- `park_prepare` stores 1 in the reader's word and fences. The reader then
+  re-checks its slot and `shutting_down`, and calls `park_wait`, which sleeps
+  in `FUTEX_WAIT` only while the word is still 1, for at most the recheck
+  interval.
+- `wake_parked` fences, then exchanges every set word to 0 and calls
+  `FUTEX_WAKE` on it.
+
+The kernel compares the word under its futex lock, so a wake that lands
+between the reader's re-check and its sleep makes the sleep return at once.
+A parked reader wakes in one futex syscall instead of a zmq send, an I/O
+thread hand-off, and a `poll` return: on the benchmark host the one-way
+parked latency drops from 61 to 34 µs at p50 and from 1.4 ms to 0.18 ms at
+p99. `shutdown()` wakes a futex-parked reader through its own word.
+
+The futex words are node-local, like the ring. Readers on other nodes keep
+receiving every message on `remote_socket`, so cross-node collectives are
+unaffected.
+
+### Wake mode selection
+
+Each reader records its capability before it subscribes: 0 without the
+extension, 1 with `full_fence`, 2 with futexes as well. In
+`wait_until_ready` the writer picks the wake mode that every local reader
+supports, publishes it in the ring buffer, and only then sends `READY`, after
+which each reader reads it:
+
+| Mode | Condition | Wake-up |
+| --- | --- | --- |
+| futex | writer and every local reader have futexes (Linux) | `wake_parked` |
+| parked-only ping | writer and every local reader have `full_fence` | notify ping while a parked flag is set |
+| ping | otherwise, for example XPU builds or Python 3.10 | notify ping after every write |
+
+The notify socket and its subscription handshake stay in place in every mode.
 
 ### Ring back-pressure
 
@@ -312,6 +347,8 @@ The invariants:
 | `message_queue` | `skipIdleFenced`: lossless channel, parked-only pings | holds |
 | `message_queue` | `skipIdleUnfenced`: parked-only pings without fences | `noLostWakeup` fails |
 | `message_queue` | `skipIdleFlaglessPark`: a reader may poll without its flag | `noLostWakeup` fails |
+| `message_queue` | `futexFenced`: futex wake of parked readers, full fences | holds |
+| `message_queue` | `futexUnfenced`: futex wake without the fences | `noLostWakeup` fails |
 | `inference` | `fixedDecode`, `fixedAllReply`: lossless channel | holds |
 | `inference` | `hwm1Decode`, `raceDecode`: lossy channel | `noLostWakeup` and `progress` fail; the executor and both workers end parked |
 | `inference` | `backpressureAtBound`: 1-slot rings, 3 outstanding RPCs | holds |

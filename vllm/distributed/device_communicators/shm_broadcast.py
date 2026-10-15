@@ -70,6 +70,24 @@ try:
 except ImportError:
     pass
 
+# Linux futex park/wake on shared-memory words: a parked local reader sleeps
+# on its word and the writer wakes it directly, without a zmq round trip.
+try:
+    from vllm.spinloop import park_clear, park_prepare, park_wait, wake_parked
+
+    _HAS_FUTEX = _full_fence is not None
+except ImportError:
+    _HAS_FUTEX = False
+
+# Reader capability flags, published in the ring buffer.
+_CAP_FENCE = 1
+_CAP_FUTEX = 2
+
+# Wake modes the writer selects in wait_until_ready.
+_WAKE_PING = 0  # ping the notify socket after every write
+_WAKE_PARKED_PING = 1  # ping only while a reader's parked flag is set
+_WAKE_FUTEX = 2  # futex-wake parked readers; no notify ping
+
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
 
@@ -604,12 +622,15 @@ class ShmRingBuffer:
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
         self.max_chunks = max_chunks
-        self.total_bytes_of_buffer = (
-            self.max_chunk_bytes + self.metadata_size
-        ) * self.max_chunks + 2 * n_reader
+        self.park_offset = (self.max_chunk_bytes + self.metadata_size) * self.max_chunks
+        # 4-byte futex words, one per reader, after the park and capability
+        # flags (the shared mapping is page aligned), then one byte where the
+        # writer publishes the wake mode it chose.
+        self.futex_offset = (self.park_offset + 2 * n_reader + 3) & ~3
+        self.mode_offset = self.futex_offset + 4 * n_reader
+        self.total_bytes_of_buffer = self.mode_offset + 1
         self.data_offset = 0
         self.metadata_offset = self.max_chunk_bytes * self.max_chunks
-        self.park_offset = self.metadata_offset + self.metadata_size * max_chunks
 
         if name is None:
             # we are creating a buffer
@@ -689,6 +710,22 @@ class ShmRingBuffer:
         assert self.shared_memory.buf is not None, "Buffer has been closed"
         with self.shared_memory.buf[start : start + 2 * self.n_reader] as buf:
             yield buf
+
+    @contextmanager
+    def get_futex_words(self):
+        """Yield the readers' futex park words (``4 * n_reader`` bytes)."""
+        start = self.futex_offset
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        with self.shared_memory.buf[start : start + 4 * self.n_reader] as buf:
+            yield buf
+
+    def set_wake_mode(self, mode: int) -> None:
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        self.shared_memory.buf[self.mode_offset] = mode
+
+    def wake_mode(self) -> int:
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        return self.shared_memory.buf[self.mode_offset]
 
 
 def _rebuild_tensor(buf: Any, shape: tuple[int, ...], dtype_str: str) -> torch.Tensor:
@@ -869,8 +906,8 @@ class MessageQueue:
             self.remote_socket = None
 
         self._is_writer = True
-        # Set by wait_until_ready once every local reader can fence.
-        self._notify_parked_only = False
+        # Set by wait_until_ready from the capabilities of every local reader.
+        self._wake_mode = _WAKE_PING
         self._cancel_sender: zmq.Socket | None = None
         self._data_poller: zmq.Poller | None = None
         self._is_local_reader = False
@@ -912,8 +949,9 @@ class MessageQueue:
             # subscriptions arrive, which the kernel orders after this store.
             with self.buffer.get_park_flags() as flags:
                 flags[self.buffer.n_reader + self.local_reader_rank] = (
-                    _full_fence is not None
+                    _CAP_FUTEX if _HAS_FUTEX else _CAP_FENCE if _full_fence else 0
                 )
+            self._wake_mode = _WAKE_PING
 
             self.local_socket = context.socket(SUB)
             self.local_socket.setsockopt_string(SUBSCRIBE, "")
@@ -981,9 +1019,13 @@ class MessageQueue:
                 # the recheck interval
                 self._spin_condition.wait_for_readers(self.n_local_reader)
                 with self.buffer.get_park_flags() as flags:
-                    self._notify_parked_only = _full_fence is not None and all(
-                        flags[self.buffer.n_reader :]
-                    )
+                    caps = flags[self.buffer.n_reader :]
+                    if _HAS_FUTEX and all(c == _CAP_FUTEX for c in caps):
+                        self._wake_mode = _WAKE_FUTEX
+                    elif _full_fence is not None and all(caps):
+                        self._wake_mode = _WAKE_PARKED_PING
+                # Readers read the mode after READY, which follows this store.
+                self.buffer.set_wake_mode(self._wake_mode)
                 # send a message to all local readers
                 # to make sure the publish channel is working
                 self.local_socket.send(b"READY")
@@ -1000,6 +1042,7 @@ class MessageQueue:
             # wait for the writer to send a message
             recv = self.local_socket.recv()
             assert recv == b"READY"
+            self._wake_mode = self.buffer.wake_mode()
         elif self._is_remote_reader:
             # wait for the writer to send a message
             recv = self.remote_socket.recv()
@@ -1013,6 +1056,11 @@ class MessageQueue:
             self._wait_metrics.flush()
         if self._spin_condition is not None:
             self._spin_condition.cancel()
+            if self._is_local_reader and self._wake_mode == _WAKE_FUTEX:
+                # A futex-parked reader re-checks shutting_down after waking.
+                with self.buffer.get_futex_words() as words:
+                    i = self.local_reader_rank
+                    wake_parked(words[4 * i : 4 * i + 4], 1)
         if self._cancel_sender is not None:
             self._cancel_sender.send(b"\x00")
 
@@ -1379,12 +1427,17 @@ class MessageQueue:
     def _notify_readers(self) -> None:
         """Wake the local readers after a write.
 
-        Once every local reader can fence, ping only when one is parked: the
-        written flag store, this fence and the parked-flag load pair with the
-        reader's flag store, fence and slot re-check in ``_park``, so either
-        the writer sees the flag or the reader sees the slot.
+        Once every local reader can fence, wake only a parked one: the written
+        flag store, a fence and the parked-flag load pair with the reader's
+        flag store, fence and slot re-check in ``_park``, so either the writer
+        sees the flag or the reader sees the slot. With futexes the writer
+        wakes a parked reader directly; otherwise it pings the notify socket.
         """
-        if self._notify_parked_only:
+        if self._wake_mode == _WAKE_FUTEX:
+            with self.buffer.get_futex_words() as words:
+                wake_parked(words, self.buffer.n_reader)
+            return
+        if self._wake_mode == _WAKE_PARKED_PING:
             assert _full_fence is not None
             _full_fence()
             with self.buffer.get_park_flags() as flags:
@@ -1393,25 +1446,37 @@ class MessageQueue:
         self._spin_condition.notify()
 
     def _park(self, ready: Callable[[], bool], timeout_ms: int) -> None:
-        """Wait for a notification unless ``ready()`` turns true meanwhile.
+        """Wait for a wake-up unless ``ready()`` turns true meanwhile.
 
         Within the spin grace this only yields. Otherwise the reader sets its
-        parked flag, fences, re-checks, and polls only if still not ready, so
-        a writer that skips the ping because no flag was set has already
+        parked flag, fences, re-checks, and sleeps only if still not ready, so
+        a writer that skips the wake-up because no flag was set has already
         published the slot this re-check reads. The grace is read once: a
-        second read could expire between the two and poll without the flag.
+        second read could expire between the two and sleep without the flag.
 
         Args:
             ready: Re-reads whether this reader's next block is written.
-            timeout_ms: Longest time to poll the notification socket.
+            timeout_ms: Longest time to sleep.
         """
         cond = self._spin_condition
         if cond.remaining_grace_s() > 0.0:
             sched_yield()
             return
-        if _full_fence is None:
+        if self._wake_mode == _WAKE_FUTEX:
+            i = self.local_reader_rank
+            with self.buffer.get_futex_words() as words:
+                park_prepare(words, i)
+                if self.shutting_down or ready():
+                    park_clear(words, i)
+                else:
+                    # The futex compares the word in the kernel, so a wake
+                    # after the re-check is never lost.
+                    park_wait(words, i, timeout_ms / 1000)
+            return
+        if self._wake_mode == _WAKE_PING:
             cond.poll_notify(timeout_ms)
             return
+        assert _full_fence is not None
         with self.buffer.get_park_flags() as flags:
             flags[self.local_reader_rank] = 1
             _full_fence()

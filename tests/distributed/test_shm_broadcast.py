@@ -538,6 +538,7 @@ def test_reader_rechecks_shm_after_idle_wait_timeout_without_notify():
     try:
         writer.wait_until_ready()
         reader.wait_until_ready()
+        writer._wake_mode = reader._wake_mode = shm_broadcast._WAKE_PING
         reader._spin_condition.last_read = 0
         reader._spin_condition.busy_loop_s = 0
 
@@ -617,6 +618,7 @@ def test_back_to_back_writes_wake_a_parked_reader():
         cond._grace.mode = "fixed"
         cond._grace.fixed_s = 0.0
         cond.busy_loop_s = 0.0
+        writer._wake_mode = reader._wake_mode = shm_broadcast._WAKE_PING
         poller = reader._spin_condition.poller
         real_poll = poller.poll
         parked = threading.Event()
@@ -729,7 +731,7 @@ def test_parked_only_reader_polls_only_with_its_flag_set():
     try:
         writer.wait_until_ready()
         reader.wait_until_ready()
-        assert writer._notify_parked_only
+        writer._wake_mode = reader._wake_mode = shm_broadcast._WAKE_PARKED_PING
         flags_at_poll = []
         real_poll = cond.poller.poll
 
@@ -775,7 +777,7 @@ def test_writer_pings_only_parked_readers():
     try:
         writer.wait_until_ready()
         reader.wait_until_ready()
-        assert writer._notify_parked_only
+        writer._wake_mode = reader._wake_mode = shm_broadcast._WAKE_PARKED_PING
         # Pin a large fixed grace so this reader never parks between
         # construction and its first dequeue: a parked reader would be pinged,
         # breaking the "pinged a reader that never parked" assertion below.
@@ -821,6 +823,113 @@ def test_writer_pings_only_parked_readers():
             reader._spin_condition.write_cancel_socket,
         ):
             socket.close(linger=0)
+
+
+def _close_pair(writer, reader):
+    writer.shutdown()
+    reader.shutdown()
+    for socket in (
+        writer.local_socket,
+        writer._spin_condition.local_notify_socket,
+        reader.local_socket,
+        reader._spin_condition.local_notify_socket,
+        reader._spin_condition.read_cancel_socket,
+        reader._spin_condition.write_cancel_socket,
+    ):
+        socket.close(linger=0)
+
+
+def _park_reader(reader):
+    """Start a blocking dequeue on a reader with no spin grace."""
+    cond = reader._spin_condition
+    cond._grace.mode = "fixed"
+    cond._grace.fixed_s = cond.busy_loop_s = 0.0
+    result: list = []
+
+    def run():
+        try:
+            result.append(reader.dequeue(timeout=5))
+        except BaseException as e:
+            result.append(e)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with reader.buffer.get_futex_words() as words:
+            if words[4 * reader.local_reader_rank]:
+                return thread, result
+        time.sleep(0.001)
+    pytest.fail("reader never parked")
+
+
+@pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
+def test_futex_wakes_parked_reader_without_notify_ping():
+    """In futex mode a write wakes a parked reader through its futex word and
+    never pings the notify socket."""
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=4
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        assert writer._wake_mode == reader._wake_mode == shm_broadcast._WAKE_FUTEX
+        notify = reader._spin_condition.local_notify_socket
+        thread, result = _park_reader(reader)
+        sent = time.monotonic()
+        writer.enqueue(7)
+        thread.join(timeout=5)
+        assert result == [7]
+        assert time.monotonic() - sent < 0.5
+        assert not notify.poll(timeout=0), "futex mode sent a notify ping"
+    finally:
+        _close_pair(writer, reader)
+
+
+@pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
+def test_shutdown_wakes_futex_parked_reader():
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=4
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        thread, result = _park_reader(reader)
+        reader.shutdown()
+        thread.join(timeout=1)
+        assert not thread.is_alive(), "shutdown did not wake the futex sleeper"
+        assert len(result) == 1 and str(result[0]) == "cancelled"
+    finally:
+        _close_pair(writer, reader)
+
+
+@pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
+def test_writer_falls_back_when_a_reader_lacks_futex():
+    """One reader without futex support forces every reader onto the
+    notify-socket path, which that reader can wait on."""
+    writer = MessageQueue(
+        n_reader=2, n_local_reader=2, max_chunk_bytes=1024, max_chunks=4
+    )
+    readers = [
+        MessageQueue.create_from_handle(writer.export_handle(), rank=r) for r in (0, 1)
+    ]
+    with readers[1].buffer.get_park_flags() as flags:
+        flags[2 + 1] = shm_broadcast._CAP_FENCE
+    try:
+        threads = [threading.Thread(target=r.wait_until_ready) for r in readers]
+        for t in threads:
+            t.start()
+        writer.wait_until_ready()
+        for t in threads:
+            t.join(timeout=5)
+        modes = {writer._wake_mode} | {r._wake_mode for r in readers}
+        assert modes == {shm_broadcast._WAKE_PARKED_PING}
+    finally:
+        writer.shutdown()
+        for r in readers:
+            r.shutdown()
 
 
 def _dequeue_error(reader) -> list[BaseException]:

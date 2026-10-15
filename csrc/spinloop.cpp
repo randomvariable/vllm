@@ -11,6 +11,12 @@ extern "C" {
   #include <sys/auxv.h>
 #endif
 
+#if defined(__linux__)
+  #include <linux/futex.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+#endif
+
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
   #include <x86intrin.h>
@@ -413,12 +419,127 @@ static PyObject* method_full_fence(PyObject* self, PyObject* args) {
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   Py_RETURN_NONE;
 }
+#if defined(__linux__)
+// Shared-memory park words for MessageQueue readers. Word i is 1 while reader
+// i is parked. The reader sets it, fences and re-checks its slot before it
+// sleeps; the writer publishes, fences and exchanges every set word to 0,
+// waking its sleeper. The futex compares the word under the kernel's lock,
+// so a wake between the reader's re-check and its sleep is never lost.
+
+static uint32_t* park_word(Py_buffer* view, Py_ssize_t index) {
+  if (index < 0 || (index + 1) * (Py_ssize_t)sizeof(uint32_t) > view->len ||
+      ((uintptr_t)view->buf % sizeof(uint32_t)) != 0) {
+    PyErr_SetString(PyExc_ValueError, "park word out of range or unaligned");
+    return NULL;
+  }
+  return (uint32_t*)view->buf + index;
+}
+
+static long futex(uint32_t* addr, int op, uint32_t val,
+                  const struct timespec* timeout) {
+  // Shared (not FUTEX_PRIVATE) futex: the words live in a mapping shared
+  // between processes.
+  return syscall(SYS_futex, addr, op, val, timeout, NULL, 0);
+}
+
+// park_prepare(buf, i): mark reader i parked, then fence so its slot
+// re-check cannot be satisfied before the mark is visible.
+static PyObject* method_park_prepare(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &index)) return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) {
+    __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+// park_wait(buf, i, timeout_s): sleep while word i is 1, at most timeout_s
+// (negative waits indefinitely), then clear it.
+static PyObject* method_park_wait(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  double timeout_s;
+  if (!PyArg_ParseTuple(args, "w*nd", &view, &index, &timeout_s)) return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) {
+    struct timespec ts, *tsp = NULL;
+    if (timeout_s >= 0) {
+      ts.tv_sec = (time_t)timeout_s;
+      ts.tv_nsec = (long)((timeout_s - (double)ts.tv_sec) * 1e9);
+      tsp = &ts;
+    }
+    Py_BEGIN_ALLOW_THREADS;
+    if (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1) {
+      futex(word, FUTEX_WAIT, 1, tsp);
+    }
+    __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
+    Py_END_ALLOW_THREADS;
+  }
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+// park_clear(buf, i): reader i found its slot ready and will not sleep.
+static PyObject* method_park_clear(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &index)) return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+// wake_parked(buf, n): after publishing, fence and wake every parked reader
+// among words 0..n-1. Returns the number of readers woken.
+static PyObject* method_wake_parked(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t n;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &n)) return NULL;
+  long woken = 0;
+  if (n > 0 && park_word(&view, n - 1) == NULL) {
+    PyBuffer_Release(&view);
+    return NULL;
+  }
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  uint32_t* words = (uint32_t*)view.buf;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    if (__atomic_load_n(&words[i], __ATOMIC_RELAXED) != 0 &&
+        __atomic_exchange_n(&words[i], 0, __ATOMIC_SEQ_CST) != 0) {
+      futex(&words[i], FUTEX_WAKE, INT32_MAX, NULL);
+      woken++;
+    }
+  }
+  PyBuffer_Release(&view);
+  return PyLong_FromLong(woken);
+}
+#endif
 
 static PyMethodDef spinloop_methods[] = {
     {"spinloop", (PyCFunction)(void (*)(void))method_spinloop,
      METH_VARARGS | METH_KEYWORDS, "Wait for store with callback"},
     {"full_fence", method_full_fence, METH_NOARGS,
      "Sequentially consistent memory fence"},
+#if defined(__linux__)
+    {"park_prepare", method_park_prepare, METH_VARARGS,
+     "Mark a reader parked and fence"},
+    {"park_wait", method_park_wait, METH_VARARGS,
+     "Sleep on a park word until woken or timed out"},
+    {"park_clear", method_park_clear, METH_VARARGS, "Clear a park word"},
+    {"wake_parked", method_wake_parked, METH_VARARGS,
+     "Fence and wake every parked reader"},
+#endif
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef spinloop_module = {

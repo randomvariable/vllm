@@ -41,6 +41,11 @@ module messageQueue {
   const FENCE: bool
   // Bug variant: a reader may poll without setting its parked flag.
   const FLAGLESS_PARK: bool
+  // Futex mode (needs SKIP_IDLE): the writer, after its fence, clears each
+  // set parked word and futex-wakes it instead of pinging; a parked reader
+  // returns once its word is clear. The futex compares the word in the
+  // kernel, so a sleep on an already cleared word returns at once.
+  const FUTEX: bool
 
   // ring buffer
   var written: int -> bool
@@ -197,6 +202,7 @@ module messageQueue {
   // the ping cannot overtake the flag. With SKIP_IDLE it reads the parked
   // flags, after its fence when FENCE holds, and sends only if one is set.
   action writerNotify(refresh: bool): bool = all {
+    not(FUTEX),
     wPc == "notify",
     if (SKIP_IDLE) (FENCE implies wPend == -1) else wPend == -1,
     if (SKIP_IDLE and READERS.forall(r => not(parked.get(r)))) all {
@@ -209,6 +215,19 @@ module messageQueue {
     wSeq' = wSeq,
     wPend' = wPend,
     ringUnchanged, readersUnchanged,
+  }
+
+  // wake_parked(): fence, then exchange every set parked word to 0 and wake
+  // its sleeper. No notification is sent.
+  action writerWakeFutex: bool = all {
+    FUTEX,
+    wPc == "notify",
+    FENCE implies wPend == -1,
+    parked' = READERS.mapBy(_ => false),
+    wPc' = "acquire",
+    wSeq' = wSeq, wPend' = wPend, sinceRefresh' = sinceRefresh, drops' = drops,
+    rPc' = rPc, rSeq' = rSeq, parkPend' = parkPend,
+    ringUnchanged, chanUnchanged,
   }
 
   // The pipe reader drains one message into the reader's CONFLATE slot.
@@ -286,7 +305,7 @@ module messageQueue {
   // the reader clears its parked flag.
   action readerPoll(r: int): bool = all {
     rPc.get(r) == "park",
-    conflated.get(r),
+    if (FUTEX) not(parked.get(r) or parkPend.get(r)) else conflated.get(r),
     conflated' = conflated.set(r, false),
     rPc' = rPc.set(r, "check"),
     parked' = parked.set(r, false),
@@ -330,6 +349,7 @@ module messageQueue {
     writerFlush,
     writerHandshake,
     writerNotify(true),
+    writerWakeFutex,
     writerNotify(false),
     idle,
     { nondet r = READERS.oneOf() any {
@@ -350,7 +370,8 @@ module messageQueue {
   // never depends on the recheck timeout.
   val noLostWakeup = READERS.forall(r =>
     (rPc.get(r) == "park" and ready(r))
-      implies (conflated.get(r) or inflight.get(r) > 0 or wPc == "notify"))
+      implies (conflated.get(r) or inflight.get(r) > 0 or wPc == "notify"
+        or (FUTEX and not(parked.get(r) or parkPend.get(r)))))
 
   // Readers see messages in order, and the writer never reuses a slot that
   // a reader has not read.
@@ -361,7 +382,7 @@ module messageQueue {
 module hwm1 {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 5, HWM = 1, LWM = 1,
     K = 3, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // hwm1 with one reader: the same lost wake-up in a smaller formula, so
@@ -369,14 +390,14 @@ module hwm1 {
 module hwm1OneReader {
   import messageQueue(READERS = Set(0), M = 2, MAXMSG = 4, HWM = 1, LWM = 1,
     K = 3, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // SNDHWM=1 without the throttle: credits are always fresh.
 module hwm1NoThrottle {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 5, HWM = 1, LWM = 1,
     K = 1, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // Finite HWM (zmq default 1000 scaled to 4, lwm = (hwm + 1) / 2), commands
@@ -384,28 +405,28 @@ module hwm1NoThrottle {
 module hwm4Slow {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 8, HWM = 4, LWM = 2,
     K = 2, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // Finite HWM, writer bursting every send inside one throttle window.
 module hwm4Burst {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 8, HWM = 4, LWM = 2,
     K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // PR #58917 alone: finite HWM, no notify handshake.
 module pr58917 {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 4, HWM = 4, LWM = 2,
     K = 2, NOTIFY_HANDSHAKE = false, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // SNDHWM=0 without the handshake: the startup race remains.
 module unlimitedNoHandshake {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 4, HWM = 0, LWM = 0,
     K = 8, NOTIFY_HANDSHAKE = false, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // Finite HWM at the smallest size that still has credit lag (hwm 2,
@@ -413,33 +434,47 @@ module unlimitedNoHandshake {
 module hwm2Slow {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 6, HWM = 2, LWM = 1,
     K = 2, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // SNDHWM=0 plus the notify-subscription handshake, always notifying.
 module unlimitedHandshake {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 8, HWM = 0, LWM = 0,
     K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = false, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // This change: lossless channel, pings only for parked readers, full fences.
 module skipIdleFenced {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 6, HWM = 0, LWM = 0,
     K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = true, FENCE = true,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // Parked-flag protocol without a store-to-load fence: the Dekker race.
 module skipIdleUnfenced {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 4, HWM = 0, LWM = 0,
     K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = true, FENCE = false,
-    FLAGLESS_PARK = false).*
+    FLAGLESS_PARK = false, FUTEX = false).*
 }
 
 // Parked-flag protocol, fenced, but a reader may poll without its flag.
 module skipIdleFlaglessPark {
   import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 4, HWM = 0, LWM = 0,
     K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = true, FENCE = true,
-    FLAGLESS_PARK = true).*
+    FLAGLESS_PARK = true, FUTEX = false).*
+}
+
+// This change: futex wake of parked readers, full fences.
+module futexFenced {
+  import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 6, HWM = 0, LWM = 0,
+    K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = true, FENCE = true,
+    FLAGLESS_PARK = false, FUTEX = true).*
+}
+
+// Futex wake without the store-to-load fences.
+module futexUnfenced {
+  import messageQueue(READERS = Set(0, 1), M = 2, MAXMSG = 4, HWM = 0, LWM = 0,
+    K = 8, NOTIFY_HANDSHAKE = true, SKIP_IDLE = true, FENCE = false,
+    FLAGLESS_PARK = false, FUTEX = true).*
 }
