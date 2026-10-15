@@ -196,6 +196,23 @@ thread hand-off, and a `poll` return: on the benchmark host the one-way
 parked latency drops from 61 to 34 µs at p50 and from 1.4 ms to 0.18 ms at
 p99. `shutdown()` wakes a futex-parked reader through its own word.
 
+#### Shallow parking
+
+Most of a parked reader's wake latency at a 10 ms step gap is not the futex
+but the CPU leaving a deep idle state: on the benchmark host C3 exits in
+350 µs, against 18 µs for C2. The idle governor picks the state from the
+time until the next timer, and avoids a state whose target residency
+(700 µs for C3) exceeds it. So while the next write is likely, `park_wait`
+sleeps in futex slices of `VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS` (0.5 ms),
+looping in C without returning to Python. The window lasts until twice the
+observed interval between reads after the last read, at most
+`VLLM_SHM_BROADCAST_SHALLOW_MAX_MS` (50 ms); after it the reader sleeps
+until woken, so idle CPU stays at zero. Each slice costs one timer wake-up of
+a few microseconds. At a 10 ms gap this cut the round trip from 443 to 54 µs
+with one worker and from 331 to 98 µs with four, with no rise in worker CPU.
+It needs no privileges. Set the slice below the deepest state's target
+residency on other CPUs (`/sys/devices/system/cpu/cpu*/cpuidle/state*/residency`).
+
 The futex words are node-local, like the ring. Readers on other nodes keep
 receiving every message on `remote_socket`, so cross-node collectives are
 unaffected.

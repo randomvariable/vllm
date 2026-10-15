@@ -459,25 +459,57 @@ static PyObject* method_park_prepare(PyObject* self, PyObject* args) {
   Py_RETURN_NONE;
 }
 
-// park_wait(buf, i, timeout_s): sleep while word i is 1, at most timeout_s
-// (negative waits indefinitely), then clear it.
+static struct timespec to_timespec(double s) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)s;
+  ts.tv_nsec = (long)((s - (double)ts.tv_sec) * 1e9);
+  return ts;
+}
+
+static double monotonic_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// park_wait(buf, i, timeout_s, shallow_s=0, slice_s=0): sleep while word i
+// is 1, at most timeout_s (negative waits indefinitely), then clear it.
+// For the first shallow_s seconds the sleep is cut into slice_s futex
+// waits: the idle governor sees a timer due within slice_s and keeps the
+// core out of idle states whose target residency exceeds it, so a wake in
+// that window avoids a deep-state exit. Each slice boundary costs one
+// timer wake-up in this loop, without returning to Python.
 static PyObject* method_park_wait(PyObject* self, PyObject* args) {
   (void)self;
   Py_buffer view;
   Py_ssize_t index;
-  double timeout_s;
-  if (!PyArg_ParseTuple(args, "w*nd", &view, &index, &timeout_s)) return NULL;
+  double timeout_s, shallow_s = 0, slice_s = 0;
+  if (!PyArg_ParseTuple(args, "w*nd|dd", &view, &index, &timeout_s, &shallow_s,
+                        &slice_s))
+    return NULL;
   uint32_t* word = park_word(&view, index);
   if (word != NULL) {
-    struct timespec ts, *tsp = NULL;
-    if (timeout_s >= 0) {
-      ts.tv_sec = (time_t)timeout_s;
-      ts.tv_nsec = (long)((timeout_s - (double)ts.tv_sec) * 1e9);
-      tsp = &ts;
-    }
     Py_BEGIN_ALLOW_THREADS;
-    if (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1) {
-      futex(word, FUTEX_WAIT, 1, tsp);
+    double start = monotonic_s();
+    while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1) {
+      double elapsed = monotonic_s() - start;
+      double left = timeout_s >= 0 ? timeout_s - elapsed : -1;
+      if (timeout_s >= 0 && left <= 0) break;
+      bool sliced = slice_s > 0 && elapsed < shallow_s;
+      if (sliced) {
+        double s = slice_s;
+        if (left >= 0 && left < s) s = left;
+        struct timespec ts = to_timespec(s);
+        futex(word, FUTEX_WAIT, 1, &ts);
+        continue;
+      }
+      if (left >= 0) {
+        struct timespec ts = to_timespec(left);
+        futex(word, FUTEX_WAIT, 1, &ts);
+      } else {
+        futex(word, FUTEX_WAIT, 1, NULL);
+      }
+      break;
     }
     __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
     Py_END_ALLOW_THREADS;

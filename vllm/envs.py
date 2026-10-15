@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS: float = 2.0
     VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA: float = 0.25
     VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS: float = 1.0
+    VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS: float = 0.5
+    VLLM_SHM_BROADCAST_SHALLOW_MAX_MS: float = 50.0
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -844,6 +846,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # write latency for fewer wakeups on a writer blocked by slow readers.
     "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS": lambda: float(
         os.environ.get("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", "1.0")
+    ),
+    # A parked reader sleeps in futex slices of this length while the next
+    # write is likely, so the idle governor keeps its core out of deep idle
+    # states (whose exit latency dominates wake-up). Set it below the target
+    # residency of the deepest state; 0 disables sliced parking.
+    "VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS": lambda: float(
+        os.environ.get("VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS", "0.5")
+    ),
+    # Longest time after a read that a parked reader keeps sleeping in
+    # slices; afterwards it sleeps until woken.
+    "VLLM_SHM_BROADCAST_SHALLOW_MAX_MS": lambda: float(
+        os.environ.get("VLLM_SHM_BROADCAST_SHALLOW_MAX_MS", "50")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -2696,6 +2710,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS",
         "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA",
         "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS",
+        "VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS",
+        "VLLM_SHM_BROADCAST_SHALLOW_MAX_MS",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",

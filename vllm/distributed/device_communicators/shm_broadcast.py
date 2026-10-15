@@ -88,6 +88,11 @@ _WAKE_PING = 0  # ping the notify socket after every write
 _WAKE_PARKED_PING = 1  # ping only while a reader's parked flag is set
 _WAKE_FUTEX = 2  # futex-wake parked readers; no notify ping
 
+# Shallow parking: futex slice length (below the target residency of the
+# deep idle states) and the longest window after a read that uses it.
+_SHALLOW_SLICE_S = envs.VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS / 1000.0
+_SHALLOW_MAX_S = envs.VLLM_SHM_BROADCAST_SHALLOW_MAX_MS / 1000.0
+
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
 
@@ -445,6 +450,20 @@ class SpinCondition:
         if self._grace.mode == "adaptive":
             self._train_interval_ema(now - self.last_read)
         self.last_read = now
+
+    def shallow_window_s(self, now: float) -> float:
+        """Seconds of the coming park to spend in shallow sliced sleeps.
+
+        While the next write is likely, a parked reader sleeps in short futex
+        slices so the idle governor keeps its core in a shallow state. The
+        window lasts until twice the observed interval between reads after
+        the last read, at most ``_SHALLOW_MAX_S``; after it the reader sleeps
+        until woken.
+        """
+        if _SHALLOW_SLICE_S <= 0 or self._grace.mode != "adaptive":
+            return 0.0
+        horizon = min(_SHALLOW_MAX_S, 2 * self._grace._interval_ema_s)
+        return max(0.0, self.last_read + horizon - now)
 
     def remaining_grace_s(self, now: float | None = None) -> float:
         """Return spin grace left before an idle reader should park.
@@ -1459,7 +1478,8 @@ class MessageQueue:
             timeout_ms: Longest time to sleep.
         """
         cond = self._spin_condition
-        if cond.remaining_grace_s() > 0.0:
+        now = time.monotonic()
+        if cond.remaining_grace_s(now) > 0.0:
             sched_yield()
             return
         if self._wake_mode == _WAKE_FUTEX:
@@ -1471,7 +1491,13 @@ class MessageQueue:
                 else:
                     # The futex compares the word in the kernel, so a wake
                     # after the re-check is never lost.
-                    park_wait(words, i, timeout_ms / 1000)
+                    park_wait(
+                        words,
+                        i,
+                        timeout_ms / 1000,
+                        cond.shallow_window_s(now),
+                        _SHALLOW_SLICE_S,
+                    )
             return
         if self._wake_mode == _WAKE_PING:
             cond.poll_notify(timeout_ms)
