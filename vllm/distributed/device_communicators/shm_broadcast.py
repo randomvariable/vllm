@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pickle import PickleBuffer
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest.mock import patch
 
 import torch
@@ -606,6 +606,36 @@ def check_shm_free_space(
     )
 
 
+class _ShmWindow:
+    """A bounded memoryview slice of the ring buffer, released on exit.
+
+    Replaces a ``@contextmanager`` accessor on the hot path: a direct
+    ``__enter__``/``__exit__`` avoids allocating a generator and the two
+    resumptions ``contextlib`` pays per acquire. Releasing the slice on
+    exit is required so the underlying ``SharedMemory`` can be closed.
+    """
+
+    __slots__ = ("_buf", "_start", "_end", "_view")
+
+    def __init__(self, buf: memoryview, start: int, end: int) -> None:
+        self._buf = buf
+        self._start = start
+        self._end = end
+        self._view: memoryview | None = None
+
+    def __enter__(self) -> memoryview:
+        view = self._buf[self._start : self._end]
+        self._view = view
+        return view
+
+    def __exit__(self, *exc: object) -> Literal[False]:
+        view = self._view
+        if view is not None:
+            view.release()
+            self._view = None
+        return False
+
+
 class ShmRingBuffer:
     def __init__(
         self,
@@ -737,37 +767,33 @@ class ShmRingBuffer:
             if self.is_creator:
                 self.shared_memory.unlink()
 
-    @contextmanager
-    def get_data(self, current_idx: int):
+    def get_data(self, current_idx: int) -> "_ShmWindow":
         start = self.data_offset + current_idx * self.max_chunk_bytes
-        end = start + self.max_chunk_bytes
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start:end] as buf:
-            yield buf
+        return _ShmWindow(self.shared_memory.buf, start, start + self.max_chunk_bytes)
 
-    @contextmanager
-    def get_metadata(self, current_idx: int):
+    def get_metadata(self, current_idx: int) -> "_ShmWindow":
         start = self.metadata_offset + current_idx * self.metadata_size
-        end = start + self.metadata_size
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start:end] as buf:
-            yield buf
+        return _ShmWindow(self.shared_memory.buf, start, start + self.metadata_size)
 
-    @contextmanager
-    def get_park_flags(self):
-        """Yield the parked flags followed by the full-fence capability flags."""
-        start = self.park_offset
+    def get_park_flags(self) -> "_ShmWindow":
+        """The parked flags followed by the full-fence capability flags."""
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start : start + 2 * self.n_reader] as buf:
-            yield buf
+        return _ShmWindow(
+            self.shared_memory.buf,
+            self.park_offset,
+            self.park_offset + 2 * self.n_reader,
+        )
 
-    @contextmanager
-    def get_futex_words(self):
-        """Yield the readers' futex park words (``4 * n_reader`` bytes)."""
-        start = self.futex_offset
+    def get_futex_words(self) -> "_ShmWindow":
+        """The readers' futex park words (``4 * n_reader`` bytes)."""
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start : start + 4 * self.n_reader] as buf:
-            yield buf
+        return _ShmWindow(
+            self.shared_memory.buf,
+            self.futex_offset,
+            self.futex_offset + 4 * self.n_reader,
+        )
 
     def set_wake_mode(self, mode: int) -> None:
         assert self.shared_memory.buf is not None, "Buffer has been closed"

@@ -33,10 +33,13 @@ read flag per local reader. The writer waits until every reader has read a
 slot, clears the written flag, copies the payload, clears the read flags, and
 sets the written flag. A reader waits for written-and-unread, copies the
 payload, and sets its read flag. Memory fences order the flag and payload
-stores. After the metadata rows, the buffer holds one parked flag, one
-fence-capability flag, and one 4-byte futex park word per local reader, plus
-a shared generation word and the wake-mode byte, used by the wake-up
-protocol below.
+stores. After the metadata rows, the buffer holds, per local reader, one
+parked flag, one fence-capability flag and one 4-byte futex park word,
+followed by the wake-mode byte, used by the wake-up protocol below.
+`ShmRingBuffer` exposes each region as a short-lived `_ShmWindow`, a direct
+`__enter__`/`__exit__` slice that releases its exported pointer on exit; a
+plain `@contextmanager` accessor cost a generator object and two resumptions
+per acquire on the hot path (see Performance).
 
 Two zmq XPUB data sockets carry what does not fit the ring:
 
