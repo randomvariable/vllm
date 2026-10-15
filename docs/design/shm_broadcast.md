@@ -280,9 +280,10 @@ The comparison covers three variants, each with its own defaults:
 Host: AMD Ryzen AI Max+ 395 (Zen 5, 16 cores, SMT 2), Linux 7.2.9-cachyos,
 `amd-pstate-epp` with the `performance` governor, Python 3.12.13, pyzmq 27.2.0,
 libzmq 4.3.5. `main` and `arm-no` are medians of 3 interleaved repeats; the
-`futex` column is a quiet-machine autoresearch sample (load average below 3),
-whose round trips are stable to a few microseconds while its CPU columns read
-a few percent high when other tenants are busy.
+`futex` column is the median of three quiet-machine autoresearch samples
+(load average below 3) of this tree. Round trips are stable to a few
+microseconds between samples; CPU columns read a few percent high when other
+tenants are busy on the box.
 
 ### CPU
 
@@ -292,15 +293,15 @@ Worker CPU is summed over the workers, in cores (CPU-seconds per second).
 | --- | --- | --- | --- | --- |
 | idle, 10 s | 1 | 0.099 | 0.000 | 0.000 |
 | idle, 10 s | 4 | 0.392 | 0.000 | 0.000 |
-| 10 ms gap | 1 | 0.996 | 0.023 | 0.010 |
-| 10 ms gap | 4 | 3.985 | 0.085 | 0.043 |
-| 1 ms gap | 1 | 0.998 | 0.832 | 0.935 |
-| 1 ms gap | 4 | 3.990 | 3.124 | 3.499 |
-| back-to-back | 4 | 3.981 | 3.975 | 3.98 |
+| 10 ms gap | 1 | 0.996 | 0.023 | 0.013 |
+| 10 ms gap | 4 | 3.985 | 0.085 | 0.049 |
+| 1 ms gap | 1 | 0.998 | 0.832 | 0.940 |
+| 1 ms gap | 4 | 3.990 | 3.124 | 3.670 |
+| back-to-back | 4 | 3.981 | 3.975 | 3.985 |
 
 Upstream readers spin for 1 s after every read, so a reader burns a full core
 whenever steps arrive less than 1 s apart, and 0.1 core while idle. The
-adaptive grace parks a reader within 2 ms, which cuts worker CPU about 90x at
+adaptive grace parks a reader within 2 ms, which cuts worker CPU about 76x at
 a 10 ms step gap and removes idle CPU. The 1 ms cell is spin-dominated by
 design: with an observed interval of 1 ms the grace `clamp(B²/T, 0.05 ms,
 2 ms)` is itself 1 ms, so the reader spins across the whole gap; halving
@@ -313,27 +314,28 @@ back-to-back and under 0.05 core when paced, in all variants.
 
 | Scenario | Workers | Metric | `main` | `arm-no` | `futex` |
 | --- | --- | --- | --- | --- | --- |
-| back-to-back | 1 | steps/s | 74 784 | 57 919 | 77 134 |
-| back-to-back | 1 | round trip p50 / p99 | 13 / 16 µs | 16 / 22 µs | 12 / 18 µs |
-| back-to-back | 4 | steps/s | 37 741 | 21 413 | 39 532 |
-| back-to-back | 4 | round trip p50 / p99 | 25 / 39 µs | 47 / 55 µs | 24 / 38 µs |
-| 1 ms gap | 1 | round trip p50 / p99 | 15 / 41 µs | 39 / 91 µs | 19 / 110 µs |
-| 1 ms gap | 4 | round trip p50 / p99 | 48 / 1 328 µs | 63 / 697 µs | 34 / 641 µs |
-| 10 ms gap | 1 | round trip p50 / p99 | 56 / 184 µs | 655 / 1 134 µs | 46 / 232 µs |
-| 10 ms gap | 4 | round trip p50 / p99 | 94 / 1 082 µs | 719 / 1 904 µs | 74 / 246 µs |
+| back-to-back | 1 | steps/s | 74 784 | 57 919 | 74 825 |
+| back-to-back | 1 | round trip p50 / p99 | 13 / 16 µs | 16 / 22 µs | 13 / 18 µs |
+| back-to-back | 4 | steps/s | 37 741 | 21 413 | 37 821 |
+| back-to-back | 4 | round trip p50 / p99 | 25 / 39 µs | 47 / 55 µs | 25 / 38 µs |
+| 1 ms gap | 1 | round trip p50 / p99 | 15 / 41 µs | 39 / 91 µs | 19 / 45 µs |
+| 1 ms gap | 4 | round trip p50 / p99 | 48 / 1 328 µs | 63 / 697 µs | 33 / 73 µs |
+| 10 ms gap | 1 | round trip p50 / p99 | 56 / 184 µs | 655 / 1 134 µs | 49 / 204 µs |
+| 10 ms gap | 4 | round trip p50 / p99 | 94 / 1 082 µs | 719 / 1 904 µs | 74 / 210 µs |
 
-- **Back-to-back.** The futex path beats upstream: the writer pays neither a
-  zmq send nor an I/O thread wake-up when no reader is parked, and the
-  reader's wait is one syscall. `arm-no` still pinged every write and lost 23%
-  (1 worker) to 43% (4 workers) of upstream's steps/s; the futex build is 3%
-  ahead of upstream at 4 workers.
-- **Paced.** The win over ping modes is the sliced shallow park: a parked
-  reader's core stays out of the 350 µs idle state while the next write is
-  due, so a 10 ms-gap round trip costs 46-74 µs instead of the 0.7 ms a plain
-  park pays, and CPU stays two orders of magnitude below upstream's full spin.
-  The remaining 1 ms-cell latency above upstream (19 vs 15 µs at 1 worker) is
-  the park/slice boundary: lower `VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS`
-  is not the lever, raising it past the gap turns that cell into pure spin.
+- **Back-to-back.** The futex build matches upstream (37.8k vs 37.7k steps/s
+  at 4 workers) although it does strictly more work per write: the writer
+  touches only shm when a reader is parked, and the reader's wait is one
+  syscall. `arm-no` pinged the socket after every write and lost 23% (1
+  worker) to 43% (4 workers) of upstream's steps/s; peak samples of the futex
+  build reached 39.5k/s at 4 workers.
+- **Paced.** A parked reader wakes through a futex, and the sliced shallow
+  park keeps its core out of the 350 µs idle state while the next write is
+  due: a 10 ms-gap round trip costs 49-74 µs instead of the 0.7 ms a plain
+  park pays, at 0.01-0.05 core rather than upstream's full core of spinning.
+  The residual over upstream at a 1 ms gap (19 vs 15 µs at 1 worker) is the
+  park/slice boundary; raising `VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS`
+  past the gap turns that cell into pure spin, at upstream's CPU cost.
 
 No step in the matrix waited out the 5 s recheck; the largest round trip was
 about 3 ms. Before the single-read fix in `_park`, the ping build stalled 5 s
