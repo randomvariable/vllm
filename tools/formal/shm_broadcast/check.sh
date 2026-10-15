@@ -45,6 +45,9 @@ checks=(
   "inference backpressureOver noLostWakeup,ringSafe,progress violation -"
   "paths pathsCurrent inOrder,noLoss,progress violation 3"
   "paths pathsNoDrop inOrder,noLoss,progress violation 4"
+  "fanin faninTwo noStuckWait ok 10"
+  "fanin faninFour noStuckWait ok 10"
+  "fanin faninBroken noStuckWait violation 8"
 )
 
 # run <id> <backend> <spec> <module> <invariants> <expected> <steps>

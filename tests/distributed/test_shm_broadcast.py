@@ -864,6 +864,79 @@ def _park_reader(reader):
 
 
 @pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
+def test_wait_many_wakes_only_for_the_queue_that_got_a_message():
+    """One wait covers several reply queues a fan-in reader waits on."""
+    writers = [
+        MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=4)
+        for _ in range(3)
+    ]
+    readers = [
+        MessageQueue.create_from_handle(w.export_handle(), rank=0) for w in writers
+    ]
+    try:
+        for w, r in zip(writers, readers):
+            w.wait_until_ready()
+            r.wait_until_ready()
+        pairs = [_park_reader(r) for r in readers]
+        writers[2].enqueue("late")
+        MessageQueue.wait_many(readers, 5000)
+        # The reply was consumed by its queue's reader; the other two readers
+        # were left parked in their own waits and timed out.
+        for t, _ in pairs:
+            t.join(timeout=10)
+        results = [res[0] for _, res in pairs]
+        assert isinstance(results[0], TimeoutError)
+        assert isinstance(results[1], TimeoutError)
+        assert results[2] == "late"
+    finally:
+        for w, r in zip(writers, readers):
+            _close_pair(w, r)
+
+
+@pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
+def test_wait_many_times_out_when_nothing_arrives():
+    writers = [
+        MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=4)
+        for _ in range(2)
+    ]
+    readers = [
+        MessageQueue.create_from_handle(w.export_handle(), rank=0) for w in writers
+    ]
+    try:
+        for w, r in zip(writers, readers):
+            w.wait_until_ready()
+            r.wait_until_ready()
+        for r in readers:
+            _park_reader(r)
+        started = time.monotonic()
+        MessageQueue.wait_many(readers, 60)
+        assert 0.05 < time.monotonic() - started < 1.0
+    finally:
+        for w, r in zip(writers, readers):
+            _close_pair(w, r)
+
+
+def test_wait_many_falls_back_without_futex_mode():
+    """Queues not in futex mode take the per-queue wait instead of waitv."""
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=4
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        reader._wake_mode = shm_broadcast._WAKE_PING
+        cond = reader._spin_condition
+        cond._grace.mode = "fixed"
+        cond._grace.fixed_s = cond.busy_loop_s = 0.0
+        started = time.monotonic()
+        MessageQueue.wait_many([reader], 50)
+        assert time.monotonic() - started < 1.0
+    finally:
+        _close_pair(writer, reader)
+
+
+@pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")
 def test_futex_wakes_parked_reader_without_notify_ping():
     """In futex mode a write wakes a parked reader through its futex word and
     never pings the notify socket."""

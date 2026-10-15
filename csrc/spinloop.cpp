@@ -3,6 +3,7 @@
 extern "C" {
 
 #include <math.h>
+#include <cerrno>
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -564,6 +565,123 @@ static PyObject* method_wake_parked(PyObject* self, PyObject* args) {
   PyBuffer_Release(&view);
   return PyLong_FromLong(woken);
 }
+
+  // The kernel has no opcode for a vector wait: futex_waitv is its own
+  // syscall (asm-generic unistd 449) with this waiter layout. Flags use the
+  // futex2 size selector; FUTEX2_SIZE_U32 (0x02) selects a 32-bit word.
+  // Its timeout is an absolute CLOCK_MONOTONIC (or CLOCK_REALTIME) deadline.
+  #ifndef __NR_futex_waitv
+    #define __NR_futex_waitv 449
+  #endif
+  #define SPINLOOP_FUTEX2_SIZE_U32 0x02
+
+struct spinloop_waitv {
+  uint64_t val;
+  uint64_t uaddr;
+  uint32_t flags;
+  uint32_t __reserved;
+};
+
+// park_wait_any(bufs, idxs, timeout_s): sleep until one of the watched words
+// is no longer 1, or the deadline passes. A word with index < 0 is skipped.
+// Returns one past the caller's index of a word that stopped being 1, 0 when
+// the wait timed out or nothing was watched, or -1 when the kernel has no
+// futex_waitv so the caller falls back to a single-word wait.
+static PyObject* method_park_wait_any(PyObject* self, PyObject* const* args,
+                                      Py_ssize_t nargs) {
+  (void)self;
+  if (nargs != 3 || !PyList_Check(args[0]) || !PyList_Check(args[1])) {
+    PyErr_SetString(PyExc_TypeError, "expected (bufs, idxs, timeout)");
+    return NULL;
+  }
+  Py_ssize_t n = PySequence_Size(args[0]);
+  if (n < 0 || n != PySequence_Size(args[1]) || n > 64) {
+    if (!PyErr_Occurred())
+      PyErr_SetString(PyExc_ValueError, "buffer and index lists must match");
+    return NULL;
+  }
+  double timeout_s = PyFloat_AsDouble(args[2]);
+  if (timeout_s == -1.0 && PyErr_Occurred()) return NULL;
+  Py_buffer views[64];
+  struct spinloop_waitv slots[64];
+  uint32_t* words[64];
+  int idxs[64];
+  int count = 0;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyObject* idx_obj = PySequence_GetItem(args[1], i);
+    if (idx_obj == NULL) {
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    Py_ssize_t index = PyLong_AsSsize_t(idx_obj);
+    Py_DECREF(idx_obj);
+    if (index < 0) continue;  // that reader is not parked
+    PyObject* buf_obj = PySequence_GetItem(args[0], i);
+    if (buf_obj == NULL) {
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    if (PyObject_GetBuffer(buf_obj, &views[count], PyBUF_SIMPLE) != 0) {
+      Py_DECREF(buf_obj);
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    Py_DECREF(buf_obj);
+    uint32_t* word = park_word(&views[count], index);
+    if (word == NULL) {
+      PyBuffer_Release(&views[count]);
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    slots[count].val = 1;
+    slots[count].uaddr = (uint64_t)(uintptr_t)word;
+    slots[count].flags = SPINLOOP_FUTEX2_SIZE_U32;
+    slots[count].__reserved = 0;
+    words[count] = word;
+    idxs[count] = (int)index;
+    count++;
+  }
+  if (count == 0) return PyLong_FromLong(0);
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  {
+    struct timespec add = to_timespec(timeout_s);
+    deadline.tv_sec += add.tv_sec;
+    deadline.tv_nsec += add.tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_nsec -= 1000000000L;
+      deadline.tv_sec += 1;
+    }
+  }
+  long rc;
+  Py_BEGIN_ALLOW_THREADS;
+  rc = syscall(__NR_futex_waitv, slots, (unsigned int)count, (unsigned int)0,
+               &deadline, (int)CLOCK_MONOTONIC);
+  Py_END_ALLOW_THREADS;
+  int woken = 0;
+  if (rc > 0 && rc < count) {
+    // The syscall returns the array index of the futex that stopped
+    // matching; map it back to the caller's reader index.
+    woken = idxs[(int)rc] + 1;
+  } else if (rc == 0) {
+    // Every watched word still reads 1: nothing woke us.
+    woken = 0;
+  } else {
+    for (int i = 0; i < count; i++) {
+      if (__atomic_load_n(words[i], __ATOMIC_ACQUIRE) != 1) {
+        woken = idxs[i] + 1;
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < count; i++) PyBuffer_Release(&views[i]);
+  if (rc < 0 && errno != ETIMEDOUT && errno != EAGAIN) {
+    if (errno == ENOSYS) return PyLong_FromLong(-1);
+    PyErr_SetFromErrno(PyExc_OSError);
+    return NULL;
+  }
+  return PyLong_FromLong(woken);
+}
 #endif
 
 static PyMethodDef spinloop_methods[] = {
@@ -579,6 +697,8 @@ static PyMethodDef spinloop_methods[] = {
     {"park_clear", method_park_clear, METH_VARARGS, "Clear a park word"},
     {"wake_parked", method_wake_parked, METH_VARARGS,
      "Fence and wake every parked reader"},
+    {"park_wait_any", (PyCFunction)(void (*)(void))method_park_wait_any,
+     METH_FASTCALL, "Sleep until one of several park words is woken"},
 #endif
     {NULL, NULL, 0, NULL}};
 

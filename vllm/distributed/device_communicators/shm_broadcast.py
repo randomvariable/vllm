@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import copyreg
 import functools
 import io
@@ -11,7 +12,7 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -73,11 +74,20 @@ except ImportError:
 # Linux futex park/wake on shared-memory words: a parked local reader sleeps
 # on its word and the writer wakes it directly, without a zmq round trip.
 try:
-    from vllm.spinloop import park_clear, park_prepare, park_wait, wake_parked
+    from vllm.spinloop import (
+        park_clear,
+        park_prepare,
+        park_wait,
+        park_wait_any,
+        wake_parked,
+    )
 
     _HAS_FUTEX = _full_fence is not None
 except ImportError:
     _HAS_FUTEX = False
+
+# Set False after a kernel without FUTEX_WAITV is first hit.
+_WAITV_SUPPORTED = True
 
 # Reader capability flags, published in the ring buffer.
 _CAP_FENCE = 1
@@ -1528,6 +1538,51 @@ class MessageQueue:
             raise RuntimeError("Only readers can wait for messages")
         if self.shutting_down:
             raise RuntimeError("cancelled")
+
+    @classmethod
+    def wait_many(cls, queues: Sequence["MessageQueue"], timeout_ms: int) -> None:
+        """Wait for a wake-up on any of several queues the caller reads.
+
+        One ``FUTEX_WAITV`` replaces the per-queue parks a fan-in reader
+        (the executor waiting for worker replies) would otherwise take in
+        slices. Only queues whose reader word says a sleeper exists are
+        watched, so an unread reply that nobody is parked for still returns
+        from the wait immediately; the caller re-checks ``ready()`` either
+        way. Falls back to ``wait_for_message`` on the first queue where the
+        kernel has no ``FUTEX_WAITV``, the writer cannot futex-wake, or a
+        reader is still in its spin window.
+
+        Args:
+            queues: Queues this process reads; at least one.
+            timeout_ms: Longest time to wait.
+        """
+        global _WAITV_SUPPORTED
+        if not _WAITV_SUPPORTED or not all(isinstance(q, MessageQueue) for q in queues):
+            # Tests and embedders hand in stub queues; defer to their wait.
+            queues[0].wait_for_message(timeout_ms)
+            return
+        bufs: list[memoryview] = []
+        idxs: list[int] = []
+        with contextlib.ExitStack() as stack:
+            for q in queues:
+                if not q._is_local_reader or q._wake_mode != _WAKE_FUTEX:
+                    queues[0].wait_for_message(timeout_ms)
+                    return
+                # A non-zero word is the reader's park state in futex mode.
+                words = stack.enter_context(q.buffer.get_futex_words())
+                if words[4 * q.local_reader_rank]:
+                    bufs.append(words)
+                    idxs.append(q.local_reader_rank)
+            if not bufs:
+                return
+            rc = park_wait_any(bufs, idxs, timeout_ms / 1000)
+            if rc < 0:
+                _WAITV_SUPPORTED = False
+                queues[0].wait_for_message(timeout_ms)
+                return
+        for q in queues:
+            if q.shutting_down:
+                raise RuntimeError("cancelled")
 
     def dequeue(
         self,

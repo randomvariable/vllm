@@ -71,8 +71,11 @@ free a slot polls the flags, so it never depends on a notification.
 
 The executor waits on several reply queues at once in `_gather_responses`. It
 probes each with `ready()`, which reads the flags and consumes nothing, and
-parks on the first pending queue in 50 ms slices with `wait_for_message`.
-A single reply queue uses a plain `dequeue`.
+then waits on all of them together with `MessageQueue.wait_many`: one
+`futex_waitv` (syscall 449) over the park words of the queues whose reader is
+parked. Without futexes it falls back to parking on the first pending queue
+in `RESPONSE_WAIT_SLICE_MS` (50 ms) slices. A single reply queue uses a plain
+`dequeue`.
 
 `shutdown()` sets `shutting_down` and sends the reader's cancel ping on an
 inproc PAIR socket. Every reader wait polls that socket: the ring park, the
@@ -344,6 +347,10 @@ specifications:
 - `paths.qnt` models one local and one remote reader with overflow payloads
   on `local_socket`, every message on `remote_socket`, and `shutdown()`
   stopping the writer and cancelling both readers.
+- `fanin.qnt` models `wait_many`: the fan-in reader snapshots several
+  queues' park words and sleeps in one vector wait, which the kernel value
+  compare makes immune to a wake lost between snapshot and sleep.
+  `faninBroken` is a writer that skips the wake when the word reads 0.
 
 The invariants:
 
@@ -353,6 +360,8 @@ The invariants:
 - `noLoss`: no data-socket message is dropped.
 - `progress`: without timeouts, some process or I/O thread can always move
   until every message is read or, after shutdown, until every reader exits.
+- `noStuckWait`: the fan-in reader never sleeps while a queue holds a
+  message with no wake source it can still receive.
 
 | Spec | Configuration | Result |
 | --- | --- | --- |
@@ -374,6 +383,8 @@ The invariants:
 | `paths` | `pathsNoDrop`: `XPUB_NODROP` only | `progress` fails: a reader blocked on a data socket never exits after shutdown |
 | `paths` | `pathsCancel`: cancellable socket waits only | `inOrder`, `noLoss` and `progress` fail |
 | `paths` | `pathsFixed`: `XPUB_NODROP` and cancellable socket waits | holds |
+| `fanin` | `faninTwo`, `faninFour`: vector wait over 2 and 4 queues | holds |
+| `fanin` | `faninBroken`: writer skips the wake when the word reads 0 | `noStuckWait` fails |
 
 Run `tools/formal/shm_broadcast/check.sh` to check every configuration with
 TLC and Apalache in parallel; it takes about 2 minutes on 16 cores and exits

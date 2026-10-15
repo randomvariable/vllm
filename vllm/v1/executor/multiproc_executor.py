@@ -186,7 +186,7 @@ def _gather_responses(
             wait_ms = RESPONSE_WAIT_SLICE_MS
             if left is not None:
                 wait_ms = max(1, min(wait_ms, int(left * 1000)))
-            response_mqs[pending[0]].wait_for_message(wait_ms)
+            MessageQueue.wait_many([response_mqs[index] for index in pending], wait_ms)
     return responses
 
 
