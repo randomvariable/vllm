@@ -142,31 +142,26 @@ SHM_READER_RECHECK_INTERVAL_MS = 5000
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
 
-# Memory fence for cross-process shared memory visibility.
-# Required for correct producer-consumer synchronization when using
-# shared memory without locks.
+# Memory fence for cross-process shared memory visibility. Required for
+# correct producer-consumer synchronisation on the lock-free ring. The native
+# seq_cst fence is used when the spinloop extension is built; a lock-based
+# fallback covers the other builds.
 _memory_fence_lock = threading.Lock()
 
 
-def memory_fence():
-    """
-    Full memory barrier for shared memory synchronization.
+def _memory_fence_lock_based():
+    """Fallback barrier where the native extension is unavailable.
 
-    Ensures all prior memory writes are visible to other processes before
-    any subsequent reads. This is critical for lock-free producer-consumer
-    patterns using shared memory.
-
-    Implementation acquires and immediately releases a lock. Python's
-    threading.Lock provides sequentially consistent memory barrier semantics
-    across all major platforms (POSIX, Windows). This is a lightweight
-    operation (~20ns) that guarantees:
-    - All stores before the barrier are visible to other threads/processes
-    - All loads after the barrier see the latest values
+    Acquires and immediately releases a lock. Python's threading.Lock orders
+    acquire and release accesses, which on weakly ordered CPUs is weaker than
+    the store-to-load barrier a seq_cst fence gives; the native
+    ``vllm.spinloop.full_fence`` is preferred wherever it is built.
     """
-    # Lock acquire/release provides full memory barrier semantics.
-    # Using context manager ensures lock release even on exceptions.
     with _memory_fence_lock:
         pass
+
+
+memory_fence = _full_fence if _full_fence is not None else _memory_fence_lock_based
 
 
 def to_bytes_big(value: int, size: int) -> bytes:

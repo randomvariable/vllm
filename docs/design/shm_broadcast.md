@@ -165,10 +165,11 @@ details carry the correctness:
   and the reader slept 5 s. The benchmark below found it; `message_queue.qnt`
   now models it as `skipIdleFlaglessPark`.
 - **Step 2 is a store-to-load fence.** Each step 3 load must not be satisfied
-  before the other process's step 1 store is visible. `memory_fence()`, which
-  takes a `threading.Lock`, gives acquire and release ordering but not that
-  guarantee on weakly ordered CPUs. The `vllm.spinloop` extension therefore
-  provides `full_fence()`, a C11 `__atomic_thread_fence(__ATOMIC_SEQ_CST)`:
+  before the other process's step 1 store is visible. `memory_fence()` is
+  `vllm.spinloop`'s `full_fence()`, a C11 `__atomic_thread_fence(__ATOMIC_SEQ_CST)`:
+  a lock-based fallback (`threading.Lock` orders acquire and release accesses,
+  which on weakly ordered CPUs is not a store-load barrier) covers builds
+  without the extension:
 
 | Architecture | Instruction |
 | --- | --- |
