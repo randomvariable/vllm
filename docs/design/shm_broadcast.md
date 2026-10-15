@@ -213,8 +213,11 @@ observed interval between reads after the last read, at most
 until woken, so idle CPU stays at zero. Each slice costs one timer wake-up of
 a few microseconds. At a 10 ms gap this cut the round trip from 443 to 54 µs
 with one worker and from 331 to 98 µs with four, with no rise in worker CPU.
-It needs no privileges. Set the slice below the deepest state's target
-residency on other CPUs (`/sys/devices/system/cpu/cpu*/cpuidle/state*/residency`).
+It needs no privileges. The slice is derived at start-up as 0.8 of the deepest
+target residency advertised under `/sys/devices/system/cpu/cpu*/cpuidle/`,
+capped by `VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS`, so it adapts to CPUs whose
+idle states differ from this host's; where cpuidle is absent (a VM using
+`haltpoll`, for example) the cap alone applies.
 
 The futex words are node-local, like the ring. Readers on other nodes keep
 receiving every message on `remote_socket`, so cross-node collectives are

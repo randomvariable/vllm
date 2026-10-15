@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import builtins
 import io
 import pickle
 import random
@@ -976,6 +977,35 @@ def test_shutdown_wakes_futex_parked_reader():
         assert len(result) == 1 and str(result[0]) == "cancelled"
     finally:
         _close_pair(writer, reader)
+
+
+def test_shallow_slice_follows_deepest_idle_residency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The sliced-park timer stays below the state it means to avoid."""
+    state_dirs = [
+        "/sys/devices/system/cpu/cpu0/cpuidle/state1",
+        "/sys/devices/system/cpu/cpu0/cpuidle/state2",
+        "/sys/devices/system/cpu/cpu0/cpuidle/state3",
+    ]
+    residencies = dict(zip(state_dirs, ("2\n", "36\n", "1000\n")))
+
+    def fake_open(path, *args, **kwargs):
+        return io.StringIO(residencies[path.removesuffix("/residency")])
+
+    monkeypatch.setattr(shm_broadcast.glob, "glob", lambda pattern: state_dirs)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(shm_broadcast, "_SHALLOW_FALLBACK_S", 5.0)
+    assert shm_broadcast._shallow_slice_s() == pytest.approx(0.8e-3)
+    # The env cap wins when the derived slice would be longer.
+    monkeypatch.setattr(shm_broadcast, "_SHALLOW_FALLBACK_S", 0.3e-3)
+    assert shm_broadcast._shallow_slice_s() == pytest.approx(0.3e-3)
+    # No cpuidle at all (a VM using haltpoll): the cap alone applies.
+    monkeypatch.setattr(shm_broadcast.glob, "glob", lambda pattern: [])
+    assert shm_broadcast._shallow_slice_s() == pytest.approx(0.3e-3)
+    # 0 disables sliced parking.
+    monkeypatch.setattr(shm_broadcast, "_SHALLOW_FALLBACK_S", 0.0)
+    assert shm_broadcast._shallow_slice_s() == 0.0
 
 
 @pytest.mark.skipif(not shm_broadcast._HAS_FUTEX, reason="needs futex support")

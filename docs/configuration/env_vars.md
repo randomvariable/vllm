@@ -13,6 +13,15 @@ When vLLM runs across multiple processes (for example, tensor-parallel inference
 
 `VLLM_SHM_BROADCAST_ADAPTIVE_*` tunes the reader grace. vLLM measures the interval between reads and spins longer during bursts and parks sooner when traffic slows. The bounds (`MIN_GRACE` / `MAX_GRACE`) and the pivot (`BUDGET`) clamp this behavior. The writer uses the same adaptive policy while a reader holds a buffer block, then sleeps in steps that double from 50 microseconds up to `VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS` (1 ms by default). Passing an explicit reader `busy_loop_s`, including `0`, pins that reader grace instead.
 
+A parked reader normally sleeps until woken, which lets its core enter a deep
+idle state: exiting one can cost hundreds of microseconds. While the next
+write is due, vLLM instead sleeps in slices just below the target residency
+reported in `/sys/devices/system/cpu/*/cpuidle/state*/residency`, so the
+governor keeps the core shallow. `VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS` (0.5
+by default) caps the slice and `VLLM_SHM_BROADCAST_SHALLOW_MAX_MS` (50) caps
+how long after a read this lasts; set the slice to `0` to disable it and
+sleep undisturbed.
+
 vLLM exports cumulative `vllm:shm_broadcast_blocked_waits_total` and `vllm:shm_broadcast_blocked_wait_seconds_total` metrics with a `role` label (`reader` or `writer`). Each queue queues an update every 128 blocked waits, or during shutdown. A background thread publishes the batches. The spin and park loops never call the metrics exporter.
 
 `VLLM_USE_SPINLOOP_EXT` independently enables the native hardware wait extension. Whatever its value, writers use the extension's full fence, when it is built, to skip notifications while no reader is parked; see [Shared-Memory Message Queue](../design/shm_broadcast.md#parked-flag-protocol).

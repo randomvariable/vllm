@@ -847,10 +847,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS": lambda: float(
         os.environ.get("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", "1.0")
     ),
-    # A parked reader sleeps in futex slices of this length while the next
-    # write is likely, so the idle governor keeps its core out of deep idle
-    # states (whose exit latency dominates wake-up). Set it below the target
-    # residency of the deepest state; 0 disables sliced parking.
+    # Ceiling, in ms, for the futex slice a parked reader sleeps in while the
+    # next write is likely, so the idle governor keeps its core out of deep
+    # idle states (whose exit latency dominates wake-up). The slice is
+    # normally derived as 0.8 of the deepest cpuidle target residency; this
+    # caps that, and also serves as the value where cpuidle is absent.
+    # 0 disables sliced parking.
     "VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS": lambda: float(
         os.environ.get("VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS", "0.5")
     ),

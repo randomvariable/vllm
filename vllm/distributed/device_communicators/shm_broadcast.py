@@ -3,6 +3,7 @@
 import contextlib
 import copyreg
 import functools
+import glob
 import io
 import math
 import os
@@ -98,10 +99,35 @@ _WAKE_PING = 0  # ping the notify socket after every write
 _WAKE_PARKED_PING = 1  # ping only while a reader's parked flag is set
 _WAKE_FUTEX = 2  # futex-wake parked readers; no notify ping
 
-# Shallow parking: futex slice length (below the target residency of the
-# deep idle states) and the longest window after a read that uses it.
-_SHALLOW_SLICE_S = envs.VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS / 1000.0
+# Shallow parking: the futex slice length must sit below the target residency
+# of the idle state worth avoiding, so the governor keeps a parked reader's
+# core shallow while the next write is due. Read that residency from sysfs
+# (world readable); VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS overrides it, and the
+# env default of 0 disables sliced parking entirely.
+_SHALLOW_FALLBACK_S = envs.VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS / 1000.0
 _SHALLOW_MAX_S = envs.VLLM_SHM_BROADCAST_SHALLOW_MAX_MS / 1000.0
+
+
+def _shallow_slice_s() -> float:
+    """Return the sliced-park timer, just under the deepest idle residency."""
+    if _SHALLOW_FALLBACK_S <= 0:
+        return 0.0
+    residencies: list[int] = []
+    for path in glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*"):
+        try:
+            with open(path + "/residency") as handle:
+                residencies.append(int(handle.read()))
+        except (OSError, ValueError):
+            continue  # no cpuidle (a VM using haltpoll, for instance)
+    deepest = max(residencies, default=0)
+    if deepest <= 0:
+        return _SHALLOW_FALLBACK_S
+    # Stay clear of the residency itself, and keep the slice off the timer
+    # floor so a burst of slices does not dominate the wake budget.
+    return max(50e-6, min(_SHALLOW_FALLBACK_S, 0.8 * deepest / 1e6))
+
+
+_SHALLOW_SLICE_S = _shallow_slice_s()
 
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
