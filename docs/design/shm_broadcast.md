@@ -35,7 +35,9 @@ sets the written flag. A reader waits for written-and-unread, copies the
 payload, and sets its read flag. Memory fences order the flag and payload
 stores. After the metadata rows, the buffer holds, per local reader, one
 parked flag, one fence-capability flag and one 4-byte futex park word,
-followed by the wake-mode byte, used by the wake-up protocol below.
+followed by the wake-mode byte used by the wake-up protocol below, and after
+that one 4-byte advisory `imminent` generation the writer bumps in `announce()`
+(see Advisory pre-wake).
 `ShmRingBuffer` exposes each region as a short-lived `_ShmWindow`, a direct
 `__enter__`/`__exit__` slice that releases its exported pointer on exit; a
 plain `@contextmanager` accessor cost a generator object and two resumptions
@@ -232,6 +234,33 @@ The futex words are node-local, like the ring. Readers on other nodes keep
 receiving every message on `remote_socket`, so cross-node collectives are
 unaffected.
 
+### Advisory pre-wake (`announce`)
+
+A reader that has parked pays the full wake latency - a futex wake and, on an
+idle core, the exit from a deep C-state - on the critical path of the step it
+is about to receive. The producer knows a step is coming a little before it
+writes it, because it is still building the RPC. `MessageQueue.announce()` lets
+it say so: the producer calls `announce()` at the start of its final pre-send
+work, a short time before `enqueue()`.
+
+`announce()` bumps the ring's advisory `imminent` generation and wakes any
+parked reader exactly as a write would, through `_notify_readers`. A reader that
+wakes to find its slot still empty - the message has not landed yet - sees the
+advanced generation and takes a bounded *expectant spin* instead of re-parking,
+so it is already polling when the write arrives. The spin is capped at
+`VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS`; the producer's lead must be shorter than
+the cap for the hint to span the write.
+
+The signal is purely advisory: it never gates whether a block is readable.
+Whether to yield a slot is decided only by the written/read flags and the
+`_park` handshake, so a lost, stale or torn `imminent` read at worst costs the
+reader a missed spin, never correctness, and the wake-up invariant is unchanged.
+The feature is off by default (`VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS=0`): with it
+unset `announce()` is a no-op and the reader never takes the extra spin, so the
+hot path is byte-for-byte the one described above. The benchmark drives it with
+`--announce-lead-us`, which models the executor announcing a step that many
+microseconds before it enqueues (see Performance).
+
 ### Wake mode selection
 
 Each reader records its capability before it subscribes: 0 without the
@@ -343,6 +372,31 @@ back-to-back and under 0.05 core when paced, in all variants.
 No step in the matrix waited out the 5 s recheck; the largest round trip was
 about 3 ms. Before the single-read fix in `_park`, the ping build stalled 5 s
 on 6-9% of paced single-worker steps.
+
+#### Advisory pre-wake results
+
+`collective_rpc` calls `MessageQueue.announce()` before its pre-send work, and
+`autoresearch.sh` measures that path by default (lead 200 us, cap 0.5 ms; set
+both to 0 for the plain path). Paired interleaved samples on the aarch64
+benchmark host - a GB10 DGX Spark (server24), a Kubernetes worker with a ~1.5
+load-average ambient floor, so baseline and announce share each round - of the
+3-round experiment above give a consistent win where the mechanism predicts it:
+
+| Metric | Baseline | Announce | Change | Rounds better |
+| --- | ---: | ---: | ---: | ---: |
+| `rtt_us` (geomean) | 81.5 | 75.9 | −7.0% | 3/3 |
+| 4-worker 10 ms round trip | 150.0 | 125.3 | −16.4% | 3/3 |
+| 1-worker 10 ms round trip | 96.0 | 89.3 | −6.9% | 2/3 |
+| paced worker cores | 0.44 | 0.31 | −29.4% | 3/3 |
+
+The gain concentrates in the multi-worker deep-park cell, which is where the
+writer's `wake_parked` serialises one `FUTEX_WAKE` per reader on the critical
+path: pre-waking the readers during the producer's own work removes that
+chain, so the round trip falls toward the back-to-back floor. Single-worker
+cells move only within noise (one wake is not a bottleneck). The parallel
+~30% CPU drop corroborates the mechanism rather than trading against it - a
+bounded expectant spin that catches the write replaces a full park, a deep
+C-state exit and the wake syscall. It needs no privileges and is off by default.
 
 Rerun one variant with:
 

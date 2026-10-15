@@ -278,6 +278,14 @@ def produce(
     start = time.monotonic()
     conn.send(("measuring",))
     for step in range(steps):
+        if opts.announce_lead_us > 0:
+            # Model the executor calling MessageQueue.announce() at the start
+            # of its final pre-send work, then enqueueing lead_us later. The
+            # announce + lead sit outside the measured window (send_ts is taken
+            # after them), so RTT stays the enqueue->reply round trip; the
+            # point is the workers are woken before the write lands.
+            rpc_q.announce()
+            time.sleep(opts.announce_lead_us / 1e6)
         send_ts = time.monotonic()
         rpc_q.enqueue(rpc_object(step, send_ts, payload), timeout=opts.timeout)
         for reply_q in reply_qs:
@@ -775,6 +783,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=900.0,
         help="budget for one phase, seconds",
+    )
+    parser.add_argument(
+        "--announce-lead-us",
+        type=int,
+        default=0,
+        help="µs between MessageQueue.announce() and enqueue in the produce "
+        "loop; 0 disables the call (baseline). The reader's expectant spin is "
+        "gated by VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS in the environment; set "
+        "it above this lead for the hint to reach the write.",
     )
     parser.add_argument("--repeat", type=int, default=0, help="repeat index")
     parser.add_argument("--json-out", default=None, help="append JSONL records")

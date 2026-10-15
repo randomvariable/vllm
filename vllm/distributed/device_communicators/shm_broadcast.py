@@ -62,6 +62,15 @@ if envs.VLLM_USE_SPINLOOP_EXT:
         )
 SPINLOOP_TIMEOUT_SECONDS = 0.1
 
+# Upper bound on the reader's expectant spin after the writer's announce(), in
+# seconds. 0 (the default) disables announce(): the writer's announce() becomes
+# a no-op and readers never take the extra spin, so behaviour is identical to
+# builds without the feature. A small positive cap keeps a stale or late hint
+# from burning CPU — the reader still parks if the write has not landed.
+_ANNOUNCE_MAX_S = (
+    float(os.environ.get("VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS", "0")) / 1000.0
+)
+
 # A store-to-load fence for the parked-flag handshake. Without it, writers
 # notify on every write.
 _full_fence: Callable[[], None] | None = None
@@ -671,7 +680,10 @@ class ShmRingBuffer:
         After the metadata, 2 x n_reader bytes hold one parked flag per reader
         (set while the reader waits on its notification socket) and then one
         flag per reader that says it has a native full fence. See
-        MessageQueue._park for the protocol.
+        MessageQueue._park for the protocol. After the futex words and the wake
+        mode byte sits a 4-byte "imminent" generation the writer bumps in
+        announce(); it only nudges a reader to take a bounded expectant spin
+        and never gates whether a block is readable.
 
         The state of metadata is as follows:
 
@@ -707,8 +719,13 @@ class ShmRingBuffer:
         # flags (the shared mapping is page aligned), then one byte where the
         # writer publishes the wake mode it chose.
         self.futex_offset = (self.park_offset + 2 * n_reader + 3) & ~3
-        self.mode_offset = self.futex_offset + 4 * n_reader
-        self.total_bytes_of_buffer = self.mode_offset + 1
+        self.mode_offset = self.futex_offset + 4 * self.n_reader
+        # Advisory "a write is imminent" generation, bumped by the writer in
+        # announce(). Readers compare it to decide whether to take a bounded
+        # expectant spin instead of parking. Never gates slot visibility, so a
+        # torn or stale read is at worst a missed spin; see MessageQueue.announce.
+        self.imminent_offset = (self.mode_offset + 1 + 3) & ~3
+        self.total_bytes_of_buffer = self.imminent_offset + 4
         self.data_offset = 0
         self.metadata_offset = self.max_chunk_bytes * self.max_chunks
 
@@ -802,6 +819,20 @@ class ShmRingBuffer:
     def wake_mode(self) -> int:
         assert self.shared_memory.buf is not None, "Buffer has been closed"
         return self.shared_memory.buf[self.mode_offset]
+
+    def imminent_gen(self) -> int:
+        """Read the advisory imminent-generation counter."""
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        o = self.imminent_offset
+        return int.from_bytes(self.shared_memory.buf[o : o + 4], "little")
+
+    def bump_imminent(self) -> None:
+        """Advance the imminent-generation counter (writer only, advisory)."""
+        assert self.shared_memory.buf is not None, "Buffer has not been closed"
+        o = self.imminent_offset
+        buf = self.shared_memory.buf
+        nxt = int.from_bytes(buf[o : o + 4], "little") + 1
+        buf[o : o + 4] = nxt.to_bytes(4, "little")
 
 
 def _rebuild_tensor(buf: Any, shape: tuple[int, ...], dtype_str: str) -> torch.Tensor:
@@ -984,6 +1015,9 @@ class MessageQueue:
         self._is_writer = True
         # Set by wait_until_ready from the capabilities of every local reader.
         self._wake_mode = _WAKE_PING
+        # Last observed advisory imminent-generation (writer: unused; kept so
+        # the attribute always exists).
+        self._imminent_seen = 0
         self._cancel_sender: zmq.Socket | None = None
         self._data_poller: zmq.Poller | None = None
         self._is_local_reader = False
@@ -1010,6 +1044,7 @@ class MessageQueue:
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
+        self._imminent_seen = 0
 
         context = Context()
 
@@ -1028,6 +1063,9 @@ class MessageQueue:
                     _CAP_FUTEX if _HAS_FUTEX else _CAP_FENCE if _full_fence else 0
                 )
             self._wake_mode = _WAKE_PING
+            # Snapshot the advisory counter at attach so a bump that predates
+            # this reader does not trigger a spurious expectant spin.
+            self._imminent_seen = self.buffer.imminent_gen()
 
             self.local_socket = context.socket(SUB)
             self.local_socket.setsockopt_string(SUBSCRIBE, "")
@@ -1363,10 +1401,18 @@ class MessageQueue:
                     # for the remaining spin grace (capped by the ext
                     # ceiling) and, on success, skips parking.
                     if SPINLOOP_EXT_ENABLED:
-                        native_timeout_s = min(
-                            self._spin_condition.remaining_grace_s(),
-                            SPINLOOP_TIMEOUT_SECONDS,
-                        )
+                        budget_s = self._spin_condition.remaining_grace_s()
+                        if _ANNOUNCE_MAX_S > 0.0:
+                            # A fresh announce() buys a bounded expectant spin
+                            # so the imminent write is caught awake, off the
+                            # park/wake critical path. Advisory only: the slot
+                            # is still yielded solely by check() below.
+                            gen = self.buffer.imminent_gen()
+                            if gen != self._imminent_seen:
+                                self._imminent_seen = gen
+                                if budget_s < _ANNOUNCE_MAX_S:
+                                    budget_s = _ANNOUNCE_MAX_S
+                        native_timeout_s = min(budget_s, SPINLOOP_TIMEOUT_SECONDS)
                         if native_timeout_s > 0.0:
                             spinloop(
                                 metadata_buffer[0 : self.local_reader_rank + 1],
@@ -1496,6 +1542,27 @@ class MessageQueue:
         if self._is_remote_reader:
             return bool(self.remote_socket.poll(timeout=0))
         raise RuntimeError("Only readers can check for messages")
+
+    def announce(self) -> None:
+        """Hint that a message will be enqueued very soon.
+
+        The producer calls this from its pre-send work, a short time before
+        ``enqueue``. It wakes any parked local reader and marks the next block
+        imminent so the reader takes a bounded expectant spin instead of
+        re-parking, overlapping the wake with the rest of the producer's work
+        rather than paying it on the critical path of the real write.
+
+        Purely advisory: it never affects whether a block is readable, so a
+        lost or stale hint only costs the extra spin, never correctness. A
+        no-op unless ``VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS`` is set, keeping the
+        default path identical to a build without the feature.
+        """
+        if _ANNOUNCE_MAX_S <= 0.0 or not self._is_writer:
+            return
+        if self.n_local_reader <= 0:
+            return
+        self.buffer.bump_imminent()
+        self._notify_readers()
 
     def _notify_readers(self) -> None:
         """Wake the local readers after a write.
