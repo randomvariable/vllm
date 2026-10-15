@@ -2,8 +2,22 @@
 
 extern "C" {
 
+#include <math.h>
+#include <cerrno>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
+
+#if defined(__aarch64__)
+  #include <sys/auxv.h>
+#endif
+
+#if defined(__linux__)
+  #include <linux/futex.h>
+  #include <sys/prctl.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+#endif
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
@@ -18,6 +32,27 @@ extern "C" {
 
 #define CPU_SUPPORT_NONE 0
 #define CPU_SUPPORT_MONITORX 1
+#define CPU_SUPPORT_WFET 2
+#define CPU_SUPPORT_WAITPKG 3
+
+#if defined(__x86_64__)
+  // Bounded wait budget per iteration, in microseconds. umwait is a bounded
+  // monitor/timeout wait; the caller's callback re-checks the predicate
+  // between waits, so a short budget bounds the worst-case re-check latency.
+  #define UMWAIT_BUDGET_US 50
+#endif
+
+#if defined(__aarch64__)
+  // Bit 31 per the arm64 ELF hwcaps ABI (FEAT_WFxT).
+  #ifndef HWCAP2_WFXT
+    #define HWCAP2_WFXT (1UL << 31)
+  #endif
+  // Bounded wait budget per iteration, in microseconds. WFET is a bounded
+  // event/timeout wait; the caller's callback re-checks the predicate
+  // between waits, so a short budget bounds the worst-case re-check
+  // latency. Experimental: not validated for production use.
+  #define WFET_BUDGET_US 50
+#endif
 
 #define MWAITX_DEFAULT_TIMEOUT_CYCLES 1000000
 
@@ -51,7 +86,154 @@ static void determine_cpu_support(spinloop_state_t* state) {
     }
   }
 #endif
+
+#if defined(__x86_64__)
+  // Intel WAITPKG (umonitor/umwait/tpause), CPUID.(EAX=7,ECX=0):EDX[5].
+  // x86-64 only: umwait_bounded_wait stages a 64-bit deadline in rdx:rax,
+  // so 32-bit x86 keeps the pause fallback.
+  if (state->cpu_support == CPU_SUPPORT_NONE &&
+      __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 1 &&
+      (edx & (1 << 5)) != 0) {
+    state->cpu_support = CPU_SUPPORT_WAITPKG;
+  }
+#endif
+
+#if defined(__aarch64__)
+  // FEAT_WFxT (WFET/WFIT): ELF HWCAP2 bit 31. Runtime-gated so baseline
+  // armv8 builds load everywhere and only wait via WFET where present.
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  if (hwcap2 & HWCAP2_WFXT) {
+    state->cpu_support = CPU_SUPPORT_WFET;
+  }
+#endif
 }
+
+// Bounded-wait status shared by the arch helpers (wfet / umwait). Pure C:
+// no Python API is touched (caller holds no GIL). WAIT_OK, WAIT_SPUN_OUT
+// when the overall timeout expired, or WAIT_CLOCK_ERR when clock_gettime
+// fails (caller defers the PyErr).
+enum bounded_wait_status { WAIT_OK, WAIT_SPUN_OUT, WAIT_CLOCK_ERR };
+
+#if defined(__aarch64__)
+// Bounded WFET wait for the fallback path. Computes the absolute CNTVCT
+// deadline from the remaining caller timeout and the per-wait budget, then
+// waits once.
+static enum bounded_wait_status wfet_bounded_wait(
+    double timeout, const struct timespec* t_start) {
+  double remaining_s = INFINITY;
+  if (timeout > 1e-9) {
+    struct timespec t_now;
+    if (clock_gettime(TIMEOUT_CLOCK, &t_now) != 0) {
+      return WAIT_CLOCK_ERR;
+    }
+    const double elapsed = (double)(t_now.tv_sec - t_start->tv_sec) +
+                           (t_now.tv_nsec - t_start->tv_nsec) * 1e-9;
+    remaining_s = timeout - elapsed;
+    if (remaining_s <= 0) {
+      return WAIT_SPUN_OUT;
+    }
+  }
+  const double budget_s = (double)WFET_BUDGET_US * 1e-6;
+  const double wait_s = remaining_s < budget_s ? remaining_s : budget_s;
+  uint64_t now_ticks, freq_hz, wait_ticks, deadline_ticks;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now_ticks));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq_hz));
+  if (freq_hz == 0) {
+    // Unreachable on compliant hardware; degrade to a plain yield.
+    __asm__ volatile("yield" ::: "memory");
+    return WAIT_OK;
+  }
+  wait_ticks = (uint64_t)(wait_s * (double)freq_hz);
+  if (wait_ticks < 1) {
+    wait_ticks = 1;  // rounding must not produce an immediate wake
+  }
+  deadline_ticks = now_ticks + wait_ticks;
+  // wfet x16: register operand encoded in the .inst immediate
+  // (encoding d5031000 | Rd); x16 is an interprocedural scratch register
+  // not carrying live values here.
+  __asm__ volatile(
+      "mov x16, %[deadline]\n"
+      ".inst 0xd5031010\n"
+      :
+      : [deadline] "r"(deadline_ticks)
+      : "x16", "memory");
+  return WAIT_OK;
+}
+#endif
+
+#if defined(__x86_64__)
+// Bounded umwait for the fallback path on WAITPKG parts: umonitor arms the
+// address range, then umwait sleeps until a store there (or a zero-extend of
+// the counter deadline in TSC ticks, or an interrupt) wakes us. The deadline
+// is capped by the remaining caller timeout and the per-wait budget, matching
+// wfet_bounded_wait. Pure C: no Python API is touched (caller holds no GIL).
+// Returns WAIT_OK, WAIT_SPUN_OUT when the overall timeout expired, or
+// WAIT_CLOCK_ERR when clock_gettime fails (caller defers the PyErr).
+static enum bounded_wait_status umwait_bounded_wait(
+    const void* addr, double timeout, const struct timespec* t_start) {
+  double remaining_s = INFINITY;
+  if (timeout > 1e-9) {
+    struct timespec t_now;
+    if (clock_gettime(TIMEOUT_CLOCK, &t_now) != 0) {
+      return WAIT_CLOCK_ERR;
+    }
+    const double elapsed = (double)(t_now.tv_sec - t_start->tv_sec) +
+                           (t_now.tv_nsec - t_start->tv_nsec) * 1e-9;
+    remaining_s = timeout - elapsed;
+    if (remaining_s <= 0) {
+      return WAIT_SPUN_OUT;
+    }
+  }
+  const double budget_s = (double)UMWAIT_BUDGET_US * 1e-6;
+  const double wait_s = remaining_s < budget_s ? remaining_s : budget_s;
+  // umwait's counter deadline is in TSC ticks. Determine the TSC frequency
+  // once per call from the invariant-TSC leaf when present; fall back to
+  // rdtsc/rdtscp only if the leaf is missing (never on WAITPKG parts, which
+  // are all post-Skylake invariant-TSC).
+  unsigned int eax, ebx, ecx, edx;
+  if (__get_cpuid(0x15, &eax, &ebx, &ecx, &edx) != 1 || eax == 0 || ebx == 0 ||
+      ecx == 0) {
+    // Keep this degraded fallback polite to sibling hyperthreads.
+    __builtin_ia32_pause();
+    return WAIT_OK;  // no invariant TSC ratio: degrade to the next iteration
+  }
+  const double tsc_hz = (double)ecx * (double)ebx / (double)eax;
+  if (!(tsc_hz > 0.0)) {
+    return WAIT_OK;
+  }
+  unsigned int lo, hi;
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  const uint64_t now_tsc = ((uint64_t)hi << 32) | lo;
+  const uint64_t deadline_tsc = now_tsc + (uint64_t)(wait_s * tsc_hz);
+  const uint64_t counter =
+      deadline_tsc & 0xFFFFFFFFFFFFFFFFULL;  // umwait reads EDX:EAX directly
+  // umonitor arms the wakeup range; the callback re-check in the outer loop
+  // closes the arm/store race, mirroring the monitorx pattern. umwait
+  // ecx=0 permits C0.1 (deeper wake latency, lower power). EFLAGS.ZF is set
+  // when the wake came from the counter deadline rather than the monitor;
+  // either way the loop re-checks the predicate, so ZF is ignored.
+  const unsigned int d_lo = (unsigned int)(counter & 0xFFFFFFFFULL);
+  const unsigned int d_hi = (unsigned int)(counter >> 32);
+  // The address arrives in rdi ("D") and is copied to rax for umonitor; the
+  // deadline halves arrive in scratch registers and move to eax/edx (umwait
+  // reads the deadline from EDX:EAX).
+  // Encoded via .byte (SDM: umonitor rax = f3 0f ae f0; umwait ecx =
+  // f2 0f ae f1) because some otherwise-fine toolchains predate the WAITPKG
+  // mnemonics; baseline x86-64 assemblers accept the raw bytes. The
+  // instructions only execute on CPUID-gated WAITPKG parts.
+  __asm__ volatile(
+      "movq %%rdi, %%rax\n"             // rax = address for umonitor
+      ".byte 0xf3, 0x0f, 0xae, 0xf0\n"  // umonitor rax
+      "movl %1, %%eax\n"                // eax = counter low 32
+      "movl %2, %%edx\n"                // edx = counter high 32
+      "xorl %%ecx, %%ecx\n"             // control = 0 (C0.1 permitted)
+      ".byte 0xf2, 0x0f, 0xae, 0xf1\n"  // umwait ecx
+      :
+      : "D"(addr), "r"(d_lo), "r"(d_hi)
+      : "rax", "rcx", "rdx", "memory");
+  return WAIT_OK;
+}
+#endif
 
 static PyObject* method_spinloop(PyObject* self, PyObject* args,
                                  PyObject* kwargs) {
@@ -86,9 +268,21 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 
   bool result = false;
   bool error = false;
+  bool clock_error = false;  // deferred: PyErr raised after GIL reacquire
+  bool timed_out = false;    // WFET exhausted the overall timeout
+#if defined(__aarch64__)
+  enum bounded_wait_status wfet_status = WAIT_OK;
+#endif
+#if defined(__x86_64__)
+  enum bounded_wait_status umwait_status = WAIT_OK;
+#endif
   bool have_timeout = (timeout > 1e-9);
   unsigned int iteration = 0;
-  const bool buffer_qualifies = (buffer.len <= state->max_monitor_line_size);
+#if defined(__i386__) || defined(__x86_64__)
+  // Py_ssize_t is 32-bit on i386; the line size is a CPUID byte.
+  const bool buffer_qualifies =
+      (buffer.len <= (Py_ssize_t)state->max_monitor_line_size);
+#endif
 
   while (true) {
     PyObject* res = PyObject_CallNoArgs(callback);
@@ -156,18 +350,54 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 #endif
       // Give other threads a chance to be scheduled
       Py_BEGIN_ALLOW_THREADS
-#if defined(__i386__) || defined(__x86_64__)
+      // clang-format off: preprocessor-guarded arch branches confuse the
+// formatter's brace/indent tracking; keep hand-aligned.
+#if defined(__x86_64__)
+      if (state->cpu_support == CPU_SUPPORT_WAITPKG) {
+        umwait_status = umwait_bounded_wait(buffer.buf, timeout, &t_start);
+        if (umwait_status == WAIT_CLOCK_ERR) {
+          clock_error = true;
+          error = true;
+        } else if (umwait_status == WAIT_SPUN_OUT) {
+          timed_out = true;
+        }
+        // WAIT_OK: continue the outer loop; the callback re-check decides.
+      } else {
+        __builtin_ia32_pause();
+      }
+#elif defined(__i386__)
       __builtin_ia32_pause();
 #elif defined(__aarch64__)
-        __asm__ volatile("yield" :: : "memory");
+      if (state->cpu_support == CPU_SUPPORT_WFET) {
+        wfet_status = wfet_bounded_wait(timeout, &t_start);
+        if (wfet_status == WAIT_CLOCK_ERR) {
+          clock_error = true;
+          error = true;
+        } else if (wfet_status == WAIT_SPUN_OUT) {
+          timed_out = true;
+        }
+        // WAIT_OK: continue the outer loop; the callback re-check decides.
+      } else {
+        __asm__ volatile("yield" ::: "memory");
+      }
 #endif
       Py_END_ALLOW_THREADS
+// clang-format on
 #if defined(__i386__) || defined(__x86_64__)
     }
 #endif
+
+    if (error || timed_out) {
+      break;
+    }
   }
 
   PyBuffer_Release(&buffer);
+
+  if (clock_error) {
+    PyErr_SetString(PyExc_RuntimeError, "clock_gettime() failed!");
+    return NULL;
+  }
 
   if (error) {
     return NULL;
@@ -180,15 +410,309 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
   Py_RETURN_FALSE;
 }
 
+// Full store-to-load fence for cross-process flag handshakes: mfence or a
+// locked op on x86, dmb ish on Arm, sync on POWER, bcr 14/15 on s390x,
+// fence rw,rw on RISC-V. Python's lock-based fences order only acquire and
+// release accesses, which does not cover a store followed by a load of
+// another location on weakly ordered CPUs.
+static PyObject* method_full_fence(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  Py_RETURN_NONE;
+}
+#if defined(__linux__)
+// Shared-memory park words for MessageQueue readers. Word i is 1 while reader
+// i is parked. The reader sets it, fences and re-checks its slot before it
+// sleeps; the writer publishes, fences and exchanges every set word to 0,
+// waking its sleeper. The futex compares the word under the kernel's lock,
+// so a wake between the reader's re-check and its sleep is never lost.
+
+static uint32_t* park_word(Py_buffer* view, Py_ssize_t index) {
+  if (index < 0 || (index + 1) * (Py_ssize_t)sizeof(uint32_t) > view->len ||
+      ((uintptr_t)view->buf % sizeof(uint32_t)) != 0) {
+    PyErr_SetString(PyExc_ValueError, "park word out of range or unaligned");
+    return NULL;
+  }
+  return (uint32_t*)view->buf + index;
+}
+
+static long futex(uint32_t* addr, int op, uint32_t val,
+                  const struct timespec* timeout, uint32_t val3) {
+  // Shared (not FUTEX_PRIVATE) futex: the words live in a mapping shared
+  // between processes.
+  return syscall(SYS_futex, addr, op, val, timeout, NULL, val3);
+}
+
+// park_prepare(buf, i): mark reader i parked, then fence so its slot
+// re-check cannot be satisfied before the mark is visible.
+static PyObject* method_park_prepare(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &index)) return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) {
+    __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+static struct timespec to_timespec(double s) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)s;
+  ts.tv_nsec = (long)((s - (double)ts.tv_sec) * 1e9);
+  return ts;
+}
+
+static double monotonic_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// park_wait(buf, i, timeout_s, shallow_s=0, slice_s=0): sleep while word i
+// is 1, at most timeout_s (negative waits indefinitely), then clear it.
+// For the first shallow_s seconds the sleep is cut into slice_s futex
+// waits: the idle governor sees a timer due within slice_s and keeps the
+// core out of idle states whose target residency exceeds it, so a wake in
+// that window avoids a deep-state exit. Each slice boundary costs one
+// timer wake-up in this loop, without returning to Python.
+//
+// Sliced waits use FUTEX_WAIT_BITSET with an absolute CLOCK_MONOTONIC
+// deadline, so re-arming does not accumulate rounding, and the thread's
+// timer slack is tightened so the slices are not deferred.
+static PyObject* method_park_wait(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  double timeout_s, shallow_s = 0, slice_s = 0;
+  if (!PyArg_ParseTuple(args, "w*nd|dd", &view, &index, &timeout_s, &shallow_s,
+                        &slice_s))
+    return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) {
+    Py_BEGIN_ALLOW_THREADS;
+    if (slice_s > 0) prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
+    double start = monotonic_s();
+    while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1) {
+      double elapsed = monotonic_s() - start;
+      double left = timeout_s >= 0 ? timeout_s - elapsed : -1;
+      if (timeout_s >= 0 && left <= 0) break;
+      bool sliced = slice_s > 0 && elapsed < shallow_s;
+      if (!sliced && left < 0) {
+        futex(word, FUTEX_WAIT, 1, NULL, 0);
+        break;
+      }
+      double sleep_s = sliced ? slice_s : left;
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      struct timespec deadline = to_timespec(sleep_s);
+      deadline.tv_sec += ts.tv_sec;
+      deadline.tv_nsec += ts.tv_nsec;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec += 1;
+      }
+      futex(word, FUTEX_WAIT_BITSET, 1, &deadline, FUTEX_BITSET_MATCH_ANY);
+      if (!sliced) break;
+    }
+    __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
+    Py_END_ALLOW_THREADS;
+  }
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+// park_clear(buf, i): reader i found its slot ready and will not sleep.
+static PyObject* method_park_clear(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t index;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &index)) return NULL;
+  uint32_t* word = park_word(&view, index);
+  if (word != NULL) __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
+  PyBuffer_Release(&view);
+  if (word == NULL) return NULL;
+  Py_RETURN_NONE;
+}
+
+// wake_parked(buf, n): after publishing, fence and wake every parked reader
+// among words 0..n-1. Returns the number of readers woken.
+static PyObject* method_wake_parked(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  Py_ssize_t n;
+  if (!PyArg_ParseTuple(args, "w*n", &view, &n)) return NULL;
+  long woken = 0;
+  if (n > 0 && park_word(&view, n - 1) == NULL) {
+    PyBuffer_Release(&view);
+    return NULL;
+  }
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  uint32_t* words = (uint32_t*)view.buf;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    if (__atomic_load_n(&words[i], __ATOMIC_RELAXED) != 0 &&
+        __atomic_exchange_n(&words[i], 0, __ATOMIC_SEQ_CST) != 0) {
+      futex(&words[i], FUTEX_WAKE, INT32_MAX, NULL, 0);
+      woken++;
+    }
+  }
+  PyBuffer_Release(&view);
+  return PyLong_FromLong(woken);
+}
+
+  // The kernel has no opcode for a vector wait: futex_waitv is its own
+  // syscall (asm-generic unistd 449) with this waiter layout. Flags use the
+  // futex2 size selector; FUTEX2_SIZE_U32 (0x02) selects a 32-bit word.
+  // Its timeout is an absolute CLOCK_MONOTONIC (or CLOCK_REALTIME) deadline.
+  #ifndef __NR_futex_waitv
+    #define __NR_futex_waitv 449
+  #endif
+  #define SPINLOOP_FUTEX2_SIZE_U32 0x02
+
+struct spinloop_waitv {
+  uint64_t val;
+  uint64_t uaddr;
+  uint32_t flags;
+  uint32_t __reserved;
+};
+
+// park_wait_any(bufs, idxs, timeout_s): sleep until one of the watched words
+// is no longer 1, or the deadline passes. A word with index < 0 is skipped.
+// Returns one past the caller's index of a word that stopped being 1, 0 when
+// the wait timed out or nothing was watched, or -1 when the kernel has no
+// futex_waitv so the caller falls back to a single-word wait.
+static PyObject* method_park_wait_any(PyObject* self, PyObject* const* args,
+                                      Py_ssize_t nargs) {
+  (void)self;
+  if (nargs != 3 || !PyList_Check(args[0]) || !PyList_Check(args[1])) {
+    PyErr_SetString(PyExc_TypeError, "expected (bufs, idxs, timeout)");
+    return NULL;
+  }
+  Py_ssize_t n = PySequence_Size(args[0]);
+  if (n < 0 || n != PySequence_Size(args[1]) || n > 64) {
+    if (!PyErr_Occurred())
+      PyErr_SetString(PyExc_ValueError, "buffer and index lists must match");
+    return NULL;
+  }
+  double timeout_s = PyFloat_AsDouble(args[2]);
+  if (timeout_s == -1.0 && PyErr_Occurred()) return NULL;
+  Py_buffer views[64];
+  struct spinloop_waitv slots[64];
+  uint32_t* words[64];
+  int idxs[64];
+  int count = 0;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyObject* idx_obj = PySequence_GetItem(args[1], i);
+    if (idx_obj == NULL) {
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    Py_ssize_t index = PyLong_AsSsize_t(idx_obj);
+    Py_DECREF(idx_obj);
+    if (index < 0) continue;  // that reader is not parked
+    PyObject* buf_obj = PySequence_GetItem(args[0], i);
+    if (buf_obj == NULL) {
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    if (PyObject_GetBuffer(buf_obj, &views[count], PyBUF_SIMPLE) != 0) {
+      Py_DECREF(buf_obj);
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    Py_DECREF(buf_obj);
+    uint32_t* word = park_word(&views[count], index);
+    if (word == NULL) {
+      PyBuffer_Release(&views[count]);
+      while (count > 0) PyBuffer_Release(&views[--count]);
+      return NULL;
+    }
+    slots[count].val = 1;
+    slots[count].uaddr = (uint64_t)(uintptr_t)word;
+    slots[count].flags = SPINLOOP_FUTEX2_SIZE_U32;
+    slots[count].__reserved = 0;
+    words[count] = word;
+    idxs[count] = (int)index;
+    count++;
+  }
+  if (count == 0) return PyLong_FromLong(0);
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  {
+    struct timespec add = to_timespec(timeout_s);
+    deadline.tv_sec += add.tv_sec;
+    deadline.tv_nsec += add.tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_nsec -= 1000000000L;
+      deadline.tv_sec += 1;
+    }
+  }
+  long rc;
+  Py_BEGIN_ALLOW_THREADS;
+  rc = syscall(__NR_futex_waitv, slots, (unsigned int)count, (unsigned int)0,
+               &deadline, (int)CLOCK_MONOTONIC);
+  Py_END_ALLOW_THREADS;
+  int woken = 0;
+  if (rc > 0 && rc < count) {
+    // The syscall returns the array index of the futex that stopped
+    // matching; map it back to the caller's reader index.
+    woken = idxs[(int)rc] + 1;
+  } else if (rc == 0) {
+    // Every watched word still reads 1: nothing woke us.
+    woken = 0;
+  } else {
+    for (int i = 0; i < count; i++) {
+      if (__atomic_load_n(words[i], __ATOMIC_ACQUIRE) != 1) {
+        woken = idxs[i] + 1;
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < count; i++) PyBuffer_Release(&views[i]);
+  if (rc < 0 && errno != ETIMEDOUT && errno != EAGAIN) {
+    if (errno == ENOSYS) return PyLong_FromLong(-1);
+    PyErr_SetFromErrno(PyExc_OSError);
+    return NULL;
+  }
+  return PyLong_FromLong(woken);
+}
+#endif
+
 static PyMethodDef spinloop_methods[] = {
-    {"spinloop", (PyCFunction)method_spinloop, METH_VARARGS | METH_KEYWORDS,
-     "Wait for store with callback"},
+    {"spinloop", (PyCFunction)(void (*)(void))method_spinloop,
+     METH_VARARGS | METH_KEYWORDS, "Wait for store with callback"},
+    {"full_fence", method_full_fence, METH_NOARGS,
+     "Sequentially consistent memory fence"},
+#if defined(__linux__)
+    {"park_prepare", method_park_prepare, METH_VARARGS,
+     "Mark a reader parked and fence"},
+    {"park_wait", method_park_wait, METH_VARARGS,
+     "Sleep on a park word until woken or timed out"},
+    {"park_clear", method_park_clear, METH_VARARGS, "Clear a park word"},
+    {"wake_parked", method_wake_parked, METH_VARARGS,
+     "Fence and wake every parked reader"},
+    {"park_wait_any", (PyCFunction)(void (*)(void))method_park_wait_any,
+     METH_FASTCALL, "Sleep until one of several park words is woken"},
+#endif
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef spinloop_module = {
-    PyModuleDef_HEAD_INIT, "spinloop",
-    "Hardware-optimized spinloops for Python", sizeof(spinloop_state_t),
-    spinloop_methods};
+    PyModuleDef_HEAD_INIT,
+    "spinloop",
+    "Hardware-optimized spinloops for Python",
+    sizeof(spinloop_state_t),
+    spinloop_methods,
+    NULL, /* m_slots */
+    NULL, /* m_traverse */
+    NULL, /* m_clear */
+    NULL, /* m_free */
+};
 
 PyMODINIT_FUNC PyInit_spinloop(void) {
   PyObject* m = PyModule_Create(&spinloop_module);

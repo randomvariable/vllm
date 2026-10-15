@@ -1,28 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import copyreg
 import functools
+import glob
 import io
+import math
 import os
 import pickle
+import queue
 import shutil
 import sys
 import threading
 import time
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pickle import PickleBuffer
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import zmq
+from prometheus_client import REGISTRY, Counter
 from torch.distributed import ProcessGroup
 from zmq import (  # type: ignore
     IPV6,  # type: ignore
-    PUB,
     SUB,
     SUBSCRIBE,
     XPUB,
@@ -57,6 +62,82 @@ if envs.VLLM_USE_SPINLOOP_EXT:
         )
 SPINLOOP_TIMEOUT_SECONDS = 0.1
 
+# Upper bound on the reader's expectant spin after the writer's announce(), in
+# seconds. 0 (the default) disables announce(): the writer's announce() becomes
+# a no-op and readers never take the extra spin, so behaviour is identical to
+# builds without the feature. A small positive cap keeps a stale or late hint
+# from burning CPU — the reader still parks if the write has not landed.
+_ANNOUNCE_MAX_S = (
+    float(os.environ.get("VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS", "0")) / 1000.0
+)
+
+# A store-to-load fence for the parked-flag handshake. Without it, writers
+# notify on every write.
+_full_fence: Callable[[], None] | None = None
+try:
+    from vllm.spinloop import full_fence
+
+    _full_fence = full_fence
+except ImportError:
+    pass
+
+# Linux futex park/wake on shared-memory words: a parked local reader sleeps
+# on its word and the writer wakes it directly, without a zmq round trip.
+try:
+    from vllm.spinloop import (
+        park_clear,
+        park_prepare,
+        park_wait,
+        park_wait_any,
+        wake_parked,
+    )
+
+    _HAS_FUTEX = _full_fence is not None
+except ImportError:
+    _HAS_FUTEX = False
+
+# Set False after a kernel without FUTEX_WAITV is first hit.
+_WAITV_SUPPORTED = True
+
+# Reader capability flags, published in the ring buffer.
+_CAP_FENCE = 1
+_CAP_FUTEX = 2
+
+# Wake modes the writer selects in wait_until_ready.
+_WAKE_PING = 0  # ping the notify socket after every write
+_WAKE_PARKED_PING = 1  # ping only while a reader's parked flag is set
+_WAKE_FUTEX = 2  # futex-wake parked readers; no notify ping
+
+# Shallow parking: the futex slice length must sit below the target residency
+# of the idle state worth avoiding, so the governor keeps a parked reader's
+# core shallow while the next write is due. Read that residency from sysfs
+# (world readable); VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS overrides it, and the
+# env default of 0 disables sliced parking entirely.
+_SHALLOW_FALLBACK_S = envs.VLLM_SHM_BROADCAST_SHALLOW_SLICE_MS / 1000.0
+_SHALLOW_MAX_S = envs.VLLM_SHM_BROADCAST_SHALLOW_MAX_MS / 1000.0
+
+
+def _shallow_slice_s() -> float:
+    """Return the sliced-park timer, just under the deepest idle residency."""
+    if _SHALLOW_FALLBACK_S <= 0:
+        return 0.0
+    residencies: list[int] = []
+    for path in glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*"):
+        try:
+            with open(path + "/residency") as handle:
+                residencies.append(int(handle.read()))
+        except (OSError, ValueError):
+            continue  # no cpuidle (a VM using haltpoll, for instance)
+    deepest = max(residencies, default=0)
+    if deepest <= 0:
+        return _SHALLOW_FALLBACK_S
+    # Stay clear of the residency itself, and keep the slice off the timer
+    # floor so a burst of slices does not dominate the wake budget.
+    return max(50e-6, min(_SHALLOW_FALLBACK_S, 0.8 * deepest / 1e6))
+
+
+_SHALLOW_SLICE_S = _shallow_slice_s()
+
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
 
@@ -70,31 +151,26 @@ SHM_READER_RECHECK_INTERVAL_MS = 5000
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
 
-# Memory fence for cross-process shared memory visibility.
-# Required for correct producer-consumer synchronization when using
-# shared memory without locks.
+# Memory fence for cross-process shared memory visibility. Required for
+# correct producer-consumer synchronisation on the lock-free ring. The native
+# seq_cst fence is used when the spinloop extension is built; a lock-based
+# fallback covers the other builds.
 _memory_fence_lock = threading.Lock()
 
 
-def memory_fence():
-    """
-    Full memory barrier for shared memory synchronization.
+def _memory_fence_lock_based():
+    """Fallback barrier where the native extension is unavailable.
 
-    Ensures all prior memory writes are visible to other processes before
-    any subsequent reads. This is critical for lock-free producer-consumer
-    patterns using shared memory.
-
-    Implementation acquires and immediately releases a lock. Python's
-    threading.Lock provides sequentially consistent memory barrier semantics
-    across all major platforms (POSIX, Windows). This is a lightweight
-    operation (~20ns) that guarantees:
-    - All stores before the barrier are visible to other threads/processes
-    - All loads after the barrier see the latest values
+    Acquires and immediately releases a lock. Python's threading.Lock orders
+    acquire and release accesses, which on weakly ordered CPUs is weaker than
+    the store-to-load barrier a seq_cst fence gives; the native
+    ``vllm.spinloop.full_fence`` is preferred wherever it is built.
     """
-    # Lock acquire/release provides full memory barrier semantics.
-    # Using context manager ensures lock release even on exceptions.
     with _memory_fence_lock:
         pass
+
+
+memory_fence = _full_fence if _full_fence is not None else _memory_fence_lock_based
 
 
 def to_bytes_big(value: int, size: int) -> bytes:
@@ -108,6 +184,201 @@ LONG_WAIT_TIME_LOG_MSG = (
     "time-consuming work (e.g. compilation, "
     "weight/kv cache quantization)."
 )
+
+# Floor for the writer-side park step (see acquire_write): once the adaptive
+# grace expires, the writer polls in sleep steps doubling from this floor up
+# to VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS instead of yielding indefinitely
+# while readers lag.
+_WRITE_PARK_MIN_S = 50e-6
+_SHM_BROADCAST_METRIC_BATCH_SIZE = 128
+
+_shm_broadcast_blocked_waits: Counter | None = None
+_shm_broadcast_blocked_wait_seconds: Counter | None = None
+_shm_broadcast_metrics_queue: queue.SimpleQueue[tuple[str, int, float] | None] = (
+    queue.SimpleQueue()
+)
+_shm_broadcast_metrics_thread: threading.Thread | None = None
+_shm_broadcast_metrics_thread_lock = threading.Lock()
+
+
+def _report_shm_broadcast_wait_metrics(
+    role: str, count: int, wait_seconds: float
+) -> None:
+    """Publish one accumulated batch of blocked shared-memory waits."""
+    global _shm_broadcast_blocked_waits
+    global _shm_broadcast_blocked_wait_seconds
+
+    if _shm_broadcast_blocked_waits is None:
+        try:
+            _shm_broadcast_blocked_waits = Counter(
+                "vllm:shm_broadcast_blocked_waits",
+                "Total shared-memory broadcast waits that blocked.",
+                ["role"],
+            )
+            _shm_broadcast_blocked_wait_seconds = Counter(
+                "vllm:shm_broadcast_blocked_wait_seconds",
+                "Total seconds spent in blocked shared-memory broadcast waits.",
+                ["role"],
+            )
+        except ValueError:
+            _shm_broadcast_blocked_waits = cast(
+                Counter,
+                REGISTRY._names_to_collectors["vllm:shm_broadcast_blocked_waits"],
+            )
+            _shm_broadcast_blocked_wait_seconds = cast(
+                Counter,
+                REGISTRY._names_to_collectors[
+                    "vllm:shm_broadcast_blocked_wait_seconds"
+                ],
+            )
+
+    assert _shm_broadcast_blocked_wait_seconds is not None
+    _shm_broadcast_blocked_waits.labels(role=role).inc(count)
+    _shm_broadcast_blocked_wait_seconds.labels(role=role).inc(wait_seconds)
+
+
+def _shm_broadcast_metrics_loop() -> None:
+    """Export accumulated shared-memory wait metrics on a background thread."""
+    while item := _shm_broadcast_metrics_queue.get():
+        _report_shm_broadcast_wait_metrics(*item)
+
+
+def _start_shm_broadcast_metrics_thread() -> None:
+    """Start the background metrics exporter once per process."""
+    global _shm_broadcast_metrics_thread
+
+    with _shm_broadcast_metrics_thread_lock:
+        if _shm_broadcast_metrics_thread is not None:
+            return
+        _shm_broadcast_metrics_thread = threading.Thread(
+            target=_shm_broadcast_metrics_loop,
+            name="vllm-shm-broadcast-metrics",
+            daemon=True,
+        )
+        _shm_broadcast_metrics_thread.start()
+
+
+class _BatchedShmBroadcastWaitMetrics:
+    """Batch blocked waits for asynchronous metrics export."""
+
+    def __init__(self, role: str) -> None:
+        self._role = role
+        self._count = 0
+        self._wait_seconds = 0.0
+
+    def record(self, wait_seconds: float) -> None:
+        """Accumulate a completed blocked wait without exporting metrics."""
+        self._count += 1
+        self._wait_seconds += wait_seconds
+        if self._count >= _SHM_BROADCAST_METRIC_BATCH_SIZE:
+            self.flush()
+
+    def flush(self) -> None:
+        """Queue the current batch for the background metrics exporter."""
+        if self._count == 0:
+            return
+        _start_shm_broadcast_metrics_thread()
+        _shm_broadcast_metrics_queue.put((self._role, self._count, self._wait_seconds))
+        self._count = 0
+        self._wait_seconds = 0.0
+
+
+def _positive_ms_env(name: str) -> float:
+    """Read a millisecond-valued env tunable as seconds.
+
+    Args:
+        name: Name of the ``vllm.envs`` variable to read.
+
+    Returns:
+        The value converted to seconds.
+
+    Raises:
+        ValueError: If the value is not finite and positive.
+    """
+    ms = float(getattr(envs, name))
+    if not math.isfinite(ms) or ms <= 0:
+        raise ValueError(f"{name} must be a finite positive number, got {ms}")
+    return ms / 1000.0
+
+
+class _AdaptiveSpinGrace:
+    """Adaptive spin-grace policy: how long to busy-loop before parking.
+
+    An EMA of observed inter-event intervals (``T_ema``) sets the grace via
+    ``grace = clamp(B * B / max(T_ema, eps), MIN, MAX)`` with ``T_ema``
+    seeded at the pivot ``B``. Faster traffic lengthens the spin toward
+    ``MAX`` (arrivals become near-certain within the grace); slower traffic
+    parks within ``MIN``. Monotonically decreasing in ``T_ema``, so slower
+    traffic never increases spin, and the grace is bounded regardless of
+    estimate staleness.
+
+    ``fixed_s`` pins the grace and disables training (a float pin restores
+    historical fixed-grace behavior).
+    """
+
+    def __init__(self, fixed_s: float | None = None):
+        """Build the policy from the ``VLLM_SHM_BROADCAST_ADAPTIVE_*`` env.
+
+        Args:
+            fixed_s: Pins the grace to this many seconds and disables
+                training; ``None`` selects the adaptive policy.
+
+        Raises:
+            ValueError: If ``fixed_s`` or any adaptive tunable is out of
+                range.
+        """
+        if fixed_s is not None and (not math.isfinite(fixed_s) or fixed_s < 0):
+            raise ValueError(
+                "busy_loop_s must be a finite non-negative number, got {value}".format(
+                    value=fixed_s
+                )
+            )
+        if fixed_s is not None:
+            self.mode = "fixed"
+            self.fixed_s = fixed_s
+            return
+        self.mode = "adaptive"
+        self.fixed_s = 0.0
+        self.min_s = _positive_ms_env("VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS")
+        self.max_s = _positive_ms_env("VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS")
+        self.budget_s = _positive_ms_env("VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS")
+        self.alpha = float(envs.VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA)
+        if not math.isfinite(self.alpha) or not 0.0 < self.alpha <= 1.0:
+            raise ValueError(
+                "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA must be in "
+                "(0, 1], got {alpha}".format(alpha=self.alpha)
+            )
+        if self.min_s > self.max_s:
+            raise ValueError(
+                "VLLM_SHM_BROADCAST_ADAPTIVE_MIN_GRACE_MS must not "
+                "exceed VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS"
+            )
+        # Seed the interval EMA at the pivot; eps keeps the divide
+        # well-defined for zero-length intervals (back-to-back burst reads).
+        self._interval_ema_s = self.budget_s
+        self._interval_ema_eps_s = 1e-9
+
+    def current(self) -> float:
+        """Return the current spin grace in seconds.
+
+        Returns:
+            Fixed grace, or the bounded grace derived from the interval EMA.
+        """
+        if self.mode == "fixed":
+            return self.fixed_s
+        t = max(self._interval_ema_s, self._interval_ema_eps_s)
+        return min(self.max_s, max(self.min_s, self.budget_s**2 / t))
+
+    def train(self, interval_s: float) -> None:
+        """Fold one observed inter-event interval into the grace policy.
+
+        Args:
+            interval_s: Seconds between consecutive observed events.
+        """
+        if self.mode != "adaptive":
+            return
+        a = self.alpha
+        self._interval_ema_s = (1 - a) * self._interval_ema_s + a * interval_s
 
 
 class SpinCondition:
@@ -132,16 +403,28 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 1,
+        busy_loop_s: float | None = None,
     ):
+        """Build one side of the condition and its notification sockets.
+
+        Args:
+            is_reader: Whether this process waits on the buffer (reader) or
+                publishes notifications (writer).
+            context: ZMQ context used for the notify and cancel sockets.
+            notify_address: Address the writer binds and readers subscribe
+                to for write notifications.
+            busy_loop_s: Pins the reader spin grace to a fixed number of
+                seconds. ``None`` uses the adaptive policy.
+        """
         self.is_reader = is_reader
+        self._grace = _AdaptiveSpinGrace(fixed_s=busy_loop_s if is_reader else 0.0)
 
         if is_reader:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
 
             # Time to keep busy-looping on the shm buffer before going idle
-            self.busy_loop_s = busy_loop_s
+            self.busy_loop_s: float = self._grace.current()
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)
@@ -165,17 +448,25 @@ class SpinCondition:
             self.poller.register(self.read_cancel_socket, zmq.POLLIN)
             self.poller.register(self.local_notify_socket, zmq.POLLIN)
         else:
-            # Writer side publishes write notifications. Keep the default high
-            # water mark: the readers' CONFLATE already collapses a burst of
-            # pings into one. A PUB drops a message once its pipe looks full,
-            # and zmq refreshes that view only when the socket processes the
-            # subscriber's activation command, which a send does at most once
-            # per ~3M CPU-counter ticks (~1 ms on x86, ~3 ms on aarch64). With
-            # a high water mark of 1, a ping sent that soon after the previous
-            # one is dropped even though the reader already consumed the
-            # previous one, and a reader that parked in between sleeps until
-            # SHM_READER_RECHECK_INTERVAL_MS.
-            self.local_notify_socket: zmq.Socket = context.socket(PUB)  # type: ignore
+            # Writer side publishes write notifications. A dropped ping leaves a
+            # parked reader asleep until SHM_READER_RECHECK_INTERVAL_MS, so the
+            # socket must never drop one:
+            # - No high water mark. A PUB drops a message once its pipe looks
+            #   full, and zmq refreshes that view only when the socket processes
+            #   the pipe's activation commands, which a send does at most once
+            #   per ~3M CPU-counter ticks (~1 ms on x86, ~3 ms on aarch64) and
+            #   only every (hwm + 1) / 2 drained messages. Any finite limit can
+            #   therefore drop a ping the reader would have consumed. The queue
+            #   stays bounded: the readers' CONFLATE collapses pings, the I/O
+            #   thread drains the pipe, and a stalled reader stops acknowledging
+            #   ring blocks, which blocks the writer after max_chunks writes.
+            # - XPUB, so wait_for_readers() can wait until every reader's
+            #   subscription is known; a PUB drops pings for subscriptions it
+            #   has not processed yet. Verbose, because every reader sends the
+            #   same empty subscription.
+            self.local_notify_socket: zmq.Socket = context.socket(XPUB)  # type: ignore
+            self.local_notify_socket.setsockopt(zmq.SNDHWM, 0)
+            self.local_notify_socket.setsockopt(XPUB_VERBOSE, True)
             self.local_notify_socket.bind(notify_address)
 
             self.last_read = 0
@@ -184,10 +475,52 @@ class SpinCondition:
             self.write_cancel_socket = None
             self.poller = None
 
+    def _train_interval_ema(self, interval_s: float) -> None:
+        """Fold one observed inter-read interval into the grace policy.
+
+        Args:
+            interval_s: Seconds since the preceding completed read.
+        """
+        self._grace.train(interval_s)
+        self.busy_loop_s = self._grace.current()
+
     def record_read(self):
-        self.last_read = time.monotonic()
+        """Mark a completed read and retrain the adaptive grace on its interval."""
+        now = time.monotonic()
+        if self._grace.mode == "adaptive":
+            self._train_interval_ema(now - self.last_read)
+        self.last_read = now
+
+    def shallow_window_s(self, now: float) -> float:
+        """Seconds of the coming park to spend in shallow sliced sleeps.
+
+        While the next write is likely, a parked reader sleeps in short futex
+        slices so the idle governor keeps its core in a shallow state. The
+        window lasts until twice the observed interval between reads after
+        the last read, at most ``_SHALLOW_MAX_S``; after it the reader sleeps
+        until woken.
+        """
+        if _SHALLOW_SLICE_S <= 0 or self._grace.mode != "adaptive":
+            return 0.0
+        horizon = min(_SHALLOW_MAX_S, 2 * self._grace._interval_ema_s)
+        return max(0.0, self.last_read + horizon - now)
+
+    def remaining_grace_s(self, now: float | None = None) -> float:
+        """Return spin grace left before an idle reader should park.
+
+        Args:
+            now: Monotonic timestamp to evaluate, or the current time.
+
+        Returns:
+            Remaining spin grace in seconds, clamped to zero.
+        """
+        if now is None:
+            now = time.monotonic()
+        remaining = self.last_read + self.busy_loop_s - now
+        return remaining if remaining > 0.0 else 0.0
 
     def cancel(self):
+        """Wake a waiting reader in this process so it can shut down."""
         # Sends cancellation ping that will cause the reader to wake up.
         # This is done from a monitor thread in the same process as the reader.
         if self.is_reader:
@@ -205,24 +538,42 @@ class SpinCondition:
         """
         assert self.is_reader, "Only readers can wait"
 
-        current_time = time.monotonic()
-        if current_time <= self.last_read + self.busy_loop_s:
+        if self.remaining_grace_s() > 0.0:
             sched_yield()
         else:
-            events = dict(self.poller.poll(timeout=timeout_ms))
+            self.poll_notify(timeout_ms)
 
-            if self.read_cancel_socket in events:
-                logger.debug("Poller received cancel event")
-            elif self.local_notify_socket in events:
-                logger.debug("Poller received notify event")
-                # Since zmq.CONFLATE is set, there will only be one notification
-                # to read from the socket
-                self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
-            else:
-                logger.debug("Poller timed out")
+    def poll_notify(self, timeout_ms: int | None = None) -> None:
+        """Park until a write notification, a cancel, or ``timeout_ms``.
+
+        Args:
+            timeout_ms: Longest time to wait; ``None`` waits indefinitely.
+        """
+        assert self.is_reader, "Only readers can wait"
+        events = dict(self.poller.poll(timeout=timeout_ms))
+
+        if self.read_cancel_socket in events:
+            logger.debug("Poller received cancel event")
+        elif self.local_notify_socket in events:
+            logger.debug("Poller received notify event")
+            # Since zmq.CONFLATE is set, there will only be one notification
+            # to read from the socket
+            self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
+        else:
+            logger.debug("Poller timed out")
+
+    def wait_for_readers(self, n_reader: int) -> None:
+        """Block until ``n_reader`` readers have subscribed to notifications.
+
+        Args:
+            n_reader: Number of local readers that connect to this writer.
+        """
+        assert not self.is_reader, "Only writers wait for readers"
+        for _ in range(n_reader):
+            self.local_notify_socket.recv()
 
     def notify(self):
-        """Notifies all readers to wake up"""
+        """Notify all readers that the writer published new data."""
         assert not self.is_reader, "Only writers can notify"
         self.local_notify_socket.send(b"\x00")
 
@@ -264,6 +615,36 @@ def check_shm_free_space(
     )
 
 
+class _ShmWindow:
+    """A bounded memoryview slice of the ring buffer, released on exit.
+
+    Replaces a ``@contextmanager`` accessor on the hot path: a direct
+    ``__enter__``/``__exit__`` avoids allocating a generator and the two
+    resumptions ``contextlib`` pays per acquire. Releasing the slice on
+    exit is required so the underlying ``SharedMemory`` can be closed.
+    """
+
+    __slots__ = ("_buf", "_start", "_end", "_view")
+
+    def __init__(self, buf: memoryview, start: int, end: int) -> None:
+        self._buf = buf
+        self._start = start
+        self._end = end
+        self._view: memoryview | None = None
+
+    def __enter__(self) -> memoryview:
+        view = self._buf[self._start : self._end]
+        self._view = view
+        return view
+
+    def __exit__(self, *exc: object) -> Literal[False]:
+        view = self._view
+        if view is not None:
+            view.release()
+            self._view = None
+        return False
+
+
 class ShmRingBuffer:
     def __init__(
         self,
@@ -296,6 +677,14 @@ class ShmRingBuffer:
         | written_flag | reader0_flag | reader1_flag | ... | readerN_flag |
         +--------------+--------------+--------------+-----+--------------+
 
+        After the metadata, 2 x n_reader bytes hold one parked flag per reader
+        (set while the reader waits on its notification socket) and then one
+        flag per reader that says it has a native full fence. See
+        MessageQueue._park for the protocol. After the futex words and the wake
+        mode byte sits a 4-byte "imminent" generation the writer bumps in
+        announce(); it only nudges a reader to take a bounded expectant spin
+        and never gates whether a block is readable.
+
         The state of metadata is as follows:
 
         (case 1) 0???...???: the block is not written yet, cannot read, can write
@@ -325,9 +714,18 @@ class ShmRingBuffer:
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
         self.max_chunks = max_chunks
-        self.total_bytes_of_buffer = (
-            self.max_chunk_bytes + self.metadata_size
-        ) * self.max_chunks
+        self.park_offset = (self.max_chunk_bytes + self.metadata_size) * self.max_chunks
+        # 4-byte futex words, one per reader, after the park and capability
+        # flags (the shared mapping is page aligned), then one byte where the
+        # writer publishes the wake mode it chose.
+        self.futex_offset = (self.park_offset + 2 * n_reader + 3) & ~3
+        self.mode_offset = self.futex_offset + 4 * self.n_reader
+        # Advisory "a write is imminent" generation, bumped by the writer in
+        # announce(). Readers compare it to decide whether to take a bounded
+        # expectant spin instead of parking. Never gates slot visibility, so a
+        # torn or stale read is at worst a missed spin; see MessageQueue.announce.
+        self.imminent_offset = (self.mode_offset + 1 + 3) & ~3
+        self.total_bytes_of_buffer = self.imminent_offset + 4
         self.data_offset = 0
         self.metadata_offset = self.max_chunk_bytes * self.max_chunks
 
@@ -386,21 +784,55 @@ class ShmRingBuffer:
             if self.is_creator:
                 self.shared_memory.unlink()
 
-    @contextmanager
-    def get_data(self, current_idx: int):
+    def get_data(self, current_idx: int) -> "_ShmWindow":
         start = self.data_offset + current_idx * self.max_chunk_bytes
-        end = start + self.max_chunk_bytes
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start:end] as buf:
-            yield buf
+        return _ShmWindow(self.shared_memory.buf, start, start + self.max_chunk_bytes)
 
-    @contextmanager
-    def get_metadata(self, current_idx: int):
+    def get_metadata(self, current_idx: int) -> "_ShmWindow":
         start = self.metadata_offset + current_idx * self.metadata_size
-        end = start + self.metadata_size
         assert self.shared_memory.buf is not None, "Buffer has been closed"
-        with self.shared_memory.buf[start:end] as buf:
-            yield buf
+        return _ShmWindow(self.shared_memory.buf, start, start + self.metadata_size)
+
+    def get_park_flags(self) -> "_ShmWindow":
+        """The parked flags followed by the full-fence capability flags."""
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        return _ShmWindow(
+            self.shared_memory.buf,
+            self.park_offset,
+            self.park_offset + 2 * self.n_reader,
+        )
+
+    def get_futex_words(self) -> "_ShmWindow":
+        """The readers' futex park words (``4 * n_reader`` bytes)."""
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        return _ShmWindow(
+            self.shared_memory.buf,
+            self.futex_offset,
+            self.futex_offset + 4 * self.n_reader,
+        )
+
+    def set_wake_mode(self, mode: int) -> None:
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        self.shared_memory.buf[self.mode_offset] = mode
+
+    def wake_mode(self) -> int:
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        return self.shared_memory.buf[self.mode_offset]
+
+    def imminent_gen(self) -> int:
+        """Read the advisory imminent-generation counter."""
+        assert self.shared_memory.buf is not None, "Buffer has been closed"
+        o = self.imminent_offset
+        return int.from_bytes(self.shared_memory.buf[o : o + 4], "little")
+
+    def bump_imminent(self) -> None:
+        """Advance the imminent-generation counter (writer only, advisory)."""
+        assert self.shared_memory.buf is not None, "Buffer has not been closed"
+        o = self.imminent_offset
+        buf = self.shared_memory.buf
+        nxt = int.from_bytes(buf[o : o + 4], "little") + 1
+        buf[o : o + 4] = nxt.to_bytes(4, "little")
 
 
 def _rebuild_tensor(buf: Any, shape: tuple[int, ...], dtype_str: str) -> torch.Tensor:
@@ -479,6 +911,8 @@ class Handle:
 
 
 class MessageQueue:
+    _wait_metrics: _BatchedShmBroadcastWaitMetrics | None
+
     def __init__(
         self,
         n_reader,  # number of all readers
@@ -490,6 +924,18 @@ class MessageQueue:
         max_chunks: int = 10,
         connect_ip: str | None = None,
     ):
+        """Create the ring buffer and the sockets its readers connect to.
+
+        Args:
+            n_reader: Total number of readers, local and remote.
+            n_local_reader: Readers served through shared memory.
+            local_reader_ranks: Ranks of the local readers; defaults to
+                ``range(n_local_reader)``.
+            max_chunk_bytes: Size of one ring-buffer block.
+            max_chunks: Number of blocks in the ring buffer.
+            connect_ip: Address remote readers connect to; probed when
+                omitted.
+        """
         if local_reader_ranks is None:
             local_reader_ranks = list(range(n_local_reader))
         else:
@@ -514,6 +960,10 @@ class MessageQueue:
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
+            # Block instead of silently dropping a payload when a reader's pipe
+            # looks full: the reader has already released the ring slot and
+            # waits for this payload with no recheck.
+            self.local_socket.setsockopt(zmq.XPUB_NODROP, True)
             local_subscribe_addr = get_open_zmq_ipc_path()
             logger.debug("Binding to %s", local_subscribe_addr)
             self.local_socket.bind(local_subscribe_addr)
@@ -525,6 +975,11 @@ class MessageQueue:
             self._spin_condition = SpinCondition(
                 is_reader=False, context=context, notify_address=local_notify_addr
             )
+            self._wait_metrics = _BatchedShmBroadcastWaitMetrics("writer")
+            self._write_grace = _AdaptiveSpinGrace()
+            self._write_park_max_s = _positive_ms_env(
+                "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS"
+            )
         else:
             self.buffer = None  # type: ignore
             local_subscribe_addr = None
@@ -532,6 +987,7 @@ class MessageQueue:
             self.current_idx = -1
             local_notify_addr = None
             self._spin_condition = None  # type: ignore
+            self._wait_metrics = None
 
         remote_addr_ipv6 = False
         if n_remote_reader > 0:
@@ -541,6 +997,9 @@ class MessageQueue:
                 connect_ip = get_ip()
             self.remote_socket = context.socket(XPUB)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
+            # Block instead of silently dropping a message when a remote
+            # reader's pipe looks full; nothing else would ever resend it.
+            self.remote_socket.setsockopt(zmq.XPUB_NODROP, True)
             if is_valid_ipv6_address(connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
                 remote_addr_ipv6 = True
@@ -554,6 +1013,13 @@ class MessageQueue:
             self.remote_socket = None
 
         self._is_writer = True
+        # Set by wait_until_ready from the capabilities of every local reader.
+        self._wake_mode = _WAKE_PING
+        # Last observed advisory imminent-generation (writer: unused; kept so
+        # the attribute always exists).
+        self._imminent_seen = 0
+        self._cancel_sender: zmq.Socket | None = None
+        self._data_poller: zmq.Poller | None = None
         self._is_local_reader = False
         self.local_reader_rank = -1
         # rank does not matter for remote readers
@@ -578,6 +1044,7 @@ class MessageQueue:
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
+        self._imminent_seen = 0
 
         context = Context()
 
@@ -588,6 +1055,17 @@ class MessageQueue:
             self.local_reader_rank = handle.local_reader_ranks.index(rank)
             self._is_local_reader = True
             self._is_remote_reader = False
+            # Tell the writer whether this reader can take part in the
+            # parked-flag handshake. The writer reads it after this reader's
+            # subscriptions arrive, which the kernel orders after this store.
+            with self.buffer.get_park_flags() as flags:
+                flags[self.buffer.n_reader + self.local_reader_rank] = (
+                    _CAP_FUTEX if _HAS_FUTEX else _CAP_FENCE if _full_fence else 0
+                )
+            self._wake_mode = _WAKE_PING
+            # Snapshot the advisory counter at attach so a bump that predates
+            # this reader does not trigger a spurious expectant spin.
+            self._imminent_seen = self.buffer.imminent_gen()
 
             self.local_socket = context.socket(SUB)
             self.local_socket.setsockopt_string(SUBSCRIBE, "")
@@ -599,6 +1077,13 @@ class MessageQueue:
             assert isinstance(handle.local_notify_addr, str)
             self._spin_condition = SpinCondition(
                 is_reader=True, context=context, notify_address=handle.local_notify_addr
+            )
+            self._wait_metrics = _BatchedShmBroadcastWaitMetrics("reader")
+            self._cancel_sender = None
+            self._data_poller = zmq.Poller()
+            self._data_poller.register(self.local_socket, zmq.POLLIN)
+            self._data_poller.register(
+                self._spin_condition.read_cancel_socket, zmq.POLLIN
             )
         else:
             self.buffer = None  # type: ignore
@@ -617,6 +1102,16 @@ class MessageQueue:
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
             self._spin_condition = None  # type: ignore
+            # shutdown() wakes a remote reader blocked on remote_socket.
+            cancel_path = get_open_zmq_inproc_path()
+            self._cancel_sender = context.socket(zmq.PAIR)
+            self._cancel_sender.bind(cancel_path)
+            cancel_receiver = context.socket(zmq.PAIR)
+            cancel_receiver.connect(cancel_path)
+            self._data_poller = zmq.Poller()
+            self._data_poller.register(self.remote_socket, zmq.POLLIN)
+            self._data_poller.register(cancel_receiver, zmq.POLLIN)
+            self._wait_metrics = None
 
         self.shutting_down = False
         return self
@@ -633,6 +1128,18 @@ class MessageQueue:
                 # wait for subscription messages from all local readers
                 self.local_socket.recv()
             if self.n_local_reader > 0:
+                # a write notification sent before the PUB knows a reader's
+                # subscription is dropped, and that reader would sleep until
+                # the recheck interval
+                self._spin_condition.wait_for_readers(self.n_local_reader)
+                with self.buffer.get_park_flags() as flags:
+                    caps = flags[self.buffer.n_reader :]
+                    if _HAS_FUTEX and all(c == _CAP_FUTEX for c in caps):
+                        self._wake_mode = _WAKE_FUTEX
+                    elif _full_fence is not None and all(caps):
+                        self._wake_mode = _WAKE_PARKED_PING
+                # Readers read the mode after READY, which follows this store.
+                self.buffer.set_wake_mode(self._wake_mode)
                 # send a message to all local readers
                 # to make sure the publish channel is working
                 self.local_socket.send(b"READY")
@@ -649,6 +1156,7 @@ class MessageQueue:
             # wait for the writer to send a message
             recv = self.local_socket.recv()
             assert recv == b"READY"
+            self._wake_mode = self.buffer.wake_mode()
         elif self._is_remote_reader:
             # wait for the writer to send a message
             recv = self.remote_socket.recv()
@@ -658,14 +1166,43 @@ class MessageQueue:
         """If this is an idle reader, wakes it up so it can clean up and shut
         down"""
         self.shutting_down = True
+        if self._wait_metrics is not None:
+            self._wait_metrics.flush()
         if self._spin_condition is not None:
             self._spin_condition.cancel()
+            if self._is_local_reader and self._wake_mode == _WAKE_FUTEX:
+                # A futex-parked reader re-checks shutting_down after waking.
+                with self.buffer.get_futex_words() as words:
+                    i = self.local_reader_rank
+                    wake_parked(words[4 * i : 4 * i + 4], 1)
+        if self._cancel_sender is not None:
+            self._cancel_sender.send(b"\x00")
 
     @contextmanager
     def acquire_write(self, timeout: float | None = None):
+        """Yield the next writable block, waiting for readers to drain it.
+
+        The writer spins within its adaptive grace, then parks in steps
+        doubling up to ``VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS``.
+
+        Args:
+            timeout: Seconds to wait for a free block; ``None`` waits
+                indefinitely.
+
+        Yields:
+            memoryview: The block the caller writes its payload into.
+
+        Raises:
+            TimeoutError: If no block frees within ``timeout``.
+        """
         assert self._is_writer, "Only writers can acquire write"
+        wait_metrics = self._wait_metrics
+        assert wait_metrics is not None
         start_time = time.monotonic()
         n_warning = 1
+        wait_start = time.monotonic()
+        blocked_wait_start: float | None = None
+        park_s = 0.0
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
 
@@ -675,21 +1212,47 @@ class MessageQueue:
                     written_flag = metadata_buffer[0]
                     return not (written_flag and read_count != self.buffer.n_reader)
 
-                if SPINLOOP_EXT_ENABLED and not check():
-                    spinloop(metadata_buffer, check, timeout=SPINLOOP_TIMEOUT_SECONDS)
+                free_now = check()
+                if not free_now and blocked_wait_start is None:
+                    blocked_wait_start = time.monotonic()
 
-                if not check():
-                    # this block is written and not read by all readers
-                    # for writers, `self.current_idx` is the next block to write
-                    # if this block is not ready to write,
-                    # we need to wait until it is read by all readers
+                if SPINLOOP_EXT_ENABLED and not free_now:
+                    # The native extension treats a timeout <= 1e-9 as
+                    # unlimited, so skip the spin once the budget is gone.
+                    now = time.monotonic()
+                    native_timeout_s = min(
+                        SPINLOOP_TIMEOUT_SECONDS,
+                        self._write_grace.current() - (now - wait_start),
+                    )
+                    if timeout is not None:
+                        native_timeout_s = min(
+                            native_timeout_s,
+                            timeout - (now - start_time),
+                        )
+                    if native_timeout_s > 1e-9:
+                        spinloop(
+                            metadata_buffer,
+                            check,
+                            timeout=native_timeout_s,
+                        )
 
-                    # Release the processor to other threads
-                    sched_yield()
+                if not free_now and not check():
+                    # Spin only while within the adaptive grace; once it
+                    # expires, poll in doubling sleep steps (capped at
+                    # VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS).
+                    if time.monotonic() - wait_start < self._write_grace.current():
+                        sched_yield()
+                    else:
+                        park_s = min(
+                            park_s * 2 or _WRITE_PARK_MIN_S, self._write_park_max_s
+                        )
+                        time.sleep(park_s)
 
                     # if we time out, raise an exception
                     elapsed = time.monotonic() - start_time
                     if timeout is not None and elapsed > timeout:
+                        assert blocked_wait_start is not None
+                        wait_metrics.record(time.monotonic() - blocked_wait_start)
                         raise TimeoutError
 
                     # if we wait for a long time, log a message
@@ -706,6 +1269,9 @@ class MessageQueue:
 
                 # mark the block as not written
                 metadata_buffer[0] = 0
+                block_wait_s = time.monotonic() - wait_start
+                if blocked_wait_start is not None:
+                    wait_metrics.record(time.monotonic() - blocked_wait_start)
                 # let caller write to the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
                     yield buf
@@ -726,6 +1292,13 @@ class MessageQueue:
                 memory_fence()
                 # mark the block as written
                 metadata_buffer[0] = 1
+                # Train the writer grace on the observed block-wait interval:
+                # fast reader turnover keeps the writer spinning (cheap, and
+                # the block is near-certain to free soon); slow readers park
+                # the writer within the grace floor. Measured up to the point
+                # the block became available, so the caller's payload copy
+                # does not inflate the interval.
+                self._write_grace.train(block_wait_s)
                 # Memory fence ensures the write is visible to readers on other cores
                 # before we proceed. Without this, readers may spin indefinitely
                 # waiting for a write that's stuck in our CPU's store buffer.
@@ -780,10 +1353,30 @@ class MessageQueue:
         timeout: float | None = None,
         indefinite: bool = False,
     ):
+        """Yield the next unread block once the writer has published it.
+
+        The reader spins within the remaining spin grace, then parks on the
+        notification socket.
+
+        Args:
+            timeout: Seconds to wait for a written block; ``None`` waits
+                indefinitely.
+            indefinite: Suppress the periodic long-wait warning for waits
+                that are expected to be long.
+
+        Yields:
+            memoryview: The block the caller reads its payload from.
+
+        Raises:
+            TimeoutError: If no block is written within ``timeout``.
+        """
         assert self._is_local_reader, "Only readers can acquire read"
+        wait_metrics = self._wait_metrics
+        assert wait_metrics is not None
         read_timeout = self.ReadTimeoutWithWarnings(
             timeout=timeout, should_warn=not indefinite
         )
+        blocked_wait_start: float | None = None
         with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
             while True:
 
@@ -793,34 +1386,65 @@ class MessageQueue:
                     written_flag = metadata_buffer[0]
                     return not (not written_flag or read_flag)
 
-                if SPINLOOP_EXT_ENABLED and not check():
-                    spinloop(
-                        metadata_buffer[0 : self.local_reader_rank + 1],
-                        check,
-                        timeout=SPINLOOP_TIMEOUT_SECONDS,
-                    )
+                ready_now = check()
+                if not ready_now and blocked_wait_start is None:
+                    blocked_wait_start = time.monotonic()
 
-                if not check():
+                if not ready_now and not check():
                     # this block is either
                     # (1) not written
                     # (2) already read by this reader
 
-                    # for readers, `self.current_idx` is the next block to read
-                    # if this block is not ready,
-                    # we need to wait until it is written
-                    self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
+                    # for readers, `self.current_idx` is the next block to
+                    # read; if this block is not ready, we need to wait
+                    # until it is written. The native spin wait runs only
+                    # for the remaining spin grace (capped by the ext
+                    # ceiling) and, on success, skips parking.
+                    if SPINLOOP_EXT_ENABLED:
+                        budget_s = self._spin_condition.remaining_grace_s()
+                        if _ANNOUNCE_MAX_S > 0.0:
+                            # A fresh announce() buys a bounded expectant spin
+                            # so the imminent write is caught awake, off the
+                            # park/wake critical path. Advisory only: the slot
+                            # is still yielded solely by check() below.
+                            gen = self.buffer.imminent_gen()
+                            if gen != self._imminent_seen:
+                                self._imminent_seen = gen
+                                if budget_s < _ANNOUNCE_MAX_S:
+                                    budget_s = _ANNOUNCE_MAX_S
+                        native_timeout_s = min(budget_s, SPINLOOP_TIMEOUT_SECONDS)
+                        if native_timeout_s > 0.0:
+                            spinloop(
+                                metadata_buffer[0 : self.local_reader_rank + 1],
+                                check,
+                                timeout=native_timeout_s,
+                            )
 
-                    if self.shutting_down:
-                        raise RuntimeError("cancelled")
+                    if not check():
+                        try:
+                            timeout_ms = read_timeout.timeout_ms()
+                        except TimeoutError:
+                            assert blocked_wait_start is not None
+                            wait_metrics.record(time.monotonic() - blocked_wait_start)
+                            raise
+                        self._park(check, timeout_ms)
 
-                    # if we wait for a long time, log a message
-                    if read_timeout.should_warn():
-                        logger.info(
-                            LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL
-                        )
+                        if self.shutting_down:
+                            assert blocked_wait_start is not None
+                            wait_metrics.record(time.monotonic() - blocked_wait_start)
+                            raise RuntimeError("cancelled")
 
-                    continue
+                        # if we wait for a long time, log a message
+                        if read_timeout.should_warn():
+                            logger.info(
+                                LONG_WAIT_TIME_LOG_MSG,
+                                VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            )
+
+                        continue
                 # found a block that is not read by this reader
+                if blocked_wait_start is not None:
+                    wait_metrics.record(time.monotonic() - blocked_wait_start)
                 # let caller read from the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
                     try:
@@ -838,7 +1462,12 @@ class MessageQueue:
                 break
 
     def enqueue(self, obj, timeout: float | None = None):
-        """Write to message queue with optional timeout (in seconds)"""
+        """Write an object to the queue.
+
+        Args:
+            obj: Pickle-serializable object to broadcast.
+            timeout: Seconds to wait for a free local buffer block.
+        """
         assert self._is_writer, "Only writers can enqueue"
         all_buffers: list[SizedBuffer] = [b""]
         total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size
@@ -891,7 +1520,7 @@ class MessageQueue:
                         buf[offset:buf_offset] = to_bytes_big(buf_len, 4)
                         buf[buf_offset : (offset := buf_offset + buf_len)] = buffer
 
-            self._spin_condition.notify()
+            self._notify_readers()
 
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
@@ -914,6 +1543,96 @@ class MessageQueue:
             return bool(self.remote_socket.poll(timeout=0))
         raise RuntimeError("Only readers can check for messages")
 
+    def announce(self) -> None:
+        """Hint that a message will be enqueued very soon.
+
+        The producer calls this from its pre-send work, a short time before
+        ``enqueue``. It wakes any parked local reader and marks the next block
+        imminent so the reader takes a bounded expectant spin instead of
+        re-parking, overlapping the wake with the rest of the producer's work
+        rather than paying it on the critical path of the real write.
+
+        Purely advisory: it never affects whether a block is readable, so a
+        lost or stale hint only costs the extra spin, never correctness. A
+        no-op unless ``VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS`` is set, keeping the
+        default path identical to a build without the feature.
+        """
+        if _ANNOUNCE_MAX_S <= 0.0 or not self._is_writer:
+            return
+        if self.n_local_reader <= 0:
+            return
+        self.buffer.bump_imminent()
+        self._notify_readers()
+
+    def _notify_readers(self) -> None:
+        """Wake the local readers after a write.
+
+        Once every local reader can fence, wake only a parked one: the written
+        flag store, a fence and the parked-flag load pair with the reader's
+        flag store, fence and slot re-check in ``_park``, so either the writer
+        sees the flag or the reader sees the slot. With futexes the writer
+        wakes a parked reader directly; otherwise it pings the notify socket.
+        """
+        if self._wake_mode == _WAKE_FUTEX:
+            with self.buffer.get_futex_words() as words:
+                wake_parked(words, self.buffer.n_reader)
+            return
+        if self._wake_mode == _WAKE_PARKED_PING:
+            assert _full_fence is not None
+            _full_fence()
+            with self.buffer.get_park_flags() as flags:
+                if not any(flags[: self.buffer.n_reader]):
+                    return
+        self._spin_condition.notify()
+
+    def _park(self, ready: Callable[[], bool], timeout_ms: int) -> None:
+        """Wait for a wake-up unless ``ready()`` turns true meanwhile.
+
+        Within the spin grace this only yields. Otherwise the reader sets its
+        parked flag, fences, re-checks, and sleeps only if still not ready, so
+        a writer that skips the wake-up because no flag was set has already
+        published the slot this re-check reads. The grace is read once: a
+        second read could expire between the two and sleep without the flag.
+
+        Args:
+            ready: Re-reads whether this reader's next block is written.
+            timeout_ms: Longest time to sleep.
+        """
+        cond = self._spin_condition
+        now = time.monotonic()
+        if cond.remaining_grace_s(now) > 0.0:
+            sched_yield()
+            return
+        if self._wake_mode == _WAKE_FUTEX:
+            i = self.local_reader_rank
+            with self.buffer.get_futex_words() as words:
+                park_prepare(words, i)
+                if self.shutting_down or ready():
+                    park_clear(words, i)
+                else:
+                    # The futex compares the word in the kernel, so a wake
+                    # after the re-check is never lost.
+                    park_wait(
+                        words,
+                        i,
+                        timeout_ms / 1000,
+                        cond.shallow_window_s(now),
+                        _SHALLOW_SLICE_S,
+                    )
+            return
+        if self._wake_mode == _WAKE_PING:
+            cond.poll_notify(timeout_ms)
+            return
+        assert _full_fence is not None
+        with self.buffer.get_park_flags() as flags:
+            flags[self.local_reader_rank] = 1
+            _full_fence()
+            try:
+                if not ready():
+                    cond.poll_notify(timeout_ms)
+            finally:
+                flags[self.local_reader_rank] = 0
+
     def wait_for_message(self, timeout_ms: int) -> None:
         """Wait at most ``timeout_ms`` for a message, without consuming one.
 
@@ -922,20 +1641,77 @@ class MessageQueue:
         early, so callers check ``ready()`` again afterwards.
         """
         if self._is_local_reader:
-            self._spin_condition.wait(timeout_ms=timeout_ms)
+            self._park(self.ready, timeout_ms)
         elif self._is_remote_reader:
-            self.remote_socket.poll(timeout=timeout_ms)
+            assert self._data_poller is not None
+            self._data_poller.poll(timeout=timeout_ms)
         else:
             raise RuntimeError("Only readers can wait for messages")
         if self.shutting_down:
             raise RuntimeError("cancelled")
+
+    @classmethod
+    def wait_many(cls, queues: Sequence["MessageQueue"], timeout_ms: int) -> None:
+        """Wait for a wake-up on any of several queues the caller reads.
+
+        One ``FUTEX_WAITV`` replaces the per-queue parks a fan-in reader
+        (the executor waiting for worker replies) would otherwise take in
+        slices. Only queues whose reader word says a sleeper exists are
+        watched, so an unread reply that nobody is parked for still returns
+        from the wait immediately; the caller re-checks ``ready()`` either
+        way. Falls back to ``wait_for_message`` on the first queue where the
+        kernel has no ``FUTEX_WAITV``, the writer cannot futex-wake, or a
+        reader is still in its spin window.
+
+        Args:
+            queues: Queues this process reads; at least one.
+            timeout_ms: Longest time to wait.
+        """
+        global _WAITV_SUPPORTED
+        if not _WAITV_SUPPORTED or not all(isinstance(q, MessageQueue) for q in queues):
+            # Tests and embedders hand in stub queues; defer to their wait.
+            queues[0].wait_for_message(timeout_ms)
+            return
+        bufs: list[memoryview] = []
+        idxs: list[int] = []
+        with contextlib.ExitStack() as stack:
+            for q in queues:
+                if not q._is_local_reader or q._wake_mode != _WAKE_FUTEX:
+                    queues[0].wait_for_message(timeout_ms)
+                    return
+                # A non-zero word is the reader's park state in futex mode.
+                words = stack.enter_context(q.buffer.get_futex_words())
+                if words[4 * q.local_reader_rank]:
+                    bufs.append(words)
+                    idxs.append(q.local_reader_rank)
+            if not bufs:
+                return
+            rc = park_wait_any(bufs, idxs, timeout_ms / 1000)
+            if rc < 0:
+                _WAITV_SUPPORTED = False
+                queues[0].wait_for_message(timeout_ms)
+                return
+        for q in queues:
+            if q.shutting_down:
+                raise RuntimeError("cancelled")
 
     def dequeue(
         self,
         timeout: float | None = None,
         indefinite: bool = False,
     ):
-        """Read from message queue with optional timeout (in seconds)"""
+        """Read the next object from the queue.
+
+        Args:
+            timeout: Seconds to wait for an object, or ``None`` indefinitely.
+            indefinite: Suppress periodic long-wait warnings.
+
+        Returns:
+            The next broadcast object.
+
+        Raises:
+            TimeoutError: If no object arrives within ``timeout``.
+        """
         if self._is_local_reader:
             with self.acquire_read(timeout, indefinite) as buf:
                 overflow = buf[0] == 1
@@ -950,18 +1726,32 @@ class MessageQueue:
                         all_buffers.append(buf[buf_offset:offset])
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                obj = self._recv(self.local_socket, timeout)
         elif self._is_remote_reader:
-            obj = MessageQueue.recv(self.remote_socket, timeout)
+            obj = self._recv(self.remote_socket, timeout)
         else:
             raise RuntimeError("Only readers can dequeue")
         return obj
 
-    @staticmethod
-    def recv(socket: zmq.Socket, timeout: float | None) -> Any:
+    def _recv(self, socket: zmq.Socket, timeout: float | None) -> Any:
+        """Receive one object from a data socket, or stop on shutdown.
+
+        Args:
+            socket: ``local_socket`` for an overflow payload, or
+                ``remote_socket`` for a remote reader.
+            timeout: Seconds to wait, or ``None`` indefinitely.
+
+        Raises:
+            TimeoutError: If nothing arrives within ``timeout``.
+            RuntimeError: If ``shutdown()`` cancelled the wait.
+        """
+        assert self._data_poller is not None
         # Ensure non-negative timeout passed to zmq poll.
         timeout_ms = None if timeout is None else max(0, int(timeout * 1000))
-        if not socket.poll(timeout=timeout_ms):
+        events = dict(self._data_poller.poll(timeout=timeout_ms))
+        if socket not in events:
+            if self.shutting_down:
+                raise RuntimeError("cancelled")
             raise TimeoutError
         recv, *recv_oob = socket.recv_multipart(copy=False)
         return pickle.loads(recv, buffers=recv_oob)

@@ -186,7 +186,7 @@ def _gather_responses(
             wait_ms = RESPONSE_WAIT_SLICE_MS
             if left is not None:
                 wait_ms = max(1, min(wait_ms, int(left * 1000)))
-            response_mqs[pending[0]].wait_for_message(wait_ms)
+            MessageQueue.wait_many([response_mqs[index] for index in pending], wait_ms)
     return responses
 
 
@@ -519,6 +519,13 @@ class MultiprocExecutor(Executor):
         )
         if self.is_failed:
             raise RuntimeError("Executor failed.")
+        # Hint the workers that an RPC is imminent before the pre-send work
+        # below (aggregator setup, method pickling, and enqueue's own
+        # serialization). A parked reader that wakes here takes a bounded
+        # expectant spin instead of re-parking, so it is awake when the write
+        # lands. No-op unless VLLM_SHM_BROADCAST_ANNOUNCE_MAX_MS is set, so
+        # this is inert by default. See docs/design/shm_broadcast.md.
+        self.rpc_broadcast_mq.announce()
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
