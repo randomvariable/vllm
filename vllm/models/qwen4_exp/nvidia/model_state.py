@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE and QSA inputs."""
 
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
@@ -134,6 +136,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if isinstance(module, B12xNGramEmbedding)
             and module.requires_disk_preparation
         )
+        self.row_prefetcher = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -169,6 +172,37 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+
+        if envs.VLLM_PLE_PREFETCH and self.disk_embeddings:
+            from b12x.sequence.ple_hash.host import query_row_ids
+
+            from vllm.utils.b12x_row_prefetch import PrefetchTarget, RowPrefetcher
+
+            def target(embedding: B12xNGramEmbedding) -> PrefetchTarget:
+                multipliers = embedding.layer_multipliers.detach().cpu()
+                prime_sizes = embedding.ngram_heads_vocab_sizes.detach().cpu()
+                table_offsets = embedding.ngram_heads_offsets.detach().cpu()
+                return PrefetchTarget(
+                    resolve_table=lambda: embedding.ngram_embedding.disk_table,
+                    row_ids=functools.partial(
+                        query_row_ids,
+                        eos_token_id=embedding.eos_token_id,
+                        max_order=embedding.ngram_size,
+                        multipliers=multipliers.contiguous(),
+                        prime_sizes=prime_sizes.contiguous(),
+                        table_offsets=table_offsets.contiguous(),
+                        heads_per_order=embedding.heads_per_ngram,
+                    ),
+                )
+
+            self.row_prefetcher = RowPrefetcher(
+                tuple(target(e) for e in self.disk_embeddings),
+                history_len=self.disk_embeddings[0].ngram_size - 1,
+                history_pad=self.ngram_eos_token_id,
+                max_num_reqs=self.max_num_reqs,
+                num_speculative_tokens=vllm_config.num_speculative_tokens,
+                device=self.device,
+            )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -485,6 +519,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
             num_sampled,
             num_computed_tokens,
         )
+
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        if self.row_prefetcher is not None:
+            self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
 
     def _prepare_ngram_context(
         self,

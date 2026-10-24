@@ -194,6 +194,20 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        """Start advisory host-side work for the next step's inputs.
+
+        Runs at the end of ``sample_tokens`` after the next step's draft tokens
+        are staged. ``draft_tokens`` is in batch order or ``None``. Must not
+        block on the GPU. No-op by default.
+        """
+        return None
+
     def prepare_draft_attn_metadata(
         self,
         *,

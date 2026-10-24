@@ -2600,6 +2600,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.draft_tokens, input_batch
                 )
 
+        self.model_state.prefetch_next_step(
+            input_batch, self.req_states, draft_tokens_for_next_step
+        )
+
         if boundary_state is not None:
             assert boundary_capture is not None
             boundary_state.capture_attention(
