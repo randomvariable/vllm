@@ -85,13 +85,18 @@ def _refresh_sampler(
     """Refresh the referenced sampler on its cadence, then exit.
 
     Module level with a weak reference on purpose: the thread must not be what
-    keeps the sampler alive, and it must not outlive it either.
+    keeps the sampler alive, and it must not outlive it either. The local is
+    released before the wait, or holding it across the interval would pin the
+    sampler for the whole wait and defeat the weak reference entirely.
     """
-    while not stop.wait(interval):
+    while True:
         sampler = sampler_ref()
         if sampler is None:
             return
         sampler.refresh()
+        del sampler
+        if stop.wait(interval):
+            return
 
 
 class RowCacheSampler:

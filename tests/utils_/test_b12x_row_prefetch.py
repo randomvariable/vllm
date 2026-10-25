@@ -459,6 +459,12 @@ def test_the_refresh_thread_does_not_keep_the_sampler_alive():
     sampler = RowCacheSampler([("ple", lambda: cache)], interval=0.001)
     thread = sampler._thread
     assert thread is not None and thread.is_alive()
+    # Park the thread inside its wait, the window in which it must not be
+    # holding the sampler: a target that retained it would survive here.
+    deadline = time.monotonic() + 2.0
+    while cache.reads == 0 and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert cache.reads > 0, "the sampler thread never refreshed"
     alive = weakref.ref(sampler)
 
     del sampler
