@@ -17,21 +17,132 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import weakref
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.metrics.b12x_row_cache import B12xRowCacheStats, B12xTableStats
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
+
+# b12x ``DiskRowCache.stats()`` takes the cache lock and asks the C reader for
+# its counters, so a per-step read would pay that on the engine thread. One
+# sample a second is far finer than any Prometheus scrape.
+ROW_CACHE_SAMPLE_SECONDS = 1.0
+
+# b12x ``stats()`` key -> ``B12xTableStats`` field, summed across tables of one
+# kind. Prefetch errors collapse the two b12x error counters: an operator
+# distinguishes them in the b12x log, not on a dashboard.
+_TABLE_FIELDS = (
+    ("row_cache_hits", "hits"),
+    ("row_cache_misses", "misses"),
+    ("row_cache_resident", "resident_rows"),
+    ("row_cache_bytes", "pool_bytes"),
+    ("prefetch_rows", "prefetch_rows"),
+    ("prefetch_rows_dropped", "prefetch_rows_dropped"),
+    ("prefetch_rows_loaded", "prefetch_rows_loaded"),
+    ("prefetch_rows_cancelled", "prefetch_rows_cancelled"),
+    ("prefetch_queue_depth", "prefetch_queue_depth"),
+)
+_ERROR_FIELDS = ("prefetch_source_errors", "prefetch_job_errors")
+
+
+def _accumulate(table: B12xTableStats, snapshot: dict[str, Any]) -> None:
+    """Fold one b12x ``stats()`` snapshot into the per-kind totals."""
+    for source, target in _TABLE_FIELDS:
+        setattr(table, target, getattr(table, target) + int(snapshot.get(source, 0)))
+    for source in _ERROR_FIELDS:
+        table.prefetch_errors += int(snapshot.get(source, 0))
+
+
+@dataclass
+class _PrefetchCounters:
+    """Advisory prefetch work counters; one writer each, so none is locked.
+
+    The engine thread owns ``submissions`` and ``dropped_submissions``, the
+    prefetch worker owns ``staged_rows``.
+    """
+
+    submissions: int = 0
+    dropped_submissions: int = 0
+    staged_rows: int = 0
+
+
+class RowCacheSampler:
+    """Periodic snapshot of the b12x row caches a worker reads from.
+
+    ``tables`` holds one ``(kind, resolve_table)`` pair per disk table, where
+    the resolver returns ``None`` while the table is still built lazily. The
+    sample is throttled: ``DiskRowCache.stats()`` takes the cache lock and
+    asks the C reader for its counters, and a Prometheus scrape is orders of
+    magnitude coarser than an engine step.
+    """
+
+    def __init__(
+        self,
+        tables: Sequence[tuple[str, Callable[[], Any | None]]],
+        *,
+        interval: float = ROW_CACHE_SAMPLE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._tables = tuple(tables)
+        self._interval = float(interval)
+        self._clock = clock
+        self._sampled_at = float("-inf")
+        self._sample: list[B12xTableStats] = []
+
+    def stats(self) -> list[B12xTableStats]:
+        """Current per-kind totals, re-read at most once per ``interval``."""
+        if not self._tables:
+            return []
+        now = self._clock()
+        if now - self._sampled_at < self._interval:
+            return self._sample
+        totals: dict[str, B12xTableStats] = {}
+        for kind, resolve_table in self._tables:
+            table = totals.setdefault(kind, B12xTableStats(kind=kind))
+            try:
+                disk = resolve_table()
+                if disk is not None:
+                    _accumulate(table, disk.stats())
+            except Exception as exc:
+                # Metrics must never fail a step: the cache can be closed, or
+                # the reader can raise while a shard is still registering.
+                logger.debug_once("B12X row-cache sample failed: %r", exc)
+        self._sample = list(totals.values())
+        self._sampled_at = now
+        return self._sample
+
+
+def row_cache_stats(
+    prefetcher: RowPrefetcher | None,
+    sampler: RowCacheSampler | None,
+) -> B12xRowCacheStats | None:
+    """This worker's metrics payload, or None when it holds no disk tables."""
+    if prefetcher is None and sampler is None:
+        return None
+    tables = sampler.stats() if sampler is not None else []
+    if prefetcher is None:
+        return B12xRowCacheStats(tables=tables)
+    submissions, dropped_submissions, staged_rows = prefetcher.counters()
+    return B12xRowCacheStats(
+        submissions=submissions,
+        dropped_submissions=dropped_submissions,
+        staged_rows=staged_rows,
+        disabled=int(prefetcher.disabled),
+        tables=tables,
+    )
+
 
 # TODO: fixed per-step bound on prefill lookahead tokens. b12x prefetch()
 # normalizes ids with a per-id Python loop; this caps GIL time taken from the
@@ -132,6 +243,7 @@ class _Job:
     targets: tuple[PrefetchTarget, ...]
     free_slots: queue.Queue[int]
     disabled: threading.Event
+    counters: _PrefetchCounters = field(default_factory=_PrefetchCounters)
 
 
 def _prefetch_worker(jobs: queue.Queue[Any]) -> None:
@@ -178,6 +290,7 @@ def _run_job(job: _Job) -> None:
             job.disabled.set()
             return
         ids = torch.unique(torch.cat([target.row_ids(block) for block in blocks]))
+        job.counters.staged_rows += int(ids.numel())
         if table.prefetch(ids) is False:
             logger.warning_once(
                 "DiskRowCache.prefetch is inactive; set a "
@@ -221,6 +334,9 @@ class RowPrefetcher:
             self._free_slots.put(index)
         self._jobs: queue.Queue[Any] = queue.Queue()
         self._disabled = threading.Event()
+        # Work counters, read by the engine thread when it builds the step's
+        # output; see ``_PrefetchCounters`` for who writes each one.
+        self._counters = _PrefetchCounters()
         threading.Thread(
             target=_prefetch_worker,
             args=(self._jobs,),
@@ -232,6 +348,15 @@ class RowPrefetcher:
     @property
     def disabled(self) -> bool:
         return self._disabled.is_set()
+
+    def counters(self) -> tuple[int, int, int]:
+        """Cumulative submissions, dropped submissions and staged rows."""
+        counters = self._counters
+        return (
+            counters.submissions,
+            counters.dropped_submissions,
+            counters.staged_rows,
+        )
 
     def submit(
         self,
@@ -253,6 +378,7 @@ class RowPrefetcher:
         try:
             slot_index = self._free_slots.get_nowait()
         except queue.Empty:
+            self._counters.dropped_submissions += 1
             return
         try:
             job = self._stage(slot_index, input_batch, req_states, draft_tokens)
@@ -264,6 +390,7 @@ class RowPrefetcher:
             )
             return
         if job is not None:
+            self._counters.submissions += 1
             self._jobs.put_nowait(job)
 
     def _stage(
@@ -309,6 +436,7 @@ class RowPrefetcher:
             targets=self._targets,
             free_slots=self._free_slots,
             disabled=self._disabled,
+            counters=self._counters,
         )
 
     def _decode_tokens(

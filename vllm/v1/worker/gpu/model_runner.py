@@ -2615,6 +2615,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        # These counters ride the same output the scheduler turns into
+        # SchedulerStats for the frontend's Prometheus registry.
+        model_runner_output.b12x_row_cache_stats = self.model_state.row_cache_stats()
+
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

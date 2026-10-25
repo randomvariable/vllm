@@ -137,6 +137,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             and module.requires_disk_preparation
         )
         self.row_prefetcher = None
+        self.row_cache_sampler = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -172,6 +173,23 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+
+        if self.disk_embeddings:
+            from vllm.utils.b12x_row_prefetch import RowCacheSampler
+
+            def disk_table(embedding: B12xNGramEmbedding):
+                # Built lazily by the b12x preparation path, so absent until
+                # the first real step.
+                return embedding.ngram_embedding.disk_table
+
+            # The cache serves the synchronous lookups whether or not advisory
+            # prefetch is on, so its counters are sampled either way.
+            self.row_cache_sampler = RowCacheSampler(
+                tuple(
+                    ("ple", functools.partial(disk_table, embedding))
+                    for embedding in self.disk_embeddings
+                )
+            )
 
         if envs.VLLM_PLE_PREFETCH and self.disk_embeddings:
             from b12x.sequence.ple_hash.host import query_row_ids
@@ -528,6 +546,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         if self.row_prefetcher is not None:
             self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
+
+    def row_cache_stats(self):
+        """Prefetch and row-cache counters for this worker's metrics payload."""
+        from vllm.utils.b12x_row_prefetch import row_cache_stats
+
+        return row_cache_stats(self.row_prefetcher, self.row_cache_sampler)
 
     def _prepare_ngram_context(
         self,

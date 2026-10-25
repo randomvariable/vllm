@@ -12,10 +12,13 @@ import torch
 from vllm.models.deepseek_v4_1.common.engram_prefetch import compress_engram_tokens
 from vllm.utils.b12x_row_prefetch import (
     PrefetchTarget,
+    RowCacheSampler,
     RowPrefetcher,
     _Job,
+    _PrefetchCounters,
     _run_job,
     plan_next_step_spans,
+    row_cache_stats,
 )
 
 # (a) decoding, (b) final prefill chunk, (c)/(d) still prefilling.
@@ -113,11 +116,15 @@ def _prefetcher(targets=()):
     prefetcher._free_slots = queue.Queue()
     prefetcher._jobs = queue.Queue()
     prefetcher._disabled = threading.Event()
+    prefetcher._counters = _PrefetchCounters()
     return prefetcher
 
 
 class _Event:
     def synchronize(self):
+        return None
+
+    def record(self, stream=None):
         return None
 
 
@@ -149,6 +156,7 @@ def _job(prefetcher, slot, num_decode_rows, query_width, prefill_lens, targets):
         targets=tuple(targets),
         free_slots=prefetcher._free_slots,
         disabled=prefetcher._disabled,
+        counters=prefetcher._counters,
     )
 
 
@@ -243,3 +251,149 @@ def test_compress_engram_tokens_marks_dead_tokens():
         -1,
         -1,
     ]
+
+
+def _counting_prefetcher(targets):
+    """A prefetcher that stages tokens without a CUDA device present."""
+    prefetcher = _prefetcher(targets)
+    prefetcher._events = [_Event(), _Event()]
+    return prefetcher
+
+
+def test_submit_books_a_queued_step_but_not_a_saturated_ring(monkeypatch):
+    """A step that finds no free slot is lost work; a queued one is a submission."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: None)
+    table = _Table()
+    prefetcher = _counting_prefetcher(
+        [
+            PrefetchTarget(
+                resolve_table=lambda: table, row_ids=lambda block: block[:, -1]
+            )
+        ]
+    )
+
+    prefetcher.submit(_batch(), _req_states(), DRAFTS)
+    assert prefetcher.counters() == (0, 1, 0)
+    assert prefetcher._jobs.qsize() == 0
+
+    prefetcher._free_slots.put(0)
+    prefetcher.submit(_batch(), _req_states(), DRAFTS)
+    assert prefetcher.counters() == (1, 1, 0)
+
+    # The two decode rows contribute their newest tokens (31, 33) and the
+    # prefilling row its single scheduled next token (4); unique() collapses
+    # them, so the row counter has a reason to be three.
+    _run_job(prefetcher._jobs.get_nowait())
+    assert [ids.tolist() for ids in table.seen] == [[4, 31, 33]]
+    assert prefetcher.counters() == (1, 1, 3)
+
+
+def test_a_disabled_prefetcher_books_no_dropped_submission(monkeypatch):
+    """Drops mean lost work, so a prefetcher that stopped itself books nothing."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: None)
+    prefetcher = _counting_prefetcher(())
+    prefetcher._disabled.set()
+    prefetcher._free_slots.put(0)
+
+    prefetcher.submit(_batch(), _req_states(), DRAFTS)
+    assert prefetcher.counters() == (0, 0, 0)
+
+
+class _Cache:
+    """Stand-in for a ``DiskRowCache``, counting how often it is read."""
+
+    def __init__(self, snapshot, raise_on_read=False):
+        self.snapshot = snapshot
+        self.raise_on_read = raise_on_read
+        self.reads = 0
+
+    def stats(self):
+        self.reads += 1
+        if self.raise_on_read:
+            raise RuntimeError("shard still registering")
+        return self.snapshot
+
+
+PLE_SNAPSHOT = {
+    "row_cache_hits": 70,
+    "row_cache_misses": 30,
+    "row_cache_resident": 25,
+    "row_cache_bytes": 2250,
+    "prefetch_rows": 12,
+    "prefetch_rows_dropped": 3,
+    "prefetch_rows_loaded": 9,
+    "prefetch_rows_cancelled": 1,
+    "prefetch_source_errors": 1,
+    "prefetch_job_errors": 0,
+    "prefetch_queue_depth": 2,
+}
+
+
+def test_sampler_totals_each_kind_and_survives_a_broken_cache():
+    """Two PLE caches fold into one kind; a raising cache must not fail the step."""
+    first, second = _Cache(dict(PLE_SNAPSHOT)), _Cache(dict(PLE_SNAPSHOT))
+    broken = _Cache({}, raise_on_read=True)
+    sampler = RowCacheSampler(
+        [("ple", lambda: first), ("ple", lambda: second), ("engram", lambda: broken)],
+        clock=lambda: 0.0,
+    )
+
+    tables = {table.kind: table for table in sampler.stats()}
+
+    assert set(tables) == {"ple", "engram"}
+    ple = tables["ple"]
+    assert (ple.hits, ple.misses) == (140, 60)
+    assert (ple.resident_rows, ple.pool_bytes) == (50, 4500)
+    assert (ple.prefetch_rows, ple.prefetch_rows_dropped) == (24, 6)
+    assert (ple.prefetch_rows_loaded, ple.prefetch_rows_cancelled) == (18, 2)
+    # The two b12x error counters fold into one: which one failed belongs in
+    # the b12x log, not on a dashboard.
+    assert ple.prefetch_errors == 2
+    assert ple.prefetch_queue_depth == 4
+    assert (first.reads, second.reads, broken.reads) == (1, 1, 1)
+    assert tables["engram"].hits == 0
+
+
+def test_sampler_rereads_the_caches_only_after_its_interval():
+    """One b12x read per interval, because stats() takes the cache lock."""
+    now = [0.0]
+    cache = _Cache(dict(PLE_SNAPSHOT))
+    sampler = RowCacheSampler([("ple", lambda: cache)], clock=lambda: now[0])
+
+    sampler.stats()
+    sampler.stats()
+    assert cache.reads == 1
+
+    now[0] = 1.0
+    sampler.stats()
+    assert cache.reads == 2
+
+
+def test_row_cache_stats_composes_worker_work_with_cache_totals():
+    """The payload carries what the prefetcher did and what the caches saw."""
+    prefetcher = _prefetcher()
+    prefetcher._counters.submissions = 5
+    prefetcher._counters.dropped_submissions = 2
+    prefetcher._counters.staged_rows = 11
+    cache = _Cache(dict(PLE_SNAPSHOT))
+
+    payload = row_cache_stats(
+        prefetcher, RowCacheSampler([("ple", lambda: cache)], clock=lambda: 0.0)
+    )
+
+    assert (payload.submissions, payload.dropped_submissions) == (5, 2)
+    assert (payload.staged_rows, payload.disabled) == (11, 0)
+    assert [table.kind for table in payload.tables] == ["ple"]
+    assert payload.tables[0].hits == 70
+
+    # With prefetch never enabled the worker still reports its cache.
+    cache.reads = 0
+    payload = row_cache_stats(
+        None, RowCacheSampler([("engram", lambda: cache)], clock=lambda: 0.0)
+    )
+    assert (payload.submissions, payload.staged_rows, payload.disabled) == (0, 0, 0)
+    assert [table.kind for table in payload.tables] == ["engram"]
+
+    assert row_cache_stats(None, None) is None

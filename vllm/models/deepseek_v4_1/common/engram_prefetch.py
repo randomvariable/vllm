@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from itertools import islice
+from typing import Any
 
 import torch
 
@@ -54,3 +57,32 @@ def engram_prefetch_targets(model) -> tuple[PrefetchTarget, ...]:
 
         targets.append(PrefetchTarget(resolve_table=resolve_table, row_ids=row_ids))
     return tuple(targets)
+
+
+def _resolve_engram_disk_table(embed: Any):
+    """The disk table of one Engram embedding, or None while lazily built."""
+    # Built lazily by _ensure_disk_table, so absent until the first real step.
+    return embed.disk_table
+
+
+def engram_disk_row_tables(
+    model,
+) -> tuple[tuple[str, Callable[[], Any | None]], ...]:
+    """One ``(kind, disk table resolver)`` pair per Engram layer.
+
+    The row-cache metrics sampler needs only the tables, so this stays free of
+    the token-map and geometry copies ``engram_prefetch_targets`` makes: it is
+    built whether or not advisory prefetch is enabled.
+    """
+    tables = []
+    for layer in islice(model.layers, model.start_layer, model.end_layer):
+        engram = getattr(layer, "engram", None)
+        if engram is None:
+            continue
+        tables.append(
+            (
+                "engram",
+                functools.partial(_resolve_engram_disk_table, engram.embed_tokens),
+            )
+        )
+    return tuple(tables)

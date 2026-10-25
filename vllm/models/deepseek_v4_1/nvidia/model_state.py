@@ -130,6 +130,22 @@ class DeepseekV41ModelState(DefaultModelState):
             if isinstance(module, DeepseekV4Model) and module.disk_engram
         )
         self.row_prefetcher = None
+        self.row_cache_sampler = None
+        if self.disk_engram_models:
+            from vllm.utils.b12x_row_prefetch import RowCacheSampler
+
+            from ..common.engram_prefetch import engram_disk_row_tables
+
+            # The cache serves the synchronous lookups whether or not advisory
+            # prefetch is on, so its counters are sampled either way.
+            self.row_cache_sampler = RowCacheSampler(
+                tuple(
+                    table
+                    for engram_model in self.disk_engram_models
+                    for table in engram_disk_row_tables(engram_model)
+                )
+            )
+
         if envs.VLLM_PLE_PREFETCH and self.disk_engram_models:
             from vllm.utils.b12x_row_prefetch import RowPrefetcher
 
@@ -310,3 +326,9 @@ class DeepseekV41ModelState(DefaultModelState):
     ) -> None:
         if self.row_prefetcher is not None:
             self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
+
+    def row_cache_stats(self):
+        """Prefetch and row-cache counters for this worker's metrics payload."""
+        from vllm.utils.b12x_row_prefetch import row_cache_stats
+
+        return row_cache_stats(self.row_prefetcher, self.row_cache_sampler)
