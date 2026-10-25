@@ -23,6 +23,8 @@ def _bound_classes(registry):
     """The metric classes the collector uses, pinned to one test registry."""
 
     class _Bound(B12xRowCacheProm):
+        """The collector with its metric classes bound to the test registry."""
+
         _counter_cls = staticmethod(
             lambda **kwargs: prometheus_client.Counter(registry=registry, **kwargs)
         )
@@ -35,19 +37,23 @@ def _bound_classes(registry):
 
 @pytest.fixture
 def collector():
+    """A fresh registry and its collector, so families never leak between tests."""
     registry = prometheus_client.CollectorRegistry()
     return _bound_classes(registry)(LABELNAMES, LABELVALUES), registry
 
 
 def _table(kind, **fields):
+    """One table snapshot with only the fields the test cares about set."""
     return B12xTableStats(kind=kind, **fields)
 
 
 def _counter(registry, name, **labels):
+    """Read a cumulative counter, whose exposed name carries ``_total``."""
     return registry.get_sample_value(f"{name}_total", {**BASE, **labels})
 
 
 def _gauge(registry, name, **labels):
+    """Read a gauge, whose exposed name is the declared name unchanged."""
     return registry.get_sample_value(name, {**BASE, **labels})
 
 

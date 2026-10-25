@@ -99,6 +99,11 @@ class RowCacheSampler:
         interval: float = ROW_CACHE_SAMPLE_SECONDS,
         background: bool = True,
     ) -> None:
+        """Bind the table resolvers and, unless asked not to, start the thread.
+
+        ``background=False`` leaves the sampler passive for a caller that owns
+        the refresh cadence, which is how the tests drive it deterministically.
+        """
         self._tables = tuple(tables)
         # A zero or negative interval would spin the daemon thread against the
         # GIL and the cache lock, so the cadence has a floor.
@@ -115,6 +120,11 @@ class RowCacheSampler:
             self._thread.start()
 
     def _refresh_loop(self) -> None:
+        """Refresh on the interval until stop is set; the thread's whole body.
+
+        Waiting on the event rather than sleeping means shutdown is immediate
+        and the thread costs nothing between samples.
+        """
         while not self._stop.wait(self._interval):
             self.refresh()
 

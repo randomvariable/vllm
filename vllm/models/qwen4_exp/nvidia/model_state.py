@@ -178,8 +178,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if self.disk_embeddings:
 
             def disk_table(embedding: B12xNGramEmbedding):
-                # Built lazily by the b12x preparation path, so absent until
-                # the first real step.
+                """The embedding's b12x disk table, or None while unbuilt.
+
+                The table is created lazily by the b12x preparation path, so
+                this reads ``None`` until the first real step has run.
+                """
                 return embedding.ngram_embedding.disk_table
 
             # The cache serves the synchronous lookups whether or not advisory
@@ -197,6 +200,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
             def target(
                 embedding: B12xNGramEmbedding,
             ) -> b12x_row_prefetch.PrefetchTarget:
+                """One prefetch target for a disk-backed PLE embedding.
+
+                The hash geometry is copied to the host once here, at
+                construction, because the b12x row-id predictor is a host
+                routine and the step path must not page it back per block.
+                """
                 multipliers = embedding.layer_multipliers.detach().cpu()
                 prime_sizes = embedding.ngram_heads_vocab_sizes.detach().cpu()
                 table_offsets = embedding.ngram_heads_offsets.detach().cpu()

@@ -172,6 +172,12 @@ class B12xRowCacheProm:
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
     ):
+        """Declare every family once per engine, with a kind child each.
+
+        Building the children up front rather than on first observation keeps
+        a kind that has never been sampled present as zero, so a dashboard
+        cannot mistake an absent series for no traffic.
+        """
         self.counters: dict[str, dict[int, prometheus_client.Counter]] = {}
         for _attribute, name, documentation in _ENGINE_COUNTERS:
             self.counters[name] = create_metric_per_engine(
@@ -223,6 +229,11 @@ class B12xRowCacheProm:
         self._last_table: dict[tuple[int, str], B12xTableStats] = {}
 
     def observe(self, stats: B12xRowCacheStats, engine_idx: int = 0) -> None:
+        """Advance this engine's counters to a new cumulative worker snapshot.
+
+        The worker reports process-lifetime totals, so each call publishes
+        what arrived since the last one; gauges take the value outright.
+        """
         previous = self._last_engine.get(engine_idx)
         for attribute, name, _documentation in _ENGINE_COUNTERS:
             delta = self._delta(

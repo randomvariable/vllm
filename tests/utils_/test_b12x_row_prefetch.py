@@ -122,10 +122,14 @@ def _prefetcher(targets=()):
 
 
 class _Event:
+    """Stand-in for the ``torch.cuda.Event`` the staging path records on."""
+
     def synchronize(self):
+        """Report the record as complete, so reuse is never blocked."""
         return None
 
     def record(self, stream=None):
+        """Accept the staging path's CUDA event record without CUDA."""
         return None
 
 
@@ -306,11 +310,13 @@ class _Cache:
     """Stand-in for a ``DiskRowCache``, counting how often it is read."""
 
     def __init__(self, snapshot, raise_on_read=False):
+        """Serve ``snapshot`` to every read, or raise if asked to fail."""
         self.snapshot = snapshot
         self.raise_on_read = raise_on_read
         self.reads = 0
 
     def stats(self):
+        """Count the read, then hand back the canned b12x ``stats()`` dict."""
         self.reads += 1
         if self.raise_on_read:
             raise RuntimeError("shard still registering")
