@@ -233,3 +233,51 @@ def test_the_worker_payload_reaches_the_prometheus_exposition():
     # The kind this step never touched is published as zero rather than absent,
     # so a dashboard cannot read "no series" as "no traffic".
     assert found[("vllm:b12x_row_cache_hits_total", "engram")] == 0.0
+
+
+def test_the_payload_survives_the_engine_core_wire_format():
+    """A multiprocess server decodes this on the frontend, so pin the wire.
+
+    Everything else in this file calls the collector in process, which would
+    keep passing if msgpack dropped the nested table list -- and a dropped
+    list is silently empty metrics in every real deployment, not a red test.
+    """
+    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.metrics.stats import SchedulerStats
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    stats = SchedulerStats(
+        b12x_row_cache_stats=B12xRowCacheStats(
+            submissions=7,
+            dropped_submissions=2,
+            staged_rows=99,
+            disabled=0,
+            tables=[
+                _table(
+                    "ple",
+                    hits=11,
+                    misses=22,
+                    resident_rows=33,
+                    pool_bytes=44,
+                    prefetch_rows=55,
+                    prefetch_rows_loaded=66,
+                    prefetch_errors=77,
+                    prefetch_queue_depth=88,
+                )
+            ],
+        )
+    )
+
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(
+        MsgpackEncoder().encode(EngineCoreOutputs(scheduler_stats=stats))
+    )
+
+    payload = decoded.scheduler_stats.b12x_row_cache_stats
+    assert payload is not None
+    assert (payload.submissions, payload.dropped_submissions) == (7, 2)
+    assert (payload.staged_rows, payload.disabled) == (99, 0)
+    table = payload.tables[0]
+    assert isinstance(table, B12xTableStats)
+    assert (table.kind, table.hits, table.misses) == ("ple", 11, 22)
+    assert (table.pool_bytes, table.prefetch_rows_loaded) == (44, 66)
+    assert (table.prefetch_errors, table.prefetch_queue_depth) == (77, 88)
