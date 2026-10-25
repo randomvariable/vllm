@@ -453,6 +453,28 @@ def test_a_failing_cache_keeps_its_last_good_totals():
     assert sampler.refresh()[0].hits == 90
 
 
+def test_an_unbuilt_cache_still_publishes_its_kind_and_keeps_its_totals():
+    """A configured kind is never dropped, which would freeze a gauge.
+
+    The disk table is built lazily, so the resolver answers None before the
+    first real step and could answer None again after teardown. The collector
+    depends on every configured kind appearing in every snapshot: a kind that
+    vanished would leave its gauges showing the last value forever.
+    """
+    built: list[_Cache] = []
+    sampler = RowCacheSampler(
+        [("ple", lambda: built[0] if built else None)], background=False
+    )
+
+    assert [(table.kind, table.hits) for table in sampler.refresh()] == [("ple", 0)]
+
+    built.append(_Cache(dict(PLE_SNAPSHOT)))
+    assert sampler.refresh()[0].hits == 70
+
+    built.clear()
+    assert [(table.kind, table.hits) for table in sampler.refresh()] == [("ple", 70)]
+
+
 def test_the_refresh_thread_does_not_keep_the_sampler_alive():
     """The daemon thread must not be what retains the sampler and its caches."""
     cache = _Cache(dict(PLE_SNAPSHOT))

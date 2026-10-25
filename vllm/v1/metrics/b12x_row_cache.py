@@ -234,6 +234,10 @@ class B12xRowCacheProm:
 
         The worker reports process-lifetime totals, so each call publishes
         what arrived since the last one; gauges take the value outright.
+
+        Every configured kind appears in every snapshot: the sampler creates a
+        totals entry per table whether or not its cache answered, so a kind
+        that has been observed cannot go missing and leave a gauge frozen.
         """
         previous = self._last_engine.get(engine_idx)
         for attribute, name, _documentation in _ENGINE_COUNTERS:
