@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -35,9 +34,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# b12x ``DiskRowCache.stats()`` takes the cache lock and asks the C reader for
-# its counters, so a per-step read would pay that on the engine thread. One
-# sample a second is far finer than any Prometheus scrape.
+# Row-cache counters are refreshed on their own thread at this cadence. A
+# Prometheus scrape is far coarser, and the read queues behind the cache lock,
+# so it must never happen on a step path.
 ROW_CACHE_SAMPLE_SECONDS = 1.0
 
 # b12x ``stats()`` key -> ``B12xTableStats`` field, summed across tables of one
@@ -79,13 +78,18 @@ class _PrefetchCounters:
 
 
 class RowCacheSampler:
-    """Periodic snapshot of the b12x row caches a worker reads from.
+    """Row-cache counters for metrics, refreshed off the engine thread.
 
     ``tables`` holds one ``(kind, resolve_table)`` pair per disk table, where
-    the resolver returns ``None`` while the table is still built lazily. The
-    sample is throttled: ``DiskRowCache.stats()`` takes the cache lock and
-    asks the C reader for its counters, and a Prometheus scrape is orders of
-    magnitude coarser than an engine step.
+    the resolver returns ``None`` while the table is still built lazily.
+
+    The refresh runs on its own daemon thread and :meth:`stats` only returns
+    the last published list; that separation is the whole design. Measured on
+    an SM120 device, ``DiskRowCache.stats()`` takes a 7 us median when the
+    cache is quiet but a 3.6 ms worst case while the prefetch worker holds the
+    cache lock to reserve and confirm rows, because it queues behind that
+    lock. Sampling it per step would therefore put a multi-millisecond outlier
+    into decode latency to serve a scrape that arrives seconds later.
     """
 
     def __init__(
@@ -93,21 +97,34 @@ class RowCacheSampler:
         tables: Sequence[tuple[str, Callable[[], Any | None]]],
         *,
         interval: float = ROW_CACHE_SAMPLE_SECONDS,
-        clock: Callable[[], float] = time.monotonic,
+        background: bool = True,
     ) -> None:
         self._tables = tuple(tables)
-        self._interval = float(interval)
-        self._clock = clock
-        self._sampled_at = float("-inf")
-        self._sample: list[B12xTableStats] = []
+        # A zero or negative interval would spin the daemon thread against the
+        # GIL and the cache lock, so the cadence has a floor.
+        self._interval = max(float(interval), 0.001)
+        self._published: list[B12xTableStats] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if background and self._tables:
+            self._thread = threading.Thread(
+                target=self._refresh_loop,
+                name="b12x-row-cache-sampler",
+                daemon=True,
+            )
+            self._thread.start()
 
-    def stats(self) -> list[B12xTableStats]:
-        """Current per-kind totals, re-read at most once per ``interval``."""
-        if not self._tables:
-            return []
-        now = self._clock()
-        if now - self._sampled_at < self._interval:
-            return self._sample
+    def _refresh_loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.refresh()
+
+    def refresh(self) -> list[B12xTableStats]:
+        """Read every cache once and publish the totals. Never on a step path.
+
+        A closed cache or a raising reader is logged, not re-raised: this runs
+        unwatched on a daemon thread, and nothing about metrics may break a
+        step or an engine shutdown.
+        """
         totals: dict[str, B12xTableStats] = {}
         for kind, resolve_table in self._tables:
             table = totals.setdefault(kind, B12xTableStats(kind=kind))
@@ -116,12 +133,13 @@ class RowCacheSampler:
                 if disk is not None:
                     _accumulate(table, disk.stats())
             except Exception as exc:
-                # Metrics must never fail a step: the cache can be closed, or
-                # the reader can raise while a shard is still registering.
                 logger.debug_once("B12X row-cache sample failed: %r", exc)
-        self._sample = list(totals.values())
-        self._sampled_at = now
-        return self._sample
+        self._published = list(totals.values())
+        return self._published
+
+    def stats(self) -> list[B12xTableStats]:
+        """The last published snapshot: an attribute read, no lock, no cache."""
+        return self._published
 
 
 def row_cache_stats(

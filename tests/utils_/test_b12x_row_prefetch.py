@@ -4,6 +4,7 @@
 
 import queue
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -332,15 +333,15 @@ PLE_SNAPSHOT = {
 
 
 def test_sampler_totals_each_kind_and_survives_a_broken_cache():
-    """Two PLE caches fold into one kind; a raising cache must not fail the step."""
+    """Two PLE caches fold into one kind; a raising cache must not fail it."""
     first, second = _Cache(dict(PLE_SNAPSHOT)), _Cache(dict(PLE_SNAPSHOT))
     broken = _Cache({}, raise_on_read=True)
     sampler = RowCacheSampler(
         [("ple", lambda: first), ("ple", lambda: second), ("engram", lambda: broken)],
-        clock=lambda: 0.0,
+        background=False,
     )
 
-    tables = {table.kind: table for table in sampler.stats()}
+    tables = {table.kind: table for table in sampler.refresh()}
 
     assert set(tables) == {"ple", "engram"}
     ple = tables["ple"]
@@ -356,19 +357,44 @@ def test_sampler_totals_each_kind_and_survives_a_broken_cache():
     assert tables["engram"].hits == 0
 
 
-def test_sampler_rereads_the_caches_only_after_its_interval():
-    """One b12x read per interval, because stats() takes the cache lock."""
-    now = [0.0]
-    cache = _Cache(dict(PLE_SNAPSHOT))
-    sampler = RowCacheSampler([("ple", lambda: cache)], clock=lambda: now[0])
+def test_the_step_path_never_touches_the_caches():
+    """``stats()`` is what the worker calls per step, so it must read nothing.
 
-    sampler.stats()
-    sampler.stats()
+    The alternative was measured on SM120: a cache read costs a 7 us median
+    but a 3.6 ms worst case while the prefetch worker holds the cache lock, so
+    sampling on the step path would trade decode latency for scrape freshness.
+    """
+    cache = _Cache(dict(PLE_SNAPSHOT))
+    sampler = RowCacheSampler([("ple", lambda: cache)], background=False)
+
+    for _ in range(1000):
+        assert sampler.stats() == []
+    assert cache.reads == 0
+
+    sampler.refresh()
+    assert cache.reads == 1
+    for _ in range(1000):
+        assert len(sampler.stats()) == 1
     assert cache.reads == 1
 
-    now[0] = 1.0
-    sampler.stats()
-    assert cache.reads == 2
+
+def test_the_sampler_thread_publishes_without_being_asked():
+    """The refresh cadence is the sampler's own thread's business."""
+    cache = _Cache(dict(PLE_SNAPSHOT))
+    sampler = RowCacheSampler([("ple", lambda: cache)], interval=0.01)
+    try:
+        deadline = time.monotonic() + 2.0
+        while not sampler.stats() and time.monotonic() < deadline:
+            time.sleep(0.002)
+        published = sampler.stats()
+        assert [table.kind for table in published] == ["ple"]
+        assert published[0].hits == 70
+        assert sampler._thread is not None and sampler._thread.is_alive()
+    finally:
+        sampler._stop.set()
+        if sampler._thread is not None:
+            sampler._thread.join(2)
+            assert not sampler._thread.is_alive()
 
 
 def test_row_cache_stats_composes_worker_work_with_cache_totals():
@@ -378,10 +404,9 @@ def test_row_cache_stats_composes_worker_work_with_cache_totals():
     prefetcher._counters.dropped_submissions = 2
     prefetcher._counters.staged_rows = 11
     cache = _Cache(dict(PLE_SNAPSHOT))
-
-    payload = row_cache_stats(
-        prefetcher, RowCacheSampler([("ple", lambda: cache)], clock=lambda: 0.0)
-    )
+    sampler = RowCacheSampler([("ple", lambda: cache)], background=False)
+    sampler.refresh()
+    payload = row_cache_stats(prefetcher, sampler)
 
     assert (payload.submissions, payload.dropped_submissions) == (5, 2)
     assert (payload.staged_rows, payload.disabled) == (11, 0)
@@ -389,11 +414,11 @@ def test_row_cache_stats_composes_worker_work_with_cache_totals():
     assert payload.tables[0].hits == 70
 
     # With prefetch never enabled the worker still reports its cache.
-    cache.reads = 0
-    payload = row_cache_stats(
-        None, RowCacheSampler([("engram", lambda: cache)], clock=lambda: 0.0)
-    )
+    engram_sampler = RowCacheSampler([("engram", lambda: cache)], background=False)
+    engram_sampler.refresh()
+    payload = row_cache_stats(None, engram_sampler)
     assert (payload.submissions, payload.staged_rows, payload.disabled) == (0, 0, 0)
     assert [table.kind for table in payload.tables] == ["engram"]
+    assert cache.reads == 2
 
     assert row_cache_stats(None, None) is None

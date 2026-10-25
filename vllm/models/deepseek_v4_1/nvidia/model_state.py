@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState, ced_decoder_start
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
+from vllm.utils import b12x_row_prefetch
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -132,13 +133,11 @@ class DeepseekV41ModelState(DefaultModelState):
         self.row_prefetcher = None
         self.row_cache_sampler = None
         if self.disk_engram_models:
-            from vllm.utils.b12x_row_prefetch import RowCacheSampler
-
             from ..common.engram_prefetch import engram_disk_row_tables
 
             # The cache serves the synchronous lookups whether or not advisory
             # prefetch is on, so its counters are sampled either way.
-            self.row_cache_sampler = RowCacheSampler(
+            self.row_cache_sampler = b12x_row_prefetch.RowCacheSampler(
                 tuple(
                     table
                     for engram_model in self.disk_engram_models
@@ -147,11 +146,9 @@ class DeepseekV41ModelState(DefaultModelState):
             )
 
         if envs.VLLM_PLE_PREFETCH and self.disk_engram_models:
-            from vllm.utils.b12x_row_prefetch import RowPrefetcher
-
             from ..common.engram_prefetch import engram_prefetch_targets
 
-            self.row_prefetcher = RowPrefetcher(
+            self.row_prefetcher = b12x_row_prefetch.RowPrefetcher(
                 tuple(
                     target
                     for engram_model in self.disk_engram_models
@@ -329,6 +326,6 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def row_cache_stats(self):
         """Prefetch and row-cache counters for this worker's metrics payload."""
-        from vllm.utils.b12x_row_prefetch import row_cache_stats
-
-        return row_cache_stats(self.row_prefetcher, self.row_cache_sampler)
+        return b12x_row_prefetch.row_cache_stats(
+            self.row_prefetcher, self.row_cache_sampler
+        )
