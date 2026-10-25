@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Next-step span prediction and staging for the disk row prefetcher."""
 
+import gc
 import queue
 import threading
 import time
+import weakref
 
 import numpy as np
 import pytest
@@ -428,3 +430,42 @@ def test_row_cache_stats_composes_worker_work_with_cache_totals():
     assert cache.reads == 2
 
     assert row_cache_stats(None, None) is None
+
+
+def test_a_failing_cache_keeps_its_last_good_totals():
+    """A transient read failure may not publish lower cumulative counters.
+
+    The frontend turns cumulative counters into deltas and re-baselines when a
+    value falls, so a partial sample would silently discard real work.
+    """
+    cache = _Cache(dict(PLE_SNAPSHOT))
+    sampler = RowCacheSampler([("ple", lambda: cache)], background=False)
+
+    assert sampler.refresh()[0].hits == 70
+
+    cache.raise_on_read = True
+    assert sampler.refresh()[0].hits == 70
+    assert cache.reads == 2
+
+    # The held value is a snapshot, not a live view of the cache's own dict.
+    cache.raise_on_read = False
+    cache.snapshot["row_cache_hits"] = 90
+    assert sampler.refresh()[0].hits == 90
+
+
+def test_the_refresh_thread_does_not_keep_the_sampler_alive():
+    """The daemon thread must not be what retains the sampler and its caches."""
+    cache = _Cache(dict(PLE_SNAPSHOT))
+    sampler = RowCacheSampler([("ple", lambda: cache)], interval=0.001)
+    thread = sampler._thread
+    assert thread is not None and thread.is_alive()
+    alive = weakref.ref(sampler)
+
+    del sampler
+    gc.collect()
+
+    assert alive() is None
+    deadline = time.monotonic() + 2.0
+    while thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert not thread.is_alive()

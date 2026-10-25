@@ -50,9 +50,10 @@ _ENGINE_COUNTERS: tuple[tuple[str, str, str], ...] = (
         "dropped_submissions",
         "vllm:b12x_row_prefetch_dropped_submissions",
         (
-            "Steps the prefetcher gave up on without queueing work: a "
-            "saturated pinned-slot ring, CUDA graph capture, or a disabled "
-            "prefetcher."
+            "Steps the prefetcher could not queue because every pinned "
+            "staging slot was still in flight. Steps skipped for other "
+            "reasons are not counted: CUDA graph capture and a disabled "
+            "prefetcher do no work to lose."
         ),
     ),
     (

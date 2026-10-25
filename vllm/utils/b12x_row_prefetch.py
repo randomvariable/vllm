@@ -77,6 +77,23 @@ class _PrefetchCounters:
     staged_rows: int = 0
 
 
+def _refresh_sampler(
+    sampler_ref: weakref.ReferenceType[RowCacheSampler],
+    stop: threading.Event,
+    interval: float,
+) -> None:
+    """Refresh the referenced sampler on its cadence, then exit.
+
+    Module level with a weak reference on purpose: the thread must not be what
+    keeps the sampler alive, and it must not outlive it either.
+    """
+    while not stop.wait(interval):
+        sampler = sampler_ref()
+        if sampler is None:
+            return
+        sampler.refresh()
+
+
 class RowCacheSampler:
     """Row-cache counters for metrics, refreshed off the engine thread.
 
@@ -110,40 +127,46 @@ class RowCacheSampler:
         self._interval = max(float(interval), 0.001)
         self._published: list[B12xTableStats] = []
         self._stop = threading.Event()
+        # One last-good snapshot per resolver: a transient read failure repeats
+        # the previous numbers rather than publishing lower totals, which the
+        # frontend would read as a worker restart and drop the accumulated
+        # count for.
+        self._last: list[dict[str, Any] | None] = [None] * len(self._tables)
         self._thread: threading.Thread | None = None
         if background and self._tables:
+            # The thread reaches the sampler through a weak reference: a bound
+            # method would keep the sampler, and through it every disk cache it
+            # resolves, alive for the whole process even after the worker drops
+            # it. Finalizing stops the loop so a collected sampler leaves no
+            # thread behind.
+            weakref.finalize(self, self._stop.set)
             self._thread = threading.Thread(
-                target=self._refresh_loop,
+                target=_refresh_sampler,
+                args=(weakref.ref(self), self._stop, self._interval),
                 name="b12x-row-cache-sampler",
                 daemon=True,
             )
             self._thread.start()
 
-    def _refresh_loop(self) -> None:
-        """Refresh on the interval until stop is set; the thread's whole body.
-
-        Waiting on the event rather than sleeping means shutdown is immediate
-        and the thread costs nothing between samples.
-        """
-        while not self._stop.wait(self._interval):
-            self.refresh()
-
     def refresh(self) -> list[B12xTableStats]:
         """Read every cache once and publish the totals. Never on a step path.
 
-        A closed cache or a raising reader is logged, not re-raised: this runs
-        unwatched on a daemon thread, and nothing about metrics may break a
-        step or an engine shutdown.
+        A closed cache or a raising reader is logged and leaves that table on
+        its last good snapshot: these counters are cumulative, and nothing
+        about metrics may break a step, an engine shutdown, or a total.
         """
-        totals: dict[str, B12xTableStats] = {}
-        for kind, resolve_table in self._tables:
-            table = totals.setdefault(kind, B12xTableStats(kind=kind))
+        for position, (_kind, resolve_table) in enumerate(self._tables):
             try:
                 disk = resolve_table()
                 if disk is not None:
-                    _accumulate(table, disk.stats())
+                    self._last[position] = dict(disk.stats())
             except Exception as exc:
                 logger.debug_once("B12X row-cache sample failed: %r", exc)
+        totals: dict[str, B12xTableStats] = {}
+        for (kind, _resolve_table), snapshot in zip(self._tables, self._last):
+            table = totals.setdefault(kind, B12xTableStats(kind=kind))
+            if snapshot is not None:
+                _accumulate(table, snapshot)
         self._published = list(totals.values())
         return self._published
 
@@ -261,6 +284,12 @@ def plan_next_step_spans(
 
 @dataclass(frozen=True)
 class _Job:
+    """One step's staged tokens, ready for the worker to hash and prefetch.
+
+    Frozen so the engine thread can hand it over and forget it; the slot,
+    event and counters are deliberately shared with the prefetcher.
+    """
+
     slot_index: int
     slot: torch.Tensor
     event: torch.cuda.Event
@@ -292,6 +321,12 @@ def _prefetch_worker(jobs: queue.Queue[Any]) -> None:
 
 
 def _run_job(job: _Job) -> None:
+    """Turn a staged slot into row ids and ask each disk table to warm them.
+
+    Runs on the prefetch worker: it waits for the asynchronous staging copy,
+    then slices the slot back into the decode and prefill blocks the token
+    hashes were taken over.
+    """
     job.event.synchronize()
     history_len = job.history_len
     blocks = []
@@ -342,6 +377,11 @@ class RowPrefetcher:
         num_speculative_tokens: int,
         device: torch.device,
     ) -> None:
+        """Allocate the pinned slot ring and the thread that consumes its jobs.
+
+        The ring is deliberately shallow: a step whose slots are all still in
+        flight is dropped rather than making the engine thread wait on disk.
+        """
         self._targets = tuple(targets)
         self._history_len = int(history_len)
         self._history_pad = int(history_pad)
@@ -375,6 +415,7 @@ class RowPrefetcher:
 
     @property
     def disabled(self) -> bool:
+        """True once a failure has switched prefetching off for this process."""
         return self._disabled.is_set()
 
     def counters(self) -> tuple[int, int, int]:
@@ -428,6 +469,11 @@ class RowPrefetcher:
         req_states: RequestState,
         draft_tokens: torch.Tensor | None,
     ) -> _Job | None:
+        """Copy this step's predicted tokens into a pinned slot, or return None.
+
+        None means the step needed no prefetch, so the slot goes straight back
+        to the ring.
+        """
         num_reqs = input_batch.num_reqs
         spans = plan_next_step_spans(
             idx_mapping_np=input_batch.idx_mapping_np[:num_reqs],
