@@ -1054,7 +1054,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _index_call(self, mode: str, rows: int, *, benchmark: bool = False):
         def prepare(state):
-            from b12x.attention.dsa_indexer.mxfp4 import score_mxfp4, select_mxfp4
             from b12x.preparation import PreparedCall
 
             assert self.indexer is not None
@@ -1131,12 +1130,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 **kwargs,
             )
 
-            def run():
-                score_mxfp4(binding, launchers=state._launchers)
-                return select_mxfp4(binding, launchers=state._launchers)
-
             return PreparedCall(
-                run=run,
+                run=lambda: state.run(binding),
                 output=indices,
                 produce=lambda: state.quantize_query(
                     source, q_mxfp4=q, q_scales=scales
@@ -1491,8 +1486,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     **candidate_args,
                 )
                 retain_cuda_graph_capture_resource(scratch)
-                dsa_indexer.score(binding)
-                dsa_indexer.select(binding)
+                dsa_indexer.run(binding)
 
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
