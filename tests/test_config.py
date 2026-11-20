@@ -2514,7 +2514,7 @@ def test_engram_draft_config_validates_target(monkeypatch, target_has_ple, expli
     ("architecture", "layer_field", "rocm", "expect_error"),
     [
         pytest.param(
-            "DeepseekV41ForCausalLM", "engram_layer_ids", False, True, id="deepseek"
+            "DeepseekV41ForCausalLM", "engram_layer_ids", False, False, id="deepseek"
         ),
         pytest.param(
             "Qwen4ExpForCausalLM", "ple_layer_ids", True, True, id="qwen4exp_rocm"

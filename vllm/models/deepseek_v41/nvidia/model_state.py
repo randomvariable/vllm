@@ -242,6 +242,20 @@ class DeepseekV41ModelState(DefaultModelState):
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         max_local_reqs = self.max_num_reqs * (2 if self.pcp_size > 1 else 1)
         depth = model.token_lookback_depth
+        from vllm.models.deepseek_v41.common.engram import Engram, NgramHashState
+
+        self.disk_engrams = [
+            m
+            for m in model.modules()
+            if isinstance(m, Engram) and m.embed_tokens.disk_offload
+        ]
+        self.disk_hash = (
+            next((m for m in model.modules() if isinstance(m, NgramHashState)), None)
+            if self.disk_engrams
+            else None
+        )
+        if self.disk_engrams and self.disk_hash is None:
+            raise RuntimeError("Disk Engram layers require an n-gram hash state")
         self.lookback_token_ids: torch.Tensor | None = None
         if depth > 0:
             # Persistent so a captured graph can read it on replay.
@@ -346,6 +360,26 @@ class DeepseekV41ModelState(DefaultModelState):
             return model_inputs
         self._fill_lookback(input_batch, req_states)
         model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        if self.disk_hash is not None:
+            from vllm.models.deepseek_v41.common.mm_preprocess import (
+                image_sentinel_mask,
+            )
+
+            ids = input_batch.input_ids
+            hashes = self.disk_hash(
+                ids,
+                input_batch.positions,
+                input_batch.query_start_loc,
+                image_sentinel_mask(ids),
+                self.lookback_token_ids,
+                image_sentinel_mask(self.lookback_token_ids),
+            )
+            for layer in self.disk_engrams:
+                layer.embed_tokens._disk.start(hashes[:, layer.layer_hash_index])
+            for layer in self.disk_engrams:
+                table = layer.embed_tokens
+                compact_ids = table._disk.finish()
+                table.lookup(compact_ids, layer.staged_rows[: ids.shape[0]])
         return model_inputs
 
     def _fill_lookback(self, input_batch: InputBatch, req_states: RequestState) -> None:
@@ -368,6 +402,8 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        for layer in self.disk_engrams:
+            layer.staged_rows[:num_tokens].zero_()
         if self.lookback_token_ids is not None:
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)

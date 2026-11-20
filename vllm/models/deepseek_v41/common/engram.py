@@ -1049,6 +1049,8 @@ class ParallelEngramEmbedding(nn.Module):
     _packed: torch.Tensor | None = None
     _loaded = False
     packed_fp4: bool = False
+    disk_offload: bool = False
+    _disk = None
 
     def __init__(
         self,
@@ -1061,6 +1063,7 @@ class ParallelEngramEmbedding(nn.Module):
         use_thp: bool = False,
         packed_fp4: bool = False,
         peer_group: EngramPeerGroup | None = None,
+        disk_offload: bool = False,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -1068,12 +1071,13 @@ class ParallelEngramEmbedding(nn.Module):
         assert not packed_fp4 or dim % 2 == 0
         self.packed_fp4 = packed_fp4
         self.row_bytes = dim // 2 if packed_fp4 else dim
-        self.cpu_offload = cpu_offload
-        self.dp_shared_memory = dp_shared_memory
-        self.use_thp = use_thp
-        self.dp_size = get_engram_dp_size()
-        if dp_shared_memory:
-            if not cpu_offload:
+        self.disk_offload = disk_offload
+        self.cpu_offload = cpu_offload and not disk_offload
+        self.dp_shared_memory = dp_shared_memory and not disk_offload
+        self.use_thp = use_thp and not disk_offload
+        self.dp_size = 1 if disk_offload else get_engram_dp_size()
+        if self.dp_shared_memory:
+            if not self.cpu_offload:
                 raise ValueError("dp_shared_memory requires cpu_offload=True")
             if self.dp_size <= 1:
                 raise ValueError(
@@ -1110,7 +1114,7 @@ class ParallelEngramEmbedding(nn.Module):
                 peer = current_platform.is_fully_connected(physical_ids)
             if peer:
                 self._peer_group, self.dp_size = group, 1
-        if cpu_offload and not is_uva_available():
+        if self.cpu_offload and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
@@ -1143,10 +1147,31 @@ class ParallelEngramEmbedding(nn.Module):
         self._num_sms = torch.cuda.get_device_properties(
             torch.accelerator.current_device_index()
         ).multi_processor_count
+        self._disk = None
+        if disk_offload:
+            from vllm.models.deepseek_v41.common.engram_disk import EngramDiskRows
+
+            cfg = get_current_vllm_config()
+            self._disk = EngramDiskRows(
+                (self.row_bytes, dim // block_size),
+                torch.uint8 if packed_fp4 else torch.float8_e4m3fn,
+                (self.vocab_start_idx, self.vocab_end_idx),
+                (self.head_start, min(head_end, self.n_hash_cols)),
+                self.n_hash_cols,
+                cfg.scheduler_config.max_num_batched_tokens,
+                cfg.load_config.load_format == "dummy",
+            )
+        if self._disk is not None:
+            self._weight_loader = self._load_disk_weight
         weight, scales = self._allocate_weights()
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
-        for param in (self.weight, self.weight_scale_inv):
+        for name, param in (
+            ("weight", self.weight),
+            ("weight_scale_inv", self.weight_scale_inv),
+        ):
+            if self._disk is not None:
+                set_weight_attrs(param, {"disk_plane": name})
             set_weight_attrs(
                 param,
                 {
@@ -1154,7 +1179,7 @@ class ParallelEngramEmbedding(nn.Module):
                     "engram_vocab_start": row_start,
                 },
             )
-        if cpu_offload and not self.weight.is_meta:
+        if self.cpu_offload and not self.weight.is_meta:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
@@ -1182,9 +1207,20 @@ class ParallelEngramEmbedding(nn.Module):
             return self.tp_size, get_tensor_model_parallel_rank()
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
+    def _load_disk_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        assert self._disk is not None
+        self._disk.keep_view(param.disk_plane, loaded_weight)
+
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         scale_dim = self.dim // self.block_size
         weight_dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
+        if self.disk_offload:
+            return (
+                torch.empty(0, self.row_bytes, dtype=weight_dtype),
+                torch.empty(0, scale_dim, dtype=torch.uint8),
+            )
         if torch.get_default_device().type == "meta" or not (
             self.cpu_offload or self.peer_rows
         ):
@@ -1274,6 +1310,8 @@ class ParallelEngramEmbedding(nn.Module):
     def process_weights_after_loading(self) -> None:
         """Peers read this table's rows directly, so serve only once every GPU
         of the group has finished loading its own."""
+        if self._disk is not None:
+            self._disk.bind()
         if not self.peer_rows:
             return
         assert self._peer_group is not None
@@ -1310,6 +1348,8 @@ class ParallelEngramEmbedding(nn.Module):
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._shared_memory is not None:
             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
+        if self._disk is not None:
+            return self._disk.tables
         if not self.cpu_offload:
             return self.weight.data, self.weight_scale_inv.data
         src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
@@ -1406,6 +1446,9 @@ class ParallelEngramEmbedding(nn.Module):
         num_tokens = indices.shape[0]
         if self.dp_size > 1:
             indices = gather_engram_hashes(indices)
+        if self._disk is not None:
+            self._disk.start(indices)
+            indices = self._disk.finish()
         out = torch.empty(
             (indices.shape[0], self.part_n_hash_cols, self.dim),
             dtype=torch.bfloat16,
@@ -1840,6 +1883,7 @@ class Engram(nn.Module):
             use_thp=engram_config.use_thp,
             packed_fp4=layout.packed_fp4,
             peer_group=peer_group,
+            disk_offload=engram_config.disk_offload,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
@@ -1852,6 +1896,8 @@ class Engram(nn.Module):
         )
         if not self.embed_tokens.cpu_offload:
             self._prefetch_stream = None
+            if self.embed_tokens.disk_offload:
+                self.staged_rows.zero_()
             return
         if self._prefetch_stream is None:
             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
@@ -1860,6 +1906,8 @@ class Engram(nn.Module):
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Look up, or prefetch from host memory, rows before the decoder layers
         consume them; DP-sharded tables take the group's gathered hash IDs."""
+        if self.embed_tokens.disk_offload:
+            return
         rows = self.staged_rows[: hash_ids.shape[0]]
         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
         if self._prefetch_stream is None:

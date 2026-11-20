@@ -53,6 +53,9 @@ tests/models/inkling2/test_processing.py  # Inkling2 B200 tests; CI job not adde
 tests/models/inkling2/test_allreduce.py  # Inkling2 B200 tests; CI job not added yet
 tests/models/inkling2/test_vision.py  # Inkling2 B200 tests; CI job not added yet
 
+# tests/models/deepseek_v41/ - CPU tests of the b12x branch's Engram disk offload.
+tests/models/deepseek_v41/test_engram_disk_offload.py  # b12x branch only; no Buildkite job on this fork
+
 # tests/lora/ - explicitly --ignore'd from the sharded LoRA run, with no
 # dedicated *_tp job (unlike the other ignored *_tp tests).
 tests/lora/test_deepseekv2_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job

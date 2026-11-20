@@ -355,7 +355,8 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                     local_expert_ids=self.local_expert_ids,
                     load_engram_on_cpu=bool(
-                        engram_config and engram_config.cpu_offload
+                        engram_config
+                        and (engram_config.cpu_offload or engram_config.disk_offload)
                     ),
                 )
             else:

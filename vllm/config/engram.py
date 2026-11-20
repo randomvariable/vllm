@@ -45,9 +45,9 @@ class EngramConfig:
     """Store embedding weights in pinned CPU memory for UVA lookup."""
 
     disk_offload: bool = False
-    """Keep Qwen4Exp PLE tables in the checkpoint files and read each step's
-    rows on the host instead of allocating the table. Takes precedence over
-    cpu_offload."""
+    """Keep Qwen4Exp PLE and DeepSeek V4.1 Engram tables in checkpoint files;
+    read each step's rows on the host instead of allocating the table.
+    Takes precedence over cpu_offload."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
@@ -120,8 +120,19 @@ class EngramConfig:
         if self.disk_offload:
             from vllm.platforms import current_platform
 
-            if field != "ple_layer_ids" or not current_platform.is_cuda():
-                raise ValueError("disk_offload requires a Qwen4Exp model on CUDA")
+            if (
+                field != "ple_layer_ids"
+                and model_config.architecture != "DeepseekV41ForCausalLM"
+            ) or not current_platform.is_cuda():
+                raise ValueError(
+                    "disk_offload requires Qwen4Exp or DeepSeek V4.1 on CUDA"
+                )
+            if model_config.architecture == "DeepseekV41ForCausalLM" and (
+                self.embedding_across_dp or self.peer_group_size or self.use_thp
+            ):
+                raise ValueError(
+                    "DeepSeek disk_offload requires private TP-sharded tables"
+                )
         # TODO: split Qwen4Exp's GPU tables over a peer group too; Engram models
         # on NVL72 should all use one.
         if self.peer_group_size and field != "engram_layer_ids":
@@ -136,6 +147,7 @@ class EngramConfig:
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
                 self.cpu_offload
+                and not self.disk_offload
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
@@ -162,6 +174,8 @@ class EngramConfig:
             )
         if self.disk_offload and parallel_config.enable_elastic_ep:
             raise ValueError("disk_offload is not supported with elastic EP.")
+        if self.disk_offload and parallel_config.use_ubatching:
+            raise ValueError("disk_offload is not supported with microbatching.")
         if self.peer_group_size:
             from vllm.platforms import current_platform
 
