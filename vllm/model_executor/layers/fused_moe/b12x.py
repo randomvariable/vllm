@@ -225,25 +225,6 @@ def _csf_scale_scratch(
     return _CSF_SCALE_SCRATCH[key]
 
 
-def _csf_scale_planes(swizzled: torch.Tensor) -> Any:
-    """Compress 128x4-swizzled expert block scales into b12x CSF planes."""
-    from flashinfer.quantization import encode_csf_scales
-
-    experts, rows, cols = swizzled.shape
-    logical = (
-        swizzled.view(experts, rows // 128, cols // 4, 32, 4, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .reshape(experts, rows, cols)
-    )
-    csf = encode_csf_scales(logical)
-    bounds = csf.exc_offsets[:: rows // 16].tolist()
-    exceptions = csf.exceptions.cpu()
-    return _require_b12x_fused_moe().CsfScalePlanes(
-        tuple(csf.fixed.cpu()),
-        tuple(exceptions[a:b] for a, b in zip(bounds, bounds[1:])),
-    )
-
-
 def _canonicalize_fp4_zero_signs_(packed: torch.Tensor) -> None:
     """Clear sign bits from packed FP4 zero values in place."""
     packed = packed.view(torch.uint8)
@@ -429,23 +410,22 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
                 ),
+                constraints=fused_moe.WeightPlanConstraints(scale_compression="csf"),
             )
-            w1_scratch, w2_scratch = _csf_scale_scratch(self.w1_scale, self.w2_scale)
-            weights = fused_moe.Nvfp4CsfWeights(
-                packed=fused_moe.PackedWeights(
+            return fused_moe.prepare_weights(
+                plan=csf_plan,
+                weights=fused_moe.PackedWeights(
                     w13=w1,
                     w2=w2,
-                    w13_block_scales=w1_scratch,
-                    w2_block_scales=w2_scratch,
+                    w13_block_scales=self.w1_scale,
+                    w2_block_scales=self.w2_scale,
                     w13_global_scales=w1_global_scale,
                     w2_global_scales=w2_global_scale,
                     input_scale=a1_gscale,
                     intermediate_scale=a2_gscale,
                 ),
-                w13_scales=_csf_scale_planes(self.w1_scale),
-                w2_scales=_csf_scale_planes(self.w2_scale),
-            )
-            return fused_moe.prepare_weights(plan=csf_plan, weights=weights)._impl
+                scale_scratch=_csf_scale_scratch(self.w1_scale, self.w2_scale),
+            )._impl
 
         # W4A8 MXFP4 with an intermediate size of 64 modulo 128 is repacked to
         # compact N64 weights. Their micro plans need the launchers of the
@@ -483,39 +463,26 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
                 ),
+                # b12x compresses the native E8M0 block scales while preparing.
+                constraints=fused_moe.WeightPlanConstraints(
+                    scale_compression="csf" if mxfp4_csf else None
+                ),
             )
-            native_weights: Any
-            if mxfp4_csf:
-                from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
-                    encode_mxfp4_csf_scales,
-                )
-
-                w1_scratch, w2_scratch = _csf_scale_scratch(
-                    self.w1_scale, self.w2_scale
-                )
-                native_weights = fused_moe.Mxfp4CsfWeights(
-                    w13=w1,
-                    w2=w2,
-                    w13_scales=fused_moe.CsfScalePlanes(
-                        *encode_mxfp4_csf_scales(self.w1_scale)
-                    ),
-                    w2_scales=fused_moe.CsfScalePlanes(
-                        *encode_mxfp4_csf_scales(self.w2_scale)
-                    ),
-                    w13_scale_scratch=w1_scratch,
-                    w2_scale_scratch=w2_scratch,
-                )
-            else:
-                native_weights = fused_moe.PackedWeights(
+            owner = fused_moe.prepare_weights(
+                plan=prepared_plan,
+                weights=fused_moe.PackedWeights(
                     w13=w1,
                     w2=w2,
                     w13_block_scales=self.w1_scale,
                     w2_block_scales=self.w2_scale,
                     w13_global_scales=w1_global_scale,
                     w2_global_scales=w2_global_scale,
-                )
-            owner = fused_moe.prepare_weights(
-                plan=prepared_plan, weights=native_weights
+                ),
+                scale_scratch=(
+                    _csf_scale_scratch(self.w1_scale, self.w2_scale)
+                    if mxfp4_csf
+                    else None
+                ),
             )
             self._native_experts = owner
             return owner._impl

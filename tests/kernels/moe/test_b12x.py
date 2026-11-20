@@ -5,7 +5,6 @@
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -51,10 +50,6 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 )
 from vllm.model_executor.layers.quantization.utils.b12x_moe import (
     prepare_nvfp4_moe_layer_for_b12x,
-)
-from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
-    MXFP4_CSF_ROWS,
-    encode_mxfp4_csf_scales,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1956,99 +1951,3 @@ def test_b12x_mxfp4_resident_scales_match_plain_scales(
             graph.replay()
             assert_outputs_match(output, apply(0))
         graph.reset()
-
-
-def _decode_mxfp4_csf_scales(
-    fixed: torch.Tensor, exceptions: torch.Tensor, cols: int
-) -> torch.Tensor:
-    """Rebuild one CPU `[rows, cols]` E8M0 matrix from its b12x planes."""
-    if (
-        fixed.dtype != torch.uint8
-        or fixed.dim() != 2
-        or fixed.shape[0] == 0
-        or exceptions.dtype != torch.uint32
-        or not 1 <= cols <= 255
-        or fixed.shape[0] * MXFP4_CSF_ROWS * cols > 1 << 24
-    ):
-        raise ValueError("Invalid MXFP4 CSF planes")
-    row_bytes = -(-cols // 8)
-    if fixed.shape[1] != MXFP4_CSF_ROWS * (1 + row_bytes):
-        raise ValueError("MXFP4 CSF fixed plane does not match the column count")
-    rows = fixed.shape[0] * MXFP4_CSF_ROWS
-    planes = fixed.numpy()
-    bases = planes[:, :MXFP4_CSF_ROWS].reshape(rows, 1).astype(np.int16)
-    bits = np.unpackbits(
-        planes[:, MXFP4_CSF_ROWS:].reshape(rows, row_bytes), axis=1, bitorder="little"
-    )[:, :cols]
-    out = (bases + bits).reshape(-1)
-    if (out > 255).any():
-        raise ValueError("MXFP4 CSF selector exceeds the byte range")
-    out = out.astype(np.uint8)
-    words = exceptions.reshape(-1).numpy()
-    positions = words & 0xFFFFFF
-    if positions.size and (
-        positions[-1] >= rows * cols or (positions[1:] <= positions[:-1]).any()
-    ):
-        raise ValueError("CSF exception positions must be increasing and in range")
-    out[positions] = (words >> 24).astype(np.uint8)
-    return torch.from_numpy(out.reshape(rows, cols))
-
-
-def _mxfp4_scales(experts: int, rows: int, cols: int, seed: int = 0) -> np.ndarray:
-    """E8M0 bytes clustered on two neighbours, as in real checkpoints, plus outliers."""
-    rng = np.random.default_rng(seed)
-    shape = (experts, rows, cols)
-    raw = 118 + rng.binomial(1, 0.4, shape)
-    outliers = rng.random(shape) < 0.02
-    raw[outliers] += rng.integers(-5, 6, int(outliers.sum()))
-    return raw.astype(np.uint8)
-
-
-@pytest.mark.parametrize("rows, cols", [(16, 1), (32, 7), (64, 90), (16, 255)])
-def test_mxfp4_csf_round_trips(rows, cols):
-    raw = _mxfp4_scales(3, rows, cols)
-    fixed, exceptions = encode_mxfp4_csf_scales(torch.from_numpy(raw))
-
-    row_bytes = -(-cols // 8)
-    for expert in range(3):
-        assert fixed[expert].dtype == torch.uint8
-        assert fixed[expert].shape == (rows // 16, 16 * (1 + row_bytes))
-        assert exceptions[expert].dtype == torch.uint32
-        decoded = _decode_mxfp4_csf_scales(fixed[expert], exceptions[expert], cols)
-        assert np.array_equal(decoded.numpy(), raw[expert])
-
-
-def test_mxfp4_csf_picks_the_window_with_fewest_exceptions():
-    # Every row holds only two neighbouring bytes, so no exceptions are needed,
-    # including at the top of the byte range.
-    raw = np.empty((1, 32, 10), dtype=np.uint8)
-    raw[0, :16] = [120, 121] * 5
-    raw[0, 16:] = [254, 255] * 5
-    fixed, exceptions = encode_mxfp4_csf_scales(torch.from_numpy(raw))
-    assert exceptions[0].numel() == 0
-    assert list(fixed[0][0, :16]) == [120] * 16
-    assert list(fixed[0][1, :16]) == [254] * 16
-    assert torch.equal(
-        fixed[0][0, 16:].reshape(16, 2),
-        torch.tensor([[0xAA, 0x02]], dtype=torch.uint8).expand(16, 2),
-    )
-    decoded = _decode_mxfp4_csf_scales(fixed[0], exceptions[0], 10)
-    assert np.array_equal(decoded.numpy(), raw[0])
-
-
-def test_mxfp4_csf_keeps_arbitrary_bytes_exact():
-    raw = np.random.default_rng(1).integers(0, 256, (2, 32, 33), dtype=np.uint8)
-    fixed, exceptions = encode_mxfp4_csf_scales(torch.from_numpy(raw))
-    for expert in range(2):
-        words = exceptions[expert].numpy()
-        assert (np.diff(words & 0xFFFFFF) > 0).all()
-        decoded = _decode_mxfp4_csf_scales(fixed[expert], exceptions[expert], 33)
-        assert np.array_equal(decoded.numpy(), raw[expert])
-
-
-@pytest.mark.parametrize(
-    "shape", [(1, 15, 4), (1, 16, 256), (16, 4), (0, 16, 4), (1, 0, 4)]
-)
-def test_mxfp4_csf_rejects_unsupported_shapes(shape):
-    with pytest.raises(ValueError):
-        encode_mxfp4_csf_scales(torch.zeros(shape, dtype=torch.uint8))
