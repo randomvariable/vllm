@@ -206,26 +206,26 @@ def test_b12x_attention_impl_accepts_default_block_size(workspace_init) -> None:
     assert impl.num_heads == 16
 
 
-def test_b12x_attention_lazily_prepares_decode_bucket(monkeypatch) -> None:
+def test_b12x_attention_requires_prepared_decode_plan() -> None:
+    from vllm.utils.b12x import PreparationResourceUnavailableError
+
     impl = object.__new__(B12xPagedAttentionImpl)
-    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=96))
-    created: list[tuple[int, int]] = []
-
-    def create_plan(page_size: int, batch_size: int) -> SimpleNamespace:
-        created.append((page_size, batch_size))
-        return plan
-
-    impl._decode_plans = {}
-    impl._create_decode_plan = create_plan
-    impl._scratch_nbytes = 128
-    impl._extend_plans = {}
+    impl._noncausal = None
+    impl._plans = {}
     impl._verify_q_per_req = 0
+    impl._extend_q_capacities = (16,)
     metadata = SimpleNamespace(max_query_len=1)
-    monkeypatch.setattr(b12x, "_capture_alloc_forbidden", lambda: False)
 
-    assert impl._select_plan(metadata, 7, 7, 7, 64) is plan
-    assert impl._select_plan(metadata, 7, 7, 7, 64) is plan
-    assert created == [(64, 7)]
+    with pytest.raises(PreparationResourceUnavailableError, match="not prepared"):
+        impl._select_plan(
+            metadata,
+            7,
+            7,
+            7,
+            64,
+            query_stride=(4096, 128, 1),
+            output_stride=(4096, 128, 1),
+        )
 
 
 def test_b12x_attention_fp8_descales_follow_request_batch() -> None:

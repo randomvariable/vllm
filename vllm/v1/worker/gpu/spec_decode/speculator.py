@@ -545,6 +545,12 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_rank,
                 self.block_tables.cp_interleave,
             )
+        model_specific_attn_metadata = self.model_state.prepare_draft_attn_metadata(
+            idx_mapping=self.idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            draft_index=step,
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -568,6 +574,7 @@ class DraftModelSpeculator(BaseSpeculator):
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
             positions=self.input_buffers.positions[:num_tokens],
             is_prefilling=self.draft_is_prefilling[:num_reqs_padded],
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
         return attn_metadata
 

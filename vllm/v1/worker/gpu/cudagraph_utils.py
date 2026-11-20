@@ -57,6 +57,7 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -97,6 +98,31 @@ def make_cudagraph_stats(
         num_padded_tokens=batch_desc.num_tokens,
         num_paddings=batch_desc.num_tokens - num_tokens,
         runtime_mode=str(batch_desc.cg_mode),
+    )
+
+
+def normalize_model_token_inputs(
+    model: nn.Module, model_inputs: dict[str, Any]
+) -> None:
+    """Keep capture and execution token inputs consistent with embeddings."""
+    if model_inputs.get("inputs_embeds") is not None and not requires_raw_input_tokens(
+        model
+    ):
+        model_inputs["input_ids"] = None
+
+
+_DENSE_VARLEN_DECODE_MAX_REQS = 2
+
+
+def dense_varlen_decode_shapes(
+    max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
+) -> tuple[tuple[int, int], ...]:
+    """Return request and token counts of exact variable-length decode graphs."""
+    return tuple(
+        (num_reqs, num_reqs * query_len)
+        for num_reqs in range(1, min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs) + 1)
+        for query_len in range(1, decode_query_len + 1)
+        if num_reqs * query_len <= max_capture_tokens
     )
 
 
@@ -201,6 +227,7 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self._capture_resources: dict[BatchExecutionDescriptor, list[Any]] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
         # The stream of the last capture; graphs replayed inside these ones (in
         # their eager breaks) can capture on it to share the pool's free blocks.
@@ -433,6 +460,18 @@ class CudaGraphManager:
         # Not cached: elastic EP rewrites parallel_config in place on scale.
         return self.vllm_config.parallel_config.data_parallel_size
 
+    def planned_token_counts(self) -> tuple[int, ...]:
+        """Return token counts for every planned graph before capture."""
+        return tuple(
+            sorted(
+                {
+                    desc.num_tokens
+                    for descs in self._capture_descs.values()
+                    for desc in descs
+                }
+            )
+        )
+
     def release_graphs(self) -> None:
         """Drop the captured graphs so a later capture() can refill them.
 
@@ -441,6 +480,7 @@ class CudaGraphManager:
         kept, so `needs_capture()` still reports the work to redo.
         """
         self.graphs.clear()
+        self._capture_resources.clear()
         self._graphs_captured = False
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
@@ -532,6 +572,7 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
                         with (
+                            collect_cuda_graph_capture_resources() as resources,
                             capture_pool(self.pool, self.vllm_config) as pool,
                             torch.cuda.graph(
                                 graph, pool, stream=self._capture_stream(desc)
@@ -548,6 +589,7 @@ class CudaGraphManager:
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
+                        self._capture_resources[desc] = resources
                         compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
@@ -759,6 +801,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "intermediate_tensors": None,
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            normalize_model_token_inputs(model, model_inputs)
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 if not requires_raw_input_tokens(model):
@@ -771,6 +814,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                 # Prepare and park threads before capture; finish runs inside it.
                 assert self.ubatch_runner is not None
                 input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+                input_batch.cudagraph_capture = True
+                input_batch.uniform_decode_graph = (
+                    desc.cg_mode == CUDAGraphMode.FULL
+                    and desc.uniform_token_count is not None
+                )
                 input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
                 set_dcp_capture_context(
                     input_batch,
@@ -808,6 +856,10 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                uniform_decode_graph=(
+                    desc.cg_mode == CUDAGraphMode.FULL
+                    and desc.uniform_token_count is not None
+                ),
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
             )
@@ -903,6 +955,7 @@ def prepare_inputs_to_capture(
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
     slot_mappings_buffer: torch.Tensor | None = None,
+    uniform_decode_graph: bool = False,
 ) -> AttentionState:
     if full_cudagraph and max_query_len is None:
         # Mixed graphs can replay a single prefill spanning the entire batch,
@@ -911,6 +964,8 @@ def prepare_inputs_to_capture(
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
+    input_batch.cudagraph_capture = True
+    input_batch.uniform_decode_graph = uniform_decode_graph
     if pcp_manager is not None:
         input_batch = pcp_manager.prepare_inputs_for_capture_or_profile(input_batch)
 
@@ -993,7 +1048,9 @@ _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
 @torch.inference_mode()
-def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+def profile_cudagraph_memory(
+    runner: "GPUModelRunner", prepare_profile_state: Callable[[], None] | None = None
+) -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
     Called during memory profiling, *before* the real KV cache is allocated,
@@ -1047,6 +1104,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         speculator = runner.speculator
         spec_manager_names: list[str] = []
         try:
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             if not runner.needs_cudagraph_capture():
                 return 0
             manager.pool = throwaway_pool
@@ -1113,7 +1172,9 @@ def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) ->
     return first_capture + (total_graphs - 1) * per_graph
 
 
-def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
+def _init_minimal_kv_cache_for_profiling(
+    runner: "GPUModelRunner", *, num_blocks: int | None = None
+) -> None:
     """Allocate the smallest KV cache that still lets every graph be captured."""
     from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
     from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder
@@ -1123,12 +1184,16 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
         builder, runner.vllm_config, runner.get_kv_cache_layer_configs()
     )
     # At least one block per sequence is required to capture the graphs.
-    min_blocks = (
-        min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)
-        or 1
-    )
+    if num_blocks is None:
+        num_blocks = (
+            min(
+                runner.max_num_reqs,
+                runner.compilation_config.max_cudagraph_capture_size,
+            )
+            or 1
+        )
     minimal_config = builder.get_kv_cache_config_from_groups(
-        runner.vllm_config, kv_cache_groups, num_blocks=min_blocks
+        runner.vllm_config, kv_cache_groups, num_blocks=num_blocks
     )
 
     runner.initialize_kv_cache(minimal_config, is_profiling=True)

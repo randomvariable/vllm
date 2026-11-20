@@ -11,6 +11,8 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 
 class MTPSpeculator(TargetDependentARSpeculator):
     share_mtp_topk_indices: bool = False
+    rollback_qsa_interval_starts: bool = False
+    prefill_outputs_are_compact: bool = False
 
     def load_draft_model(
         self,
@@ -24,7 +26,7 @@ class MTPSpeculator(TargetDependentARSpeculator):
             draft_model.model.set_prefill_rows(self.last_token_indices)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
-            spec_config.draft_model_config.hf_config
+            spec_config.draft_model_config.hf_text_config
             if spec_config is not None
             else None
         )
@@ -37,6 +39,12 @@ class MTPSpeculator(TargetDependentARSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        self.rollback_qsa_interval_starts = hasattr(
+            draft_model.model, "snapshot_qsa_interval_starts"
+        ) and hasattr(draft_model.model, "restore_qsa_interval_starts")
+        self.prefill_outputs_are_compact = hasattr(
+            draft_model.model, "set_prefill_output_indices"
+        ) and getattr(draft_model.model, "supports_mtp_prefill_compaction", True)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -44,6 +52,10 @@ class MTPSpeculator(TargetDependentARSpeculator):
         # midway cannot leave reuse mode on.
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+        if self.prefill_outputs_are_compact:
+            self.model.model.set_prefill_output_indices(
+                self.last_token_indices[:num_reqs]
+            )
 
     def on_prefill_end(self, num_reqs: int) -> None:
         # Step 0 (prefill) wrote topk indices for every query token in the
@@ -51,13 +63,19 @@ class MTPSpeculator(TargetDependentARSpeculator):
         # steps 1+ can reuse them from the shared buffer.
         if self.share_mtp_topk_indices and self.num_speculative_steps > 1:
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
+        if self.prefill_outputs_are_compact:
+            self.model.model.set_prefill_output_indices(None)
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
+        if self.rollback_qsa_interval_starts:
+            self.model.model.snapshot_qsa_interval_starts()
         # Switch to reuse mode so draft steps 1+ skip the indexer op and read
         # the indices that step 0 wrote into the shared buffer.
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(True)
 
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
+        if self.rollback_qsa_interval_starts:
+            self.model.model.restore_qsa_interval_starts()
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)

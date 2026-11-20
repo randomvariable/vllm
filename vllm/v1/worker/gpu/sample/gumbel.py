@@ -487,3 +487,30 @@ def gumbel_sample(
         PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
     )
     return sampled
+
+
+def warmup_processed_gumbel(
+    vocab_size: int, device: torch.device, *, use_fp64: bool = False
+) -> None:
+    """Compile target sampling of processed FP32 logits without a model forward.
+
+    FlashInfer handles unseeded filtered warmup requests, but explicit seeds
+    dispatch to Gumbel-max. Greedy warmup covers only native-dtype logits and
+    therefore cannot initialize this specialization. Temporary inputs do not
+    consume a serving request's RNG stream or modify request state.
+    """
+    logits = torch.zeros((1, vocab_size), dtype=torch.float32, device=device)
+    mapping = torch.zeros(1, dtype=torch.int64, device=device)
+    temperature = torch.ones(1, dtype=torch.float32, device=device)
+    seed = torch.zeros(1, dtype=torch.int64, device=device)
+    position = torch.zeros(1, dtype=torch.int64, device=device)
+    gumbel_sample(
+        logits,
+        mapping,
+        temperature,
+        seed,
+        position,
+        apply_temperature=False,
+        is_drafting=False,
+        use_fp64=use_fp64,
+    )

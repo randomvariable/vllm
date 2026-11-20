@@ -86,6 +86,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_flashinfer_pcie_ipc_allreduce = use_flashinfer_pcie_ipc_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_b12x_allreduce = (
+            use_custom_allreduce
+            and not envs.VLLM_BATCH_INVARIANT
+            and envs.VLLM_ENABLE_PCIE_ALLREDUCE
+            and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+        )
+        self.use_roce_allreduce = (
+            use_custom_allreduce
+            and not envs.VLLM_BATCH_INVARIANT
+            and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+        )
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -120,6 +131,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.use_aiter_tp_all_gather: bool = False
+        self.b12x_ar_comm = None
+        if self.world_size > 1 and self.use_b12x_allreduce:
+            from .b12x_pcie_all_reduce import B12xPcieAllReduce
+
+            self.b12x_ar_comm = B12xPcieAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
+        elif self.world_size > 1 and self.use_roce_allreduce:
+            from .b12x_roce_all_reduce import B12xRoceAllReduce
+
+            self.b12x_ar_comm = B12xRoceAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
@@ -321,6 +351,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "B12X_PCIE",
+            "B12X_ROCENANTE",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
@@ -331,6 +363,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.b12x_ar_comm is not None and not self.b12x_ar_comm.disabled:
+            enabled_ar_backends.append(
+                getattr(self.b12x_ar_comm, "backend_name", "B12X_PCIE")
+            )
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -387,6 +423,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        comm = self.b12x_ar_comm
+        if comm is not None and not comm.disabled and comm.should_custom_ar(input_):
+            out = comm.custom_all_reduce(input_)
+            assert out is not None
+            return out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -491,6 +532,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        comm = self.b12x_ar_comm
+        should_gather = getattr(comm, "should_all_gather", None)
+        if (
+            comm is not None
+            and not comm.disabled
+            and should_gather is not None
+            and should_gather(input_, dim)
+        ):
+            return comm.all_gather(input_, dim)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -861,7 +911,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             raise ValueError("No PyNCCL communicator found")
 
+    def check_health(self):
+        check = getattr(self.b12x_ar_comm, "check_health", None)
+        if check is not None:
+            check()
+
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.disabled
+            or pynccl_comm.all_reduce(input_, out_tensor=input_) is None
+        ):
+            torch.distributed.all_reduce(input_, group=self.device_group)
+        return input_
+
     def destroy(self):
+        for transport in getattr(self, "b12x_dcp_transports", {}).values():
+            transport.close()
+        self.b12x_dcp_transports = {}
+        if self.b12x_ar_comm is not None:
+            self.b12x_ar_comm.close()
+            self.b12x_ar_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

@@ -66,6 +66,10 @@ CHECK_STRINGS = {
             "tests/distributed/test_weight_transfer.py",
             "vllm/utils/hashing.py",
             "vllm/v1/token_buffer.py",
+            # b12x preparation results cross the executor/worker boundary
+            "vllm/v1/executor/abstract.py",
+            "vllm/v1/worker/b12x_startup.py",
+            "vllm/v1/worker/worker_base.py",
             "tests/v1/test_request.py",
             "tests/multimodal/media/test_base.py",
             "tests/tokenizers_/test_hf.py",

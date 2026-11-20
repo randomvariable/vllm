@@ -211,6 +211,22 @@ def build_cost_tables_from_curves(
     return draft_table, verify_table
 
 
+def preparation_tail_sizes(
+    capture_sizes: Iterable[int], max_num_tokens: int
+) -> tuple[int, ...]:
+    """Exact eager token counts used to initialize adaptive verification costs."""
+    capture_sizes = tuple(capture_sizes)
+    size = capture_sizes[-1] if capture_sizes else 0
+    tail_sizes = set()
+    if size:
+        tail_sizes.add(min(size + size // 2, max_num_tokens))
+        while size < max_num_tokens:
+            size = min(size * 2, max_num_tokens)
+            tail_sizes.add(size)
+        tail_sizes -= set(capture_sizes)
+    return tuple(sorted(tail_sizes))
+
+
 class AdmittedDraftCounts:
     """Per-request admitted draft counts, in flight to the host."""
 
@@ -316,18 +332,12 @@ class AdaptiveVerificationManager:
         Run these inside StepTimingCollector.collect(), then hand the block's
         timings to set_initial_cost_curves."""
         max_num_tokens = self.req_states.max_num_batched_tokens
-        size = self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
+        self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
         # Also profile beyond the capture limit: real steps run there
         # (piecewise/eager) and linear extrapolation badly underestimates
         # them. These runs double as JIT warmup for the piecewise shapes.
-        tail_sizes: set[int] = set()
-        if size:
-            tail_sizes.add(min(size + size // 2, max_num_tokens))
-            while size < max_num_tokens:
-                size = min(size * 2, max_num_tokens)
-                tail_sizes.add(size)
-            tail_sizes -= set(capture_sizes)
-        for num_tokens in capture_sizes + sorted(tail_sizes):
+        tail_sizes = preparation_tail_sizes(capture_sizes, max_num_tokens)
+        for num_tokens in (*capture_sizes, *tail_sizes):
             for _ in range(_PROFILE_REPLAYS):
                 yield {
                     "num_tokens": num_tokens,

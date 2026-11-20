@@ -297,6 +297,9 @@ class KernelConfig:
     """Benchmark FlashInfer kernel implementations during warmup and use the
     fastest. Enabled by default except at `-O0`; disable for faster startup."""
 
+    enable_b12x_autotune: bool = True
+    """Search uncached b12x choices at startup; mandatory preparation always runs."""
+
     enable_flashinfer_mm_encoder_autotune: bool = False
     """Include multimodal encoders and projectors in FlashInfer autotuning.
     Disabled by default because profiling can increase startup time. Requires
@@ -485,6 +488,14 @@ class KernelConfig:
     experts' scales on each call, which saves memory (2.57 GiB on
     Qwen3.8-Flash-Next-FP4-Local) at some latency at higher batch sizes."""
 
+    b12x_moe_mxfp4_compressed_scales: bool = False
+    """Keep the MXFP4 E8M0 MoE block scales of eligible W4A8 layers compressed
+    on the GPU with the B12X MoE backend. Compact layouts (intermediate size 64
+    modulo 128) read the compressed scales inline when the plan is within the
+    inline token capacity. Other plans expand the routed experts' scales before
+    each call. This saves memory (3.53 GiB per rank on GLM-5.3-Flash TP2). The
+    expansion can lower throughput at higher batch sizes. Off by default."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -522,6 +533,7 @@ class KernelConfig:
             "enable_cutedsl_warmup",
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
+            "enable_b12x_autotune",
             "enable_flashinfer_mm_encoder_autotune",
             "enable_rocm_segmented_attn_autotune",
             "enable_rocm_aiter_gemm_warmup",

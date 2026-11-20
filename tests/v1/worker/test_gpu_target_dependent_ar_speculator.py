@@ -109,6 +109,10 @@ def test_pcp_draft_metadata_keeps_graph_padding_in_decode(cg_mode):
         slot_mappings=torch.tensor([[10, 20, -1, -1]]),
     )
     speculator.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    speculator.idx_mapping = torch.zeros(4, dtype=torch.int32)
+    speculator.model_state = SimpleNamespace(
+        prepare_draft_attn_metadata=lambda **_: None
+    )
     builder = SimpleNamespace(build=build, supports_update_block_table=False)
     speculator.attn_groups = [
         [

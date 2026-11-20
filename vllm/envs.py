@@ -141,7 +141,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
-    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton", "b12x"] = "cuda"
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -369,6 +369,33 @@ if TYPE_CHECKING:
     VLLM_USE_SIMPLE_KV_OFFLOAD: bool = False
     VLLM_USE_SPINLOOP_EXT: bool = False
     VLLM_SKIP_VERSION_SUFFIX: bool = False
+
+    VLLM_B12X_ACTIVATION_MODE_A16_M: int = 0
+    VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
+    VLLM_PCIE_DMA_FP8: str | None = None
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
+    VLLM_PLE_CPU_OFFLOAD: bool = True
+    VLLM_PLE_PREFETCH: bool = False
+    VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
+    VLLM_PLE_SHARED_TABLE_IDENTITY: str | None = None
+    VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S: float = 3600.0
+    VLLM_PLE_SHARED_TABLE_ROLE: Literal["auto", "populate", "attach"] = "auto"
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
+    VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_SHARE_PYNCCL_COMMS: bool = False
+
+    VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
 
 
 def get_default_cache_root():
@@ -1360,11 +1387,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Select the GDN MTP decode implementation. "cuda" uses the fused decode
     # kernel where supported and falls back to "triton" otherwise; setting it
-    # explicitly to "cuda" raises when unsupported.
+    # explicitly to "cuda" raises when unsupported. "b12x" also selects the
+    # b12x GDN prefill.
     "VLLM_GDN_DECODE_KERNEL": env_with_choices(
         "VLLM_GDN_DECODE_KERNEL",
         "cuda",
-        ["cuda", "triton"],
+        ["cuda", "triton", "b12x"],
         case_sensitive=False,
     ),
     # Disable pynccl (using torch.distributed instead)
@@ -2526,6 +2554,107 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
         "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
     ).upper(),
+    # b12x / GB10 integration (monstrous-moonshine)
+    # B12X attention decode/verify through b12x.attention.paged_decode:
+    # "auto" for layers with unequal Q/K and V head dims and for non-causal
+    # FP8-KV layers, "1" for every supported layer, "0" never.
+    "VLLM_B12X_PAGED_DECODE": env_with_choices(
+        "VLLM_B12X_PAGED_DECODE", "auto", ["auto", "0", "1"]
+    ),
+    # Force NVFP4 dense and MoE A16 at M <= cutoff, including small prefills.
+    # Zero disables the cutoff; larger M retains its configured precision.
+    "VLLM_B12X_ACTIVATION_MODE_A16_M": lambda: int(
+        os.getenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "0")
+    ),
+    # Dense activation precision; recipe overrides take precedence.
+    "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
+    ),
+    # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
+    ),
+    # Optional B12X DMA wire codec. Unset uses lossless transport.
+    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
+    # Minimum input size for the DMA ring. Set to "off" to keep large
+    # all-reduces on the normal fallback backend.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Largest input size for the lossless BF16 two-shot. Set a byte size to
+    # opt in; "off" keeps inputs above the one-shot ceiling on the fallback.
+    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "off"
+    ),
+    # Store n-gram embedding tables in pinned CPU memory for UVA lookup.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "1"))),
+    # Advisory prefetch of disk-backed PLE/Engram rows that the next step will
+    # hash. b12x issues the reads only when a B12X_ROW_CACHE_* size is set.
+    "VLLM_PLE_PREFETCH": lambda: bool(int(os.getenv("VLLM_PLE_PREFETCH", "0"))),
+    # tmpfs directory of the shared PLE tables.
+    "VLLM_PLE_SHARED_TABLE_DIR": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_DIR", "/dev/shm/vllm-ple"
+    ),
+    # Checkpoint identity in the shared table key, for example a content hash
+    # supplied by a launcher; derived from the checkpoint location when unset.
+    "VLLM_PLE_SHARED_TABLE_IDENTITY": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_IDENTITY"
+    ),
+    # Seconds to wait while another process populates the shared table.
+    "VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S", "3600")
+    ),
+    # "auto" attaches to a complete table or populates it, "attach" requires
+    # one, "populate" always rewrites it.
+    "VLLM_PLE_SHARED_TABLE_ROLE": env_with_choices(
+        "VLLM_PLE_SHARED_TABLE_ROLE", "auto", ["auto", "populate", "attach"]
+    ),
+    # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
+    # "shared" keeps one host-RAM table per host in VLLM_PLE_SHARED_TABLE_DIR
+    # for every process serving the same checkpoint, such as TP1 replicas.
+    "VLLM_PLE_TABLE_MEMORY": env_with_choices(
+        "VLLM_PLE_TABLE_MEMORY",
+        None,
+        ["ram", "disk", "shared"],
+    ),
+    # Shard BF16 HyperConnection projections with FP32 down-projection outputs.
+    "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
+    ),
+    "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
+    ),
+    # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+    "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+    ),
+    # Largest per-rank shard routed to the RoCE all-gather
+    # (e.g. logits [rows, vocab/tp]).
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    # Groups over the same ranks share one PyNCCL communicator.
+    "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
+        int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
+    ),
 }
 
 

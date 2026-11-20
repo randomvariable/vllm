@@ -175,7 +175,8 @@ class EngineCore:
             measure_encoder_output_widths(vllm_config, self.collective_rpc)
 
             # Setup KV Caches and update CacheConfig after profiling.
-            kv_cache_config = self._initialize_kv_caches(vllm_config)
+            with self.model_executor.b12x_warmup_control():
+                kv_cache_config = self._initialize_kv_caches(vllm_config)
         except BaseException:
             # Otherwise module-level state keeps an in-process model alive.
             try:

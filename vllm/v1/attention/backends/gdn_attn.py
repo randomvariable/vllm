@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     max_decode_query_len,
 )
+from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
@@ -133,6 +134,8 @@ class GDNAttentionMetadata:
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
     aiter_prefill_metadata: object | None = None
+    b12x_prefill_live_counts: torch.Tensor | None = None
+    b12x_mixed: B12xGdnMixedMetadata | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -152,6 +155,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     ) -> int | None:
         del kv_cache_spec
         return max_decode_query_len(vllm_config)
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _resolve_gdn_decode_kernel,
+            _resolve_gdn_prefill_backend,
+        )
+
+        model_type = getattr(vllm_config.model_config.hf_text_config, "model_type", "")
+        if model_type in {"qwen3_8_flash_next_text", "qwen4_exp_text"}:
+            _, prefill = _resolve_gdn_prefill_backend(vllm_config)
+            decode, _ = _resolve_gdn_decode_kernel(vllm_config)
+            if prefill == decode == "b12x":
+                return AttentionCGSupport.ALWAYS
+        return cls._cudagraph_support
 
     reorder_batch_threshold: int = 1
 
@@ -181,7 +199,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         self.gdn_prefill_backend: Literal[
-            "triton", "flashinfer", "cutedsl", "aiter_flydsl", "sycl", "hip"
+            "triton", "flashinfer", "cutedsl", "aiter_flydsl", "sycl", "hip", "b12x"
         ]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
         self._check_chunk_metadata_override(type(self), self.gdn_prefill_backend)
@@ -200,6 +218,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        self._b12x_prefill_live_counts = (
+            torch.zeros(2, dtype=torch.int32, device=device)
+            if self.gdn_prefill_backend == "b12x"
+            else None
+        )
+        self._b12x_mixed = (
+            B12xGdnMixedMetadata(
+                max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+                max_seqs=vllm_config.scheduler_config.max_num_seqs,
+                state_columns=self.num_spec + 1,
+                device=device,
+            )
+            if self.gdn_prefill_backend == "b12x"
+            else None
+        )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
         self.use_full_cuda_graph: bool = (
@@ -358,6 +391,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.vllm_config.cache_config.mamba_cache_mode,
                 self.num_speculative_blocks,
             )
+
+        mixed = self._b12x_mixed
+        if mixed is not None and not m.uniform_decode_graph:
+            mixed.stage(
+                m, block_table_tensor, num_accepted_tokens, num_decode_draft_tokens_cpu
+            )
+        else:
+            mixed = None
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
@@ -571,7 +612,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         cu_seqlens=prefill_query_start_loc,
                     )
                 )
-            elif self.gdn_prefill_backend != "flashinfer":
+            elif self.gdn_prefill_backend not in ("flashinfer", "b12x"):
                 # FlashInfer's chunk kernel consumes cu_seqlens directly and
                 # never reads chunk_indices/chunk_offsets, so skip the FLA
                 # metadata (CPU compute + H2D copies) entirely.
@@ -703,6 +744,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        prefill_live_counts = self._b12x_prefill_live_counts
+        if prefill_live_counts is not None:
+            prefill_live_counts[0].fill_(num_prefills)
+            prefill_live_counts[1].fill_(num_prefill_tokens)
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -720,6 +765,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
             aiter_prefill_metadata=aiter_prefill_metadata,
+            b12x_prefill_live_counts=prefill_live_counts,
+            b12x_mixed=mixed,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
@@ -780,6 +827,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.vllm_config.cache_config.mamba_cache_mode == "align":
             assert self.mamba_aligned_state_indices is not None
             blk_table = self.mamba_aligned_state_indices
+        mixed = None
+        if m.b12x_mixed is not None:
+            mixed = self._b12x_mixed
+            assert mixed is not None
+            mixed.copy_and_refresh_from(m.b12x_mixed, blk_table)
+        if self._b12x_prefill_live_counts is not None:
+            self._b12x_prefill_live_counts[0].fill_(m.num_prefills)
+            self._b12x_prefill_live_counts[1].fill_(m.num_prefill_tokens)
         masks = m.spec_sequence_masks_cpu
         spec_indices = non_spec_indices = prefill_indices = None
         if masks is None:
@@ -819,6 +874,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
             checkpoint=checkpoint,
+            b12x_mixed=mixed,
+            b12x_prefill_live_counts=self._b12x_prefill_live_counts,
         )
 
     def build_for_cudagraph_capture(
@@ -828,6 +885,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
         m = common_attn_metadata
+        if self.gdn_prefill_backend == "b12x":
+            lengths = torch.diff(m.query_start_loc_cpu)
+            if self.use_spec_decode and m.max_query_len <= self.num_spec + 1:
+                accepted = torch.ones(
+                    m.num_reqs, dtype=torch.int32, device=m.query_start_loc.device
+                )
+                drafts = torch.where(lengths > 1, lengths - 1, -1)
+                return self.build(0, m, accepted, drafts)
+            return self.build(0, m)
 
         assert (
             m.num_reqs <= self.decode_cudagraph_max_bs

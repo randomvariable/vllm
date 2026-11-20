@@ -1079,8 +1079,8 @@ class Platform:
             )
             # customize_spec may read the model config (e.g. Octave's rotary dim).
             with set_current_vllm_config(vllm_config):
-                attn_page_size_1_token = backend_cls.customize_spec(
-                    attn_spec
+                attn_page_size_1_token = backend_cls.customize_hybrid_kv_cache_spec(
+                    attn_spec, vllm_config
                 ).page_size_bytes
                 # A drafter whose attention layers hold more KV per token than the
                 # target's (e.g. an EAGLE head with more KV heads) sets the common

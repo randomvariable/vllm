@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
@@ -83,7 +83,15 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
-from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .b12x_ple import B12xNGramEmbedding, _resolve_ple_table_memory
+from .b12x_qsa import Qwen4ExpQSAAttention as B12xQSAAttention
+from .backend import uses_b12x
+from .hyperconnection import (
+    B12xGatedResidual,
+    GatedResidual,
+    HyperConnectionConfig,
+    HyperConnectionWorkspace,
+)
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .mega_moe import Qwen4ExpMegaMoeBlock
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
@@ -93,6 +101,19 @@ from .qsa import Qwen4ExpQSAAttention
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
+
+
+def _is_file_backed_ple_weight(name: str) -> bool:
+    _, marker, shard_suffix = name.rpartition(
+        ".ple.ple_embedding.ngram_embedding.shard_"
+    )
+    shard_index, separator, suffix = shard_suffix.partition(".")
+    return bool(
+        marker
+        and separator
+        and shard_index.isdigit()
+        and suffix in {"weight", "weight_scale"}
+    )
 
 
 def without_modelopt_fp4(
@@ -201,6 +222,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         layer_type: str,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        *,
+        workspace: HyperConnectionWorkspace | None = None,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -238,6 +261,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 reduce_results=not self.use_hc_sequence_parallel,
+                overlap_input_projections=uses_b12x(vllm_config)
+                and envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -251,17 +276,27 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     reduce_results=not self.use_hc_sequence_parallel,
                 )
             else:
-                if topk_indices_buffer is None:
-                    raise ValueError("QSA layers require a shared top-k buffer")
-                self.self_attn = Qwen4ExpQSAAttention(
-                    vllm_config=vllm_config,
-                    config=config,
-                    layer_id=self.layer_idx,
-                    topk_indices_buffer=topk_indices_buffer,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.self_attn",
-                    reduce_results=not self.use_hc_sequence_parallel,
-                )
+                if uses_b12x(vllm_config):
+                    self.self_attn = B12xQSAAttention(
+                        vllm_config=vllm_config,
+                        config=config,
+                        layer_id=self.layer_idx,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.self_attn",
+                        reduce_results=not self.use_hc_sequence_parallel,
+                    )
+                else:
+                    if topk_indices_buffer is None:
+                        raise ValueError("QSA layers require a shared top-k buffer")
+                    self.self_attn = Qwen4ExpQSAAttention(
+                        vllm_config=vllm_config,
+                        config=config,
+                        layer_id=self.layer_idx,
+                        topk_indices_buffer=topk_indices_buffer,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.self_attn",
+                        reduce_results=not self.use_hc_sequence_parallel,
+                    )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
@@ -283,12 +318,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.attn_hyper_connection = GatedResidual(
+        hc_cls = B12xGatedResidual if workspace is not None else GatedResidual
+        hc_kwargs = {"workspace": workspace} if workspace is not None else {}
+        self.attn_hyper_connection = hc_cls(
             hc_config,
+            **hc_kwargs,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
-        self.mlp_hyper_connection = GatedResidual(
+        self.mlp_hyper_connection = hc_cls(
             hc_config,
+            **hc_kwargs,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
@@ -302,6 +341,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        output_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if prev_block_output is None:
             assert prev_injection is None
@@ -345,6 +385,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        if output_indices is not None:
+            hidden_states = hidden_states[output_indices]
+            attn_out = attn_out[output_indices]
+            assert injection is not None
+            injection = injection[output_indices]
         mlp_hc = self.mlp_hyper_connection
         if self.use_hc_sequence_parallel:
             attn_out = sp_reduce_scatter(attn_out)
@@ -425,6 +470,7 @@ class Qwen4ExpModel(nn.Module):
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
+        self._use_b12x = uses_b12x(vllm_config)
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
@@ -458,12 +504,28 @@ class Qwen4ExpModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+        hc_config = HyperConnectionConfig(
+            hc_count=config.hc_count,
+            hidden_size=config.hidden_size,
+            params_dtype=torch.bfloat16,
+            hc_lowrank=config.hc_lowrank,
+            rms_norm_eps=config.rms_norm_eps,
+            hc_per_branch_norm=True,
+        )
+        self.hyper_connection_workspace = (
+            HyperConnectionWorkspace(
+                hc_config, vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            if self._use_b12x
+            else None
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
             return Qwen4ExpDecoderLayer(
                 vllm_config,
                 layer_type=config.layer_types[layer_idx],
+                workspace=self.hyper_connection_workspace,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
             )
@@ -491,9 +553,20 @@ class Qwen4ExpModel(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
             )
-            self.hyper_connection_mixer = GatedResidual(
+            mixer_cls = (
+                B12xGatedResidual
+                if self.hyper_connection_workspace is not None
+                else GatedResidual
+            )
+            mixer_kwargs = (
+                {"workspace": self.hyper_connection_workspace}
+                if self.hyper_connection_workspace is not None
+                else {}
+            )
+            self.hyper_connection_mixer = mixer_cls(
                 hc_config,
                 use_combine=False,
+                **mixer_kwargs,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
@@ -511,13 +584,17 @@ class Qwen4ExpModel(nn.Module):
             and get_pp_group().is_last_rank
         )
         if needs_mtp_hidden:
-            self._mtp_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                config.hc_count * config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
+            self.register_buffer(
+                "_mtp_hidden_buffer",
+                torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    config.hc_count * config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
             )
         else:
-            self._mtp_hidden_buffer = None
+            self.register_buffer("_mtp_hidden_buffer", None, persistent=False)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -770,17 +847,18 @@ class Qwen4ExpForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
-        enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
-        if self.model_config.dtype == torch.bfloat16:
-            # Precompile the fused HC down+SiLU kernels for every CUDA-graph
-            # capture size in the fused dispatch range, so no CuTe-DSL JIT
-            # happens during graph capture.
-            request_hc_down_silu_warmup(
-                vllm_config.compilation_config.cudagraph_capture_sizes or (),
-                self.config.hc_lowrank,
-                self.config.hc_count,
-                self.config.hidden_size * self.config.hc_count,
-            )
+        if not uses_b12x(vllm_config):
+            enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
+            if self.model_config.dtype == torch.bfloat16:
+                # Precompile the fused HC down+SiLU kernels for every CUDA-graph
+                # capture size in the fused dispatch range, so no CuTe-DSL JIT
+                # happens during graph capture.
+                request_hc_down_silu_warmup(
+                    vllm_config.compilation_config.cudagraph_capture_sizes or (),
+                    self.config.hc_lowrank,
+                    self.config.hc_count,
+                    self.config.hidden_size * self.config.hc_count,
+                )
 
     @staticmethod
     def get_model_state_cls():
@@ -955,6 +1033,33 @@ class Qwen4ExpForCausalLM(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    @property
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        if not (uses_b12x(self.vllm_config) and self.config.ple_layer_ids):
+            return None
+        if (
+            _resolve_ple_table_memory(
+                self.vllm_config.additional_config,
+                getattr(self.config, "ple_embedding_dtype", "bfloat16"),
+            )
+            == "io_uring"
+        ):
+            return _is_file_backed_ple_weight
+        embeddings = [
+            module
+            for module in self.modules()
+            if isinstance(module, B12xNGramEmbedding)
+        ]
+        # Attached shared tables already hold every shard row: skip reading them.
+        if embeddings and all(
+            embedding.ngram_embedding.shared_table_attached for embedding in embeddings
+        ):
+            return _is_file_backed_ple_weight
+        return None
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1188,6 +1293,10 @@ class Qwen4ExpForConditionalGeneration(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
         return Qwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
+
+    @property
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        return self.language_model.checkpoint_file_weight_filter
 
 
 __all__ = [

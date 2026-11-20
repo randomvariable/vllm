@@ -232,6 +232,15 @@ def test_profile_run_creates_aux_output_connector_before_forward(
     runner.pooling_runner = None
     runner.ec_connector = NO_OP_EC_CONNECTOR
     monkeypatch.setattr(runner, "_dummy_run", dummy_run)
+    # Scratch reservation and the DeepSeek V4 attention probe need a loaded
+    # model and workspace; this test covers only the connector ordering.
+    monkeypatch.setattr(runner, "_reserve_profile_scratch", lambda: None)
+    monkeypatch.setattr(runner, "_profile_deepseek_v4_attention", lambda _: None)
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(reserve_by_lane=lambda: None),
+    )
 
     runner.profile_run()
 

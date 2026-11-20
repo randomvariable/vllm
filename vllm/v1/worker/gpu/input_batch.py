@@ -131,6 +131,15 @@ class InputBatch:
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
 
+    # The selected full graph specializes uniform decode. This is not inferred
+    # from dummy query lengths: a mixed graph may be captured with uniform rows.
+    uniform_decode_graph: bool = False
+
+    # Dummy batch for any CUDA graph capture, FULL or PIECEWISE. Operations
+    # recorded inside a PIECEWISE graph must size their metadata for every
+    # replay, not for the dummy sequence lengths.
+    cudagraph_capture: bool = False
+
     @classmethod
     def make_dummy(
         cls,

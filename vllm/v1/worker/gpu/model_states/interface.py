@@ -184,6 +184,34 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        """Start nonblocking advisory work with drafts in batch order."""
+        return None
+
+    def row_cache_stats(self) -> Any | None:
+        """Return advisory prefetch and row-cache counters, if available."""
+        return None
+
+    def prepare_draft_attn_metadata(
+        self,
+        *,
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+        draft_index: int,
+    ) -> ModelSpecificAttnMetadata | None:
+        """Build model-specific metadata for a draft lookahead forward."""
+        return None
+
+    def get_model_positions(self, input_batch: InputBatch) -> torch.Tensor:
+        """Return the positions prepared for the target model forward."""
+        return input_batch.positions
+
     @abstractmethod
     def prepare_inputs_embeds(
         self,

@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Stable worklists for mixed GDN prefill and speculative verification."""
+
+from types import SimpleNamespace
+
+import torch
+
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import PIN_MEMORY
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_non_spec",
+        "num_spec",
+        "state_stride",
+        "state_column_stride",
+    ]
+)
+def _copy_worklists_and_refresh_states(
+    sources,
+    destinations,
+    request_rows,
+    spec_request_rows,
+    states,
+    output_states,
+    output_spec_states,
+    num_non_spec,
+    num_spec,
+    state_stride,
+    state_column_stride,
+    SIZES: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    STATE_COLUMNS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    for field in tl.static_range(len(SIZES)):
+        value = tl.load(sources[field] + index, index < SIZES[field], other=0)
+        tl.store(destinations[field] + index, value, index < SIZES[field])
+
+    row = tl.load(request_rows + index, index < num_non_spec, other=0).to(tl.int64)
+    state = tl.load(states + row * state_stride, index < num_non_spec, other=0)
+    tl.store(output_states + index, state, index < MAX_SEQS)
+
+    spec_row = index // STATE_COLUMNS
+    spec_column = index % STATE_COLUMNS
+    row = tl.load(spec_request_rows + spec_row, spec_row < num_spec, other=0).to(
+        tl.int64
+    )
+    state = tl.load(
+        states + row * state_stride + spec_column * state_column_stride,
+        spec_row < num_spec,
+        other=0,
+    )
+    tl.store(output_spec_states + index, state, spec_row < MAX_SEQS)
+
+
+class B12xGdnMixedMetadata:
+    """Builder-owned buffers; live partitions change without changing pointers."""
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int,
+        max_seqs: int,
+        state_columns: int,
+        device: torch.device,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.max_seqs = max_seqs
+        self.state_columns = state_columns
+
+        def zeros(*shape, dtype=torch.int32):
+            return torch.zeros(shape, dtype=dtype, device=device)
+
+        self.query_start_loc = zeros(max_seqs + 1)
+        self.state_indices = zeros(max_seqs)
+        self.has_initial_state = zeros(max_seqs, dtype=torch.bool)
+        self.live_counts = zeros(2)
+        self.token_indices = zeros(max_tokens, dtype=torch.int64)
+        self.request_rows = zeros(max_seqs, dtype=torch.int64)
+        self.spec_query_start_loc = zeros(max_seqs + 1)
+        self.spec_state_indices = zeros(max_seqs, state_columns)
+        self.spec_accepted = torch.ones(max_seqs, dtype=torch.int32, device=device)
+        self.spec_counts = zeros(2)
+        self.spec_token_indices = zeros(max_seqs * state_columns, dtype=torch.int64)
+        self.spec_request_rows = zeros(max_seqs, dtype=torch.int64)
+        self.batch_ptr = torch.full(
+            ((max_tokens + 7) // 8 + max_seqs,), -1, dtype=torch.int32, device=device
+        )
+        self.token_chunk_offset_ptr = torch.zeros_like(self.batch_ptr)
+        worklists = (
+            self.query_start_loc,
+            self.has_initial_state,
+            self.live_counts,
+            self.token_indices,
+            self.request_rows,
+            self.spec_query_start_loc,
+            self.spec_accepted,
+            self.spec_counts,
+            self.spec_token_indices,
+            self.spec_request_rows,
+            self.batch_ptr,
+            self.token_chunk_offset_ptr,
+        )
+        self._worklists = worklists
+        self._worklist_sizes = tuple(value.numel() for value in worklists)
+        self._refresh_blocks = triton.cdiv(
+            max(*self._worklist_sizes, self.spec_state_indices.numel()), 256
+        )
+        self._worklists_by_dtype = tuple(
+            tuple(value for value in worklists if value.dtype == dtype)
+            for dtype in (torch.int32, torch.int64, torch.bool)
+        )
+        self._num_non_spec = 0
+        self._num_spec = 0
+
+    @staticmethod
+    def _copy_list(target: torch.Tensor, values: list[int], *, padding: int = 0):
+        target.fill_(padding)
+        if values:
+            source = torch.tensor(
+                values,
+                dtype=target.dtype,
+                device="cpu",
+                pin_memory=PIN_MEMORY and target.is_cuda,
+            )
+            target[: len(values)].copy_(source, non_blocking=True)
+
+    def stage(
+        self,
+        common,
+        state_indices: torch.Tensor,
+        accepted: torch.Tensor | None,
+        draft_tokens_cpu: torch.Tensor | None,
+    ) -> None:
+        starts = common.query_start_loc_cpu[: common.num_reqs + 1].tolist()
+        if len(starts) - 1 > self.max_seqs or starts[-1] > self.max_tokens:
+            raise ValueError("GDN batch exceeds planned mixed-batch capacity")
+        drafts = None if draft_tokens_cpu is None else draft_tokens_cpu.tolist()
+        spec_rows, non_spec_rows = [], []
+        for row, (start, end) in enumerate(zip(starts, starts[1:])):
+            if end == start:
+                continue
+            if (
+                drafts is not None
+                and drafts[row] >= 0
+                and end - start == drafts[row] + 1
+            ):
+                if end - start > self.state_columns:
+                    raise ValueError("GDN verification exceeds planned state columns")
+                spec_rows.append(row)
+            else:
+                non_spec_rows.append(row)
+        self._num_non_spec, self._num_spec = len(non_spec_rows), len(spec_rows)
+        for rows, cu, indices, row_indices, counts in (
+            (
+                non_spec_rows,
+                self.query_start_loc,
+                self.token_indices,
+                self.request_rows,
+                self.live_counts,
+            ),
+            (
+                spec_rows,
+                self.spec_query_start_loc,
+                self.spec_token_indices,
+                self.spec_request_rows,
+                self.spec_counts,
+            ),
+        ):
+            offsets = [0]
+            tokens: list[int] = []
+            for row in rows:
+                tokens.extend(range(starts[row], starts[row + 1]))
+                offsets.append(len(tokens))
+            self._copy_list(cu, offsets, padding=len(tokens))
+            self._copy_list(indices, tokens)
+            self._copy_list(row_indices, rows)
+            self._copy_list(counts, [len(rows), len(tokens)])
+
+        self.has_initial_state.zero_()
+        if non_spec_rows:
+            rows = self.request_rows[: len(non_spec_rows)]
+            computed = common.seq_lens - common.query_start_loc.diff()
+            self.has_initial_state[: len(non_spec_rows)].copy_(computed[rows] > 0)
+        self.spec_accepted.fill_(1)
+        if spec_rows:
+            if accepted is None:
+                raise ValueError("GDN verification requires accepted-token counts")
+            self.spec_accepted[: len(spec_rows)].copy_(
+                accepted[self.spec_request_rows[: len(spec_rows)]]
+            )
+
+        conv_rows: list[int] = []
+        conv_offsets: list[int] = []
+        for packed_row, row in enumerate(non_spec_rows):
+            chunks = (starts[row + 1] - starts[row] + 7) // 8
+            conv_rows.extend([packed_row] * chunks)
+            conv_offsets.extend(range(chunks))
+        self._copy_list(self.batch_ptr, conv_rows, padding=-1)
+        self._copy_list(self.token_chunk_offset_ptr, conv_offsets)
+
+        self.refresh_state_indices(state_indices)
+
+    def copy_worklists_from(self, source: "B12xGdnMixedMetadata") -> None:
+        if source is self:
+            return
+        if (self.max_tokens, self.max_seqs, self.state_columns) != (
+            source.max_tokens,
+            source.max_seqs,
+            source.state_columns,
+        ):
+            raise ValueError("GDN metadata reuse requires matching planned capacities")
+        self._num_non_spec = source._num_non_spec
+        self._num_spec = source._num_spec
+        for destination, inputs in zip(
+            self._worklists_by_dtype, source._worklists_by_dtype
+        ):
+            torch._foreach_copy_(destination, inputs, non_blocking=True)
+
+    def copy_and_refresh_from(
+        self,
+        source: "B12xGdnMixedMetadata",
+        state_indices: torch.Tensor,
+    ) -> None:
+        """Keep captured group buffers while refreshing them in one GPU launch."""
+        if source is self or not self.state_indices.is_cuda:
+            self.copy_worklists_from(source)
+            self.refresh_state_indices(state_indices)
+            return
+        if (self.max_tokens, self.max_seqs, self.state_columns) != (
+            source.max_tokens,
+            source.max_seqs,
+            source.state_columns,
+        ):
+            raise ValueError("GDN metadata reuse requires matching planned capacities")
+        self._num_non_spec = source._num_non_spec
+        self._num_spec = source._num_spec
+        _copy_worklists_and_refresh_states[(self._refresh_blocks,)](
+            source._worklists,
+            self._worklists,
+            source.request_rows,
+            source.spec_request_rows,
+            state_indices,
+            self.state_indices,
+            self.spec_state_indices,
+            self._num_non_spec,
+            self._num_spec,
+            state_indices.stride(0),
+            state_indices.stride(1),
+            SIZES=self._worklist_sizes,
+            MAX_SEQS=self.max_seqs,
+            STATE_COLUMNS=self.state_columns,
+            BLOCK=256,
+        )
+
+    def refresh_state_indices(self, state_indices) -> None:
+        self.state_indices.zero_()
+        self.spec_state_indices.zero_()
+        if self._num_non_spec:
+            rows = self.request_rows[: self._num_non_spec]
+            self.state_indices[: self._num_non_spec].copy_(state_indices[rows, 0])
+        if self._num_spec:
+            rows = self.spec_request_rows[: self._num_spec]
+            self.spec_state_indices[: self._num_spec].copy_(
+                state_indices[rows, : self.state_columns]
+            )
+
+    def convolution_metadata(self, token_capacity: int):
+        programs = (token_capacity + 7) // 8 + self.max_seqs
+        return SimpleNamespace(
+            batch_ptr=self.batch_ptr,
+            token_chunk_offset_ptr=self.token_chunk_offset_ptr,
+            nums_dict={
+                8: dict(
+                    tot=programs,
+                    mlist=None,
+                    mlist_len=0,
+                    offsetlist=None,
+                    batch_ptr=self.batch_ptr,
+                    token_chunk_offset_ptr=self.token_chunk_offset_ptr,
+                )
+            },
+        )

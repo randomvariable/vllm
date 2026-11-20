@@ -165,6 +165,13 @@ class AttentionBackend(ABC):
         return spec
 
     @classmethod
+    def customize_hybrid_kv_cache_spec(
+        cls, spec: "AttentionSpec", vllm_config: "VllmConfig"
+    ) -> "AttentionSpec":
+        """Adjust the probe used to size attention against recurrent state."""
+        return cls.customize_spec(spec)
+
+    @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         supported_sizes = cls.get_supported_kernel_block_sizes()
         if not supported_sizes:
@@ -491,6 +498,9 @@ class CommonAttentionMetadata:
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
+    # True only when the selected graph excludes mixed/prefill kernels.
+    uniform_decode_graph: bool = False
+
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
 
@@ -619,6 +629,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # eager build() is needed between steps or between the batches that replay
     # it, whether the graph holds one draft forward or a multi-step loop.
     supports_draft_decode_metadata_update: bool = False
+    # Variable-length decode can be graph-safe without graph-safe mixed prefill.
+    supports_varlen_decode_cudagraph: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(
@@ -1034,6 +1046,10 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""
 
     supports_pcp: bool = True
+
+    def uses_full_ckv_dcp(self, attn_metadata: T, num_tokens: int) -> bool:
+        """Whether this call attends a transient globally gathered DCP cache."""
+        return False
 
     def get_fp8_ds_mla_row_bytes(self) -> int:
         return 656

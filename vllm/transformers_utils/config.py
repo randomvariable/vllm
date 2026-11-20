@@ -1036,6 +1036,11 @@ def get_config(
         sentence_transformers.pop("activation_fn", None)
         config.sbert_ce_default_activation_function = act_fn
 
+    if config.model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        from vllm.models.qwen4_exp.ple_dtype import resolve_ple_embedding_dtype
+
+        resolve_ple_embedding_dtype(config, config_dict, model, revision)
+
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)
         config.update(hf_overrides_kw)

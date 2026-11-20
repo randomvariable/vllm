@@ -12,6 +12,7 @@ import signal
 import sys
 from collections.abc import Callable, Generator
 from pathlib import Path
+from typing import TextIO
 
 import psutil
 
@@ -228,6 +229,15 @@ def decorate_logs(
         process_name = multiprocessing.current_process().name
 
     set_vllm_process_name(process_name, skip_if_set=skip_if_decorated)
+
+
+def undecorated_log_stream(stream: TextIO) -> TextIO:
+    """Return a stream that writes terminal control sequences unmodified.
+
+    `decorate_logs` attaches process metadata to log records rather than
+    rewriting stream writes, so the stream itself is already undecorated.
+    """
+    return stream
 
 
 def kill_process_tree(pid: int):

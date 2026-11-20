@@ -133,6 +133,14 @@ class DPMetadata:
         return torch.cumsum(num_tokens_across_sp_cpu, dim=0)
 
 
+@dataclass(frozen=True)
+class MoEPrefillMetadata:
+    """Semantic prefill ranges in a target forward's padded token ordering."""
+
+    num_tokens: int
+    prefill_ranges: tuple[tuple[int, int], ...]
+
+
 @dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
@@ -159,6 +167,8 @@ class ForwardContext:
     # tokens. Consumers can use it to skip work for padded tokens. None when
     # the producer does not set it.
     is_padding: torch.Tensor | None = None
+
+    moe_prefill_metadata: MoEPrefillMetadata | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
@@ -234,6 +244,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    moe_prefill_metadata: MoEPrefillMetadata | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -252,6 +263,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        moe_prefill_metadata=moe_prefill_metadata,
     )
 
 
@@ -282,6 +294,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    moe_prefill_metadata: MoEPrefillMetadata | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -349,6 +362,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        moe_prefill_metadata=moe_prefill_metadata,
     )
 
     try:

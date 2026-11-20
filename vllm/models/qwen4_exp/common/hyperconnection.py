@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 
 def is_hc_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
@@ -79,6 +80,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.group_size = group_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        self.weight.weight_loader = default_weight_loader
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype

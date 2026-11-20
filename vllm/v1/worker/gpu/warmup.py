@@ -27,13 +27,26 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.request import Request
+from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 from vllm.v1.worker.extensible_kv_cache import (
     ensure_kv_cache_blocks,
     num_committable_kv_blocks,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
 
 logger = init_logger(__name__)
+
+
+def warmup_prefill_shape(
+    *,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    decode_query_len: int,
+) -> tuple[int, int]:
+    """Prefill query length and request limit used by sampler warmup."""
+    prompt_len = decode_query_len + 1
+    return prompt_len, min(max_num_seqs, max_num_batched_tokens // prompt_len)
 
 
 def _reserved_block_count(
@@ -559,6 +572,20 @@ def warmup_kernels(
             _warmup_kernels(
                 model_runner, worker_execute_model, worker_sample_tokens, greedy=True
             )
+    if model_runner.is_last_pp_rank and not model_runner.is_pooling_model:
+        warmup_processed_gumbel(
+            model_runner.model_config.get_vocab_size(),
+            model_runner.device,
+            use_fp64=model_runner.model_config.use_fp64_gumbel,
+        )
+        warmup_top_k_top_p(
+            model_runner.model_config.get_vocab_size(),
+            min(
+                model_runner.scheduler_config.max_num_batched_tokens,
+                model_runner.max_num_reqs * model_runner.decode_query_len,
+            ),
+            model_runner.device,
+        )
     adaptive_verification = model_runner.adaptive_verification
     if adaptive_verification is not None:
         adaptive_verification.warmup_budget_kernel()
@@ -583,7 +610,11 @@ def _warmup_kernels(
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    prompt_len, _ = warmup_prefill_shape(
+        max_num_seqs=model_runner.scheduler_config.max_num_seqs,
+        max_num_batched_tokens=model_runner.scheduler_config.max_num_batched_tokens,
+        decode_query_len=decode_query_len,
+    )
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
