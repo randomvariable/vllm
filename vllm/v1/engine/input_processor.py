@@ -560,6 +560,9 @@ class InputProcessor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_input.get("cache_salt"),
+            recurrent_instruction_boundary=decoder_input.get(
+                "recurrent_instruction_boundary"
+            ),
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,

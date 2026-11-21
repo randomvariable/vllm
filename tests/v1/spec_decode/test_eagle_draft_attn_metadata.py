@@ -61,6 +61,8 @@ def _make_fake_speculator(
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
         max_model_len=max_model_len,
         draft_max_seq_len=draft_max_seq_len,
+        model_state=SimpleNamespace(prepare_draft_attn_metadata=lambda **_: None),
+        idx_mapping=torch.arange(max_num_reqs, dtype=torch.int32),
     )
     # The uniform wrapper delegates through self; bind the real implementation.
     fake._build_attn_metadata = MethodType(EagleSpeculator._build_attn_metadata, fake)

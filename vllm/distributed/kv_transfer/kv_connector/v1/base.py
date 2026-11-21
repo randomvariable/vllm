@@ -67,9 +67,11 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
 CopyBlocksOp = Callable[
@@ -535,6 +537,58 @@ class KVConnectorBase_V1(ABC):
         """Bind the scheduler's cache manager after it has been constructed."""
         self._kv_cache_manager = kv_cache_manager
         self.bind_gpu_block_pool(kv_cache_manager.block_pool)
+
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        """Bind the cache manager's capture-pin releaser.
+
+        A connector whose boundary stores source frozen capture blocks must
+        release the manager pin when a store job completes or the offer is
+        dropped. Connectors that never source capture blocks ignore it (the
+        manager's pin dict stays empty, so a missed release cannot leak).
+        """
+        return None
+
+    @classmethod
+    def supports_request_boundary_checkpoints(cls, config: "VllmConfig") -> bool:
+        """Whether configuration selects a complete external checkpoint adapter."""
+        return False
+
+    def bind_boundary_checkpoint_cache(self, manager: "KVCacheManager") -> None:
+        """Bind the scheduler allocator for atomic external checkpoint imports.
+
+        A connector advertising request-boundary support must implement the
+        all-rank transfer contract. Ordinary aligned connectors do not use it.
+        """
+        if manager.boundary_checkpoints is not None:
+            raise NotImplementedError("Connector cannot transfer recurrent checkpoints")
+
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        """Bind worker-owned physical pages and their address-free byte layout."""
+        raise NotImplementedError("Connector cannot transfer recurrent checkpoints")
+
+    def boundary_checkpoint_external_tokens(self, request: "Request") -> int:
+        """Attribute an admitted imported bundle to external, not GPU-cache hits."""
+        return 0
+
+    def store_boundary_checkpoint(
+        self, request: "Request", checkpoint: "BoundaryCheckpoint"
+    ) -> None:
+        """Optionally retain and asynchronously store an already committed bundle.
+
+        The connector must acquire independent source pins before returning
+        and release them only after every worker's D2H operation completes.
+        """
+        return
+
+    def poll_boundary_checkpoint(self, request: "Request") -> bool:
+        """Return False while an atomic external checkpoint import is pending.
+
+        A True result permits ordinary local lookup. It is not a hit claim;
+        imported bundles must first be published by the allocator after all
+        worker copies complete. Cancellation must retain destinations until
+        every submitted copy drains.
+        """
+        return True
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """Bind the GPU block pool to the connector for per-GPU block status tracking.

@@ -327,6 +327,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+    # Per request: prompt, response, instruction and prefill-tail captures.
+    boundary_checkpoint_tokens: list[list[int]] | None = None
 
     # Iterations whose GPU timing has completed; see IterationTimer.
     iteration_records: list[SchedulerIterationDetails] = field(default_factory=list)

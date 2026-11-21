@@ -87,6 +87,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.conf_compute_utils import install as install_conf_compute_copy_patches
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import (
@@ -120,6 +121,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -220,6 +222,7 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        self.boundary_checkpoint_state: BoundaryCheckpointState | None = None
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -892,12 +895,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
             self.compilation_config.static_forward_context
         )
+        self.boundary_checkpoint_state = (
+            BoundaryCheckpointState(
+                self.model_state,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                self.speculator.model if self.speculator is not None else None,
+            )
+            if self.vllm_config.use_request_boundary_checkpoints and not is_profiling
+            else None
+        )
 
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_caches_by_layer = kv_caches_dict
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            if self.boundary_checkpoint_state is not None:
+                self.kv_connector.bind_boundary_checkpoint_state(
+                    self.boundary_checkpoint_state
+                )
 
             # AuxOutput connector requires resolved kv_cache_config.
             if self.vllm_config.aux_output_config.enabled:
@@ -1227,6 +1244,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
         # Runs before the KV cache exists, outside compile_or_warm_up_model.
         with self.eplb.suppress():
+            if prepare_profile_state is None:
+                return _profile_cudagraph_memory(self)
             return _profile_cudagraph_memory(self, prepare_profile_state)
 
     def needs_cudagraph_capture(self) -> bool:
@@ -1420,6 +1439,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
+            if self.boundary_checkpoint_state is not None:
+                self.boundary_checkpoint_state.add_request(req_index, new_req_data)
             mrope_position_delta = self.model_state.get_mrope_position_delta(req_index)
             if mrope_position_delta is not None:
                 self.kv_connector.record_mrope_position_delta(
@@ -1913,6 +1934,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc: torch.Tensor | None = None,
         # Drafts received from the last PP rank (non-last ranks only).
         draft_tokens: torch.Tensor | None = None,
+        boundary_capture: torch.Tensor | None = None,
+        logits_only: bool = False,
     ) -> None:
         # Update the number of computed tokens.
         output_bin_counts = None
@@ -1932,7 +1955,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.total_len.gpu,
             draft_tokens,
             self.req_states.draft_tokens,
+            self.boundary_checkpoint_state if boundary_capture is not None else None,
+            boundary_capture,
         )
+        if boundary_capture is not None:
+            assert self.boundary_checkpoint_state is not None
+            self.boundary_checkpoint_state.capture_mamba(idx_mapping, boundary_capture)
+        if logits_only:
+            return
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
@@ -1973,6 +2003,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for req_id, updates in scheduler_output.encoder_input_updates.items():
                     self.encoder_cache.update_encoder_inputs(req_id, updates)
             self.block_tables.apply_staged_writes()
+            if (
+                self.boundary_checkpoint_state is not None
+                and self.speculator is not None
+            ):
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    checkpoint = new_req.boundary_checkpoint
+                    if (
+                        checkpoint is not None
+                        and not scheduler_output.boundary_logits_only
+                    ):
+                        assert new_req.prefill_token_ids is not None
+                        self.boundary_checkpoint_state.replay_draft(
+                            self,
+                            new_req.req_id,
+                            checkpoint.num_tokens,
+                            checkpoint.auxiliary_block_ids[0],
+                            token=new_req.prefill_token_ids[checkpoint.num_tokens],
+                        )
             if self.aux_output_connector is not None:
                 # Register this step before the GPU forward.
                 self.aux_output_connector.begin_step(
@@ -2050,6 +2098,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            if scheduler_output.boundary_logits_only:
+                assert self.boundary_checkpoint_state is not None
+                assert input_batch.num_reqs == 1
+                request = scheduler_output.scheduled_new_reqs[0]
+                checkpoint = request.boundary_checkpoint
+                assert checkpoint is not None and request.prefill_token_ids is not None
+                input_batch.positions.fill_(checkpoint.num_tokens - 1)
+                input_batch.input_ids.fill_(request.prefill_token_ids[-1])
+                input_batch.seq_lens.fill_(checkpoint.num_tokens)
+                input_batch.seq_lens_cpu_upper_bound.fill_(checkpoint.num_tokens)
+                self.kv_connector.pre_forward(scheduler_output)
+                self.kv_connector.finish_forward()
+                self.execute_model_state = ExecuteModelState(
+                    input_batch=input_batch,
+                    attn_metadata=None,
+                    slot_mappings_by_layer=None,
+                    hidden_states=self.boundary_checkpoint_state.get_hidden_states(
+                        checkpoint.auxiliary_block_ids[0]
+                    ),
+                    aux_hidden_states=None,
+                    dp_sync_state=dp_sync_state,
+                    finished_req_ids=scheduler_output.finished_req_ids,
+                    ec_connector_output=None,
+                    cudagraph_stats=cudagraph_stats,
+                    num_spec_tokens_to_schedule=(
+                        0
+                        if (
+                            dp_sync_state.skip_drafts
+                            if dp_sync_state is not None
+                            else scheduler_output.skip_drafts
+                        )
+                        else scheduler_output.num_spec_tokens_to_schedule
+                    ),
+                    boundary_logits_only=True,
+                    boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
+                )
+                return None
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -2391,6 +2476,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        execute_model_state = self.execute_model_state
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2418,6 +2504,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
+        boundary_logits_only = execute_model_state.boundary_logits_only
+        boundary_aux_block_id = execute_model_state.boundary_aux_block_id
         assert hidden_states is not None
         draft_hidden_states = hidden_states
         if self.pcp_manager is not None:
@@ -2471,18 +2559,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_drafted_tokens_per_req, num_verified_tokens_per_req = (
             self._get_num_drafted_and_verified(input_batch)
         )
-        # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-            check_ep_fault=self.check_ep_fault,
-            pending_aux_output=pending_aux_output,
-            num_drafted_tokens_per_req=num_drafted_tokens_per_req,
-            num_verified_tokens_per_req=num_verified_tokens_per_req,
+        boundary_state = (
+            None if boundary_logits_only else self.boundary_checkpoint_state
         )
+        boundary_capture = (
+            torch.empty(
+                (3, input_batch.num_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if boundary_state is not None
+            else None
+        )
+        # The capture kernel adjusts sampled counts; copy them after postprocessing.
+        async_output = None
+        if boundary_state is None:
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                pending_aux_output=pending_aux_output,
+                num_drafted_tokens_per_req=num_drafted_tokens_per_req,
+                num_verified_tokens_per_req=num_verified_tokens_per_req,
+            )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
         defer_kv_finalize = self.speculator is not None
@@ -2518,10 +2620,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output.sampled_token_ids,
             num_sampled,
             num_rejected,
-            input_batch.query_start_loc,
+            None if boundary_logits_only else input_batch.query_start_loc,
+            boundary_capture=boundary_capture,
+            logits_only=boundary_logits_only,
         )
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            spec_hidden = (
+                get_drafter_hidden_states(self.model, hidden_states)
+                if self.speculator is not None
+                else None
+            )
+            boundary_state.capture_auxiliary(
+                input_batch.idx_mapping, boundary_capture, hidden_states, spec_hidden
+            )
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                pending_aux_output=pending_aux_output,
+                num_drafted_tokens_per_req=num_drafted_tokens_per_req,
+                num_verified_tokens_per_req=num_verified_tokens_per_req,
+                boundary_checkpoint_tokens=boundary_capture[0],
+            )
 
-        if self.speculator is not None:
+        if self.speculator is not None and boundary_logits_only and num_spec_tokens > 0:
+            assert self.boundary_checkpoint_state is not None
+            draft_tokens = self.boundary_checkpoint_state.replay_draft(
+                self,
+                input_batch.req_ids[0],
+                int(input_batch.seq_lens_cpu_upper_bound[0]),
+                boundary_aux_block_id,
+                num_speculative_tokens=num_spec_tokens,
+            )
+            self.req_states.draft_tokens[input_batch.idx_mapping, :num_spec_tokens] = (
+                draft_tokens[:, :num_spec_tokens]
+            )
+        elif self.speculator is not None and not boundary_logits_only:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.prepare_propose(
@@ -2531,22 +2669,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model, draft_hidden_states
             )
             with self.draft_context():
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    num_speculative_tokens=num_spec_tokens,
-                    dp_sync_state=dp_sync_state,
-                    mm_inputs=mm_inputs,
-                )
+                if boundary_state is not None:
+                    self.speculator.boundary_checkpoint_capture = (
+                        boundary_state,
+                        input_batch.idx_mapping,
+                        boundary_capture,
+                    )
+                try:
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        num_speculative_tokens=num_spec_tokens,
+                        dp_sync_state=dp_sync_state,
+                        mm_inputs=mm_inputs,
+                    )
+                finally:
+                    if boundary_state is not None:
+                        self.speculator.boundary_checkpoint_capture = None
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
@@ -2579,6 +2727,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, self.req_states, draft_tokens_for_next_step
         )
 
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            boundary_state.capture_attention(
+                input_batch.idx_mapping, boundary_capture, self.block_tables
+            )
         if defer_kv_finalize:
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
@@ -2671,6 +2824,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         set_offloader(None)
         self.cudagraph_manager = None
         self.fast_prefill = None
+        self.boundary_checkpoint_state = None
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
@@ -2753,6 +2907,8 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    boundary_logits_only: bool = False
+    boundary_aux_block_id: int = 0
 
 
 class BatchReqState(NamedTuple):

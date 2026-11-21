@@ -1059,6 +1059,23 @@ def generate_lookahead_block_hash_extra_keys(
     return extra_keys, mm_idx
 
 
+def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -> int:
+    if not num_groups or not vllm_config.use_request_boundary_checkpoints:
+        return 0
+    from vllm.v1.core.boundary_checkpoint import (
+        NUM_BOUNDARY_CHECKPOINT_SLOTS,
+        get_prefill_tail_checkpoint_position,
+    )
+
+    scheduler = vllm_config.scheduler_config
+    budget = scheduler.max_num_scheduled_tokens or scheduler.max_num_batched_tokens
+    tail = get_prefill_tail_checkpoint_position(
+        vllm_config.model_config.max_model_len, budget, None
+    )
+    slots = NUM_BOUNDARY_CHECKPOINT_SLOTS - int(tail is None)
+    return (slots + 1) * (num_groups + 1)
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1078,6 +1095,10 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
+    num_blocks_per_request += _request_boundary_reserve_blocks(
+        vllm_config,
+        sum(not group.host_resident for group in kv_cache_config.kv_cache_groups),
+    )
     limits = [kv_cache_config.num_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None

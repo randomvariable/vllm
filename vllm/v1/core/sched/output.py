@@ -23,9 +23,11 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
+    BoundaryCheckpoint = object
     AuxOutputConnectorMetadata = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -53,6 +55,10 @@ class NewRequestData:
     prompt_is_token_ids: list[bool] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    boundary_checkpoint: BoundaryCheckpoint | None = None
+    boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+    recurrent_instruction_boundary: int | None = None
+    recurrent_prefill_tail_boundary: int | None = None
 
     @classmethod
     def from_request(
@@ -79,6 +85,10 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            boundary_checkpoint=request.boundary_checkpoint,
+            boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
+            recurrent_prefill_tail_boundary=request.recurrent_prefill_tail_boundary,
         )
 
     def __setstate__(self, state: dict) -> None:
@@ -280,6 +290,7 @@ class SchedulerOutput:
 
     # Optional scheduling-time snapshot, before worker-side token adjustments.
     iteration_details: IterationDetails | None = None
+    boundary_logits_only: bool = False
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

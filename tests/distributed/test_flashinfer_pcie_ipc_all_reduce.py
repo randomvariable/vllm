@@ -115,6 +115,7 @@ def test_cuda_dispatch_prefers_pcie_ipc_before_existing_flashinfer(monkeypatch):
     expected = object()
     communicator.fi_pcie_ipc_ar_comm.all_reduce.return_value = expected
     communicator.fi_ar_comm = Mock()
+    communicator.b12x_ar_comm = None
     communicator.aiter_ar_comm = None
     communicator.ca_comm = None
     communicator.symm_mem_comm = None

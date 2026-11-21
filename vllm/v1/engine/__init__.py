@@ -236,6 +236,10 @@ class EngineCoreRequest(
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
 
+    # Verified exclusive token offset after leading chat instructions. Appended
+    # to preserve the positional wire format of existing request fields.
+    recurrent_instruction_boundary: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

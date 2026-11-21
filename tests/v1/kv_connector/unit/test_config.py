@@ -150,6 +150,20 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
         _build_config(kv_connector=kv_connector)
 
 
+@pytest.mark.parametrize("mode,allowed", [("engine_driven", True), ("auto", False)])
+def test_recurrent_connector_expandable_segments(monkeypatch, mode, allowed):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    kwargs = {
+        "kv_connector": "LMCacheRecurrentCheckpointConnector",
+        "kv_connector_extra_config": {"lmcache.mp.mp_transfer_mode": mode},
+    }
+    if allowed:
+        _build_config(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="expandable_segments"):
+            _build_config(**kwargs)
+
+
 def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):
     """Sleep mode routes KV allocations through CuMemAllocator's pool, which
     auto-disables expandable_segments (see #40812)."""

@@ -245,8 +245,42 @@ class Qwen4ExpModelState(MambaHybridModelState):
             # RoPE, and anchor pools still contain the prior owner's data.  The
             # flag remains set through the complete next model forward so every
             # QSA layer independently resets its slot.
-            self.qsa_state_is_fresh_gpu[req_index].fill_(True)
+            #
+            # Only the boundary-checkpoint restore carries the producer's
+            # committed selector pools into this slot; a KV connector restores
+            # KV pages, never these per-slot module buffers. A resumed prefix
+            # without a checkpoint (local hit or connector external resume)
+            # still owns a recycled slot, so it keeps the fresh reset. The
+            # condition mirrors BoundaryCheckpointState.add_request, the only
+            # pool writer.
+            checkpoint = new_req_data.boundary_checkpoint
+            restored_selector_state = (
+                checkpoint is not None
+                and new_req_data.boundary_checkpoint_blocks is not None
+            )
+            self.qsa_state_is_fresh_gpu[req_index].fill_(not restored_selector_state)
             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
+            if restored_selector_state:
+                assert checkpoint is not None
+                # The skipped fresh reset would derive the anchor as
+                # first_position - accepted = prefix_len - 1; seed that value
+                # so the selector state is consistent before the first forward.
+                anchor = checkpoint.num_tokens - 1
+                for module in self._qsa_state_modules:
+                    module.set_recurrent_checkpoint_anchor(req_index, anchor)
+
+    @functools.cached_property
+    def _qsa_state_modules(self) -> tuple[nn.Module, ...]:
+        """QSA layers owning per-request selector pools (ring, tags, anchor).
+
+        Mirrors BoundaryCheckpointState.target_modules: the pools are module
+        buffers indexed by request slot.
+        """
+        return tuple(
+            module
+            for module in self.model.modules()
+            if hasattr(module, "set_recurrent_checkpoint_anchor")
+        )
 
     def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
         return (

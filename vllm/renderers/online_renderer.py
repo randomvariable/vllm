@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -78,6 +78,9 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.mcp.tool_server import ToolServer
+
+
+_INSTRUCTION_ROLES = frozenset(("system", "developer"))
 
 
 ResponsesPreviousMessages: TypeAlias = (
@@ -184,7 +187,11 @@ class OnlineRenderer:
         default_chat_template_kwargs: dict[str, Any] | None = None,
         reasoning_effort_map: dict[str, str] | None = None,
         log_error_stack: bool = False,
+        enable_recurrent_instruction_checkpoints: bool = False,
     ) -> None:
+        self.enable_recurrent_instruction_checkpoints = (
+            enable_recurrent_instruction_checkpoints
+        )
         self.model_config = model_config
         self.renderer = renderer
         self.request_logger = request_logger
@@ -869,6 +876,14 @@ class OnlineRenderer:
                 },
                 skip_mm_cache=skip_mm_cache,
             )
+            if self.enable_recurrent_instruction_checkpoints:
+                await self._set_recurrent_instruction_boundary(
+                    messages,
+                    chat_params,
+                    tok_params,
+                    engine_input,
+                    skip_mm_cache=skip_mm_cache,
+                )
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -915,3 +930,64 @@ class OnlineRenderer:
                 request = request_parser.adjust_request(request=request)
 
         return conversation, [engine_input]
+
+    async def _set_recurrent_instruction_boundary(
+        self,
+        messages: list[Any],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+        engine_input: EngineInput,
+        *,
+        skip_mm_cache: bool,
+    ) -> None:
+        """Attach a verified token boundary before the first user content."""
+        if engine_input["type"] != "token":
+            return
+
+        instruction_count = 0
+        for message in messages:
+            role = (
+                message.get("role")
+                if isinstance(message, dict)
+                else getattr(message, "role", None)
+            )
+            if role not in _INSTRUCTION_ROLES:
+                break
+            instruction_count += 1
+        if instruction_count == 0:
+            return
+
+        instruction_messages = [
+            *messages[:instruction_count],
+            {"role": "user", "content": ""},
+        ]
+        instruction_params = replace(
+            chat_params,
+            chat_template_kwargs=merge_kwargs(
+                chat_params.chat_template_kwargs,
+                {"add_generation_prompt": False, "continue_final_message": True},
+                unset_values=(),
+            ),
+        )
+        try:
+            (_,), (instruction_input,) = await self.renderer.render_chat_async(
+                [instruction_messages],
+                instruction_params,
+                tok_params,
+                skip_mm_cache=skip_mm_cache,
+            )
+        except Exception:
+            logger.debug(
+                "Chat template cannot render the leading instruction segment; "
+                "recurrent instruction checkpoint disabled for this request",
+                exc_info=True,
+            )
+            return
+
+        if instruction_input["type"] != "token":
+            return
+        instruction_ids = instruction_input["prompt_token_ids"]
+        prompt_ids = engine_input["prompt_token_ids"]
+        boundary = len(instruction_ids)
+        if 0 < boundary < len(prompt_ids) and prompt_ids[:boundary] == instruction_ids:
+            engine_input["recurrent_instruction_boundary"] = boundary

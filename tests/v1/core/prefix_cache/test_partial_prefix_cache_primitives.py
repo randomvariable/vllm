@@ -110,6 +110,41 @@ def cache_full_block_and_partial_tail(
     return pool, req, blocks, partial_hash
 
 
+@pytest.mark.parametrize("lookahead,endpoint", [(0, 8), (1, 9), (3, 10)])
+def test_boundary_checkpoint_identity_excludes_future_tokens(lookahead, endpoint):
+    from vllm.v1.core.boundary_checkpoint import (
+        BoundaryCheckpoint,
+        BoundaryCheckpointCache,
+    )
+
+    def make(tokens):
+        return Request(
+            request_id=str(tokens),
+            prompt_token_ids=tokens,
+            sampling_params=SamplingParams(max_tokens=10),
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(4, sha256, lookahead),
+        )
+
+    pool = BlockPool(8, True, 4, num_hash_lookahead_tokens=lookahead)
+    cache = BoundaryCheckpointCache(pool)
+    prefix = list(range(endpoint))
+    producer = make(prefix + [101, 102, 103, 104])
+    block = pool.get_new_blocks(1)[0]
+    checkpoint = BoundaryCheckpoint(cache.next_id(), endpoint, ((block.block_id,),))
+    cache.stage(producer, checkpoint, 1)
+    assert cache.acknowledge(checkpoint.checkpoint_id, 0)
+    pool.free_blocks([block])
+    for future in ([201, 202, 203, 204], [301, 302, 303, 304]):
+        assert cache.find(make(prefix + future), endpoint + len(future)) == checkpoint
+    bounded = make(prefix + [201, 202, 203, 204])
+    bounded.prefix_cache_hit_limit = endpoint - 1
+    assert cache.find(bounded, bounded.num_tokens) is None
+    different = prefix.copy()
+    different[-1] += 1
+    assert cache.find(make(different + [201, 202, 203, 204]), endpoint + 4) is None
+
+
 def test_boundary_hashes_reuse_fine_grained_chain():
     hash_block_size = 2
     block_size = 6

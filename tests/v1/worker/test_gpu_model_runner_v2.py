@@ -51,6 +51,38 @@ from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
 
+def test_boundary_capture_precedes_mamba_postprocess(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        model_runner_module, "post_update", lambda *a: order.append("update")
+    )
+    boundary = SimpleNamespace(capture_mamba=lambda *a: order.append("capture"))
+    runner = SimpleNamespace(
+        is_last_pp_rank=False,
+        boundary_checkpoint_state=boundary,
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(gpu=None),
+            last_sampled_tokens=None,
+            all_token_ids=SimpleNamespace(gpu=None),
+            total_len=SimpleNamespace(gpu=None),
+            draft_tokens=None,
+        ),
+        model_state=SimpleNamespace(
+            postprocess_state=lambda *a: order.append("postprocess")
+        ),
+    )
+    capture = torch.zeros(3, 1, 4)
+    GPUModelRunner.postprocess_sampled(
+        runner, torch.tensor([0]), None, None, None, boundary_capture=capture
+    )
+    assert order == ["update", "capture", "postprocess"]
+    order.clear()
+    GPUModelRunner.postprocess_sampled(
+        runner, torch.tensor([0]), None, None, None, logits_only=True
+    )
+    assert order == ["update"]
+
+
 @pytest.mark.parametrize("eligible,expected_bound", [(True, 8), (False, None)])
 def test_prompt_tail_keeps_decode_graph_bound(monkeypatch, eligible, expected_bound):
     """A decode-eligible prompt tail must not lose its varlen graph bound."""

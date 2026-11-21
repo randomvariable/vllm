@@ -1138,6 +1138,81 @@ def _run_gpu_postprocess(
     return accepted_gpu
 
 
+@pytest.mark.parametrize("accepted_state_committed", [False, True])
+def test_boundary_checkpoint_copies_only_selected_committed_states(
+    monkeypatch, accepted_state_committed
+):
+    from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
+    )
+    cfg = _TestConfig()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    names = ["layer_0", "layer_1"]
+    config = _make_kv_cache_config(cfg, names)
+    conv_ref, temporal_ref, conv, temporal, _, context = _make_dual_states(
+        cfg, names, device
+    )
+    ctx = _make_gpu_ctx(cfg, config, device, context)
+
+    def t(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    tables = torch.zeros((8, 6), device=device, dtype=torch.int32)
+    tables[3] = t([1, 2, 3, 4, 5, 6])
+    tables[1] = t([14, 15, 16, 17, 18, 19])
+    ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
+    destinations = torch.zeros(
+        (8, NUM_BOUNDARY_CHECKPOINT_SLOTS, 1), device=device, dtype=torch.int32
+    )
+    destinations[3, :2, 0] = t([20, 21])
+    destinations[1, :2, 0] = t([22, 23])
+    idx = t([3, 1])
+    states = t([0, 1, 0, 0, 0, 0, 0, 0])
+    capture = torch.zeros(
+        (2, NUM_BOUNDARY_CHECKPOINT_SLOTS), device=device, dtype=torch.int32
+    )
+    bias = torch.zeros_like(capture)
+    capture[:, :2] = t([[7, 9], [0, 23]])
+    bias[:, :2] = t([[0, 2], [0, 1]])
+
+    def copy():
+        ctx.checkpoint_request_boundaries(
+            idx,
+            states,
+            capture,
+            bias,
+            destinations,
+            accepted_state_committed=accepted_state_committed,
+        )
+
+    copy()
+    if device.type == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            copy()
+        graph.replay()
+    for layer in range(len(names)):
+        for dst, src, shift in ((20, 1, 0), (21, 1, 2), (23, 15, 1)):
+            if accepted_state_committed:
+                shift = 0
+            torch.testing.assert_close(
+                conv[layer][dst, : cfg.conv_width - shift],
+                conv_ref[layer][src, shift:],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                temporal[layer][dst],
+                temporal_ref[layer][src + shift],
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(conv[layer][22], conv_ref[layer][22])
+        torch.testing.assert_close(temporal[layer][22], temporal_ref[layer][22])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""

@@ -220,6 +220,20 @@ def check_enough_kv_cache_memory(
             if groups
             else available_memory
         )
+        if vllm_config.use_request_boundary_checkpoints:
+            builder = get_kv_cache_config_builder(vllm_config)
+            _check_enough_kv_cache_memory(
+                check_memory,
+                partial(
+                    _max_memory_usage_bytes_from_groups, builder, vllm_config, groups
+                ),
+                vllm_config.model_config.max_model_len,
+                partial(
+                    _estimate_max_model_len_from_groups, builder, vllm_config, groups
+                ),
+                _more_kv_cache_memory_hint(vllm_config),
+            )
+            return
         _check_enough_kv_cache_memory(
             check_memory,
             lambda: max_memory_usage_bytes(vllm_config, layer_configs.values()),
@@ -1254,6 +1268,9 @@ def _max_memory_usage_bytes_from_groups(
         group.max_allocated_blocks_per_request(vllm_config) for group in kv_cache_groups
     )
 
+    from vllm.v1.core.kv_cache_utils import _request_boundary_reserve_blocks
+
+    total_blocks += _request_boundary_reserve_blocks(vllm_config, len(kv_cache_groups))
     return bytes_per_block * total_blocks
 
 

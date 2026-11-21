@@ -283,6 +283,16 @@ class SingleTypeKVCacheManager(ABC):
             and num_local_computed_tokens % self.block_size != 0
         )
 
+    def prepare_boundary_replay(self, request_id: str, num_tokens: int) -> None:
+        """Protect a full tail page whose last row is replayed by MTP."""
+        assert num_tokens > 0 and num_tokens % self.block_size == 0
+        block_idx = num_tokens // self.block_size - 1
+        self._partial_hit_reqs[request_id] = (
+            block_idx,
+            self.req_to_blocks[request_id][block_idx],
+        )
+        self.num_cached_block[request_id] = block_idx
+
     def get_num_blocks_to_reserve(self, request_id: str, num_tokens: int) -> int | None:
         """Return a reservation, or None to use the allocation-based admission check."""
         return None
@@ -2572,6 +2582,11 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if request.use_boundary_checkpoints:
+            if self.mamba_cache_mode == "align":
+                self._req_chunk_ranges.pop(request.request_id, None)
+            self.num_cached_block[request.request_id] = num_tokens // self.block_size
+            return
         if self.mamba_cache_mode == "align":
             chunk_range = self._req_chunk_ranges.pop(request.request_id, None)
             if chunk_range is not None:
@@ -2637,7 +2652,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def cache_blocks_on_free(self, request: Request) -> None:
         """Cache the held latest decode-crossed boundary state, so a follow-up
         turn resumes there."""
-        if not self.keep_decode_resume_state:
+        if request.use_boundary_checkpoints or not self.keep_decode_resume_state:
             return
         blocks = self.req_to_blocks.get(request.request_id, [])
         idx = self._decode_resume_block_idx(

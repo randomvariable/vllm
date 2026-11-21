@@ -24,6 +24,7 @@ from vllm.v1.outputs import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -61,6 +62,10 @@ class KVConnector:
     def reset_capture_state(self) -> None:
         pass
 
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        """Expose caller-owned checkpoint pages to a compatible connector."""
+        pass
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -82,6 +87,9 @@ class ActiveKVConnector(KVConnector):
             kv_transfer_config is not None and kv_transfer_config.is_kv_producer
         )
         self._mrope_position_deltas: dict[str, int] = {}
+
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        self.kv_connector.bind_boundary_checkpoint_state(state)
 
     def pre_forward(
         self,

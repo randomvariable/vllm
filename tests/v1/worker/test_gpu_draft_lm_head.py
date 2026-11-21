@@ -257,8 +257,16 @@ def test_default_draft_lm_head_quantization(
         "is_device_capability",
         lambda capability, device_id=0: capability == case["capability"],
     )
-    monkeypatch.setattr(utils.envs, "VLLM_BATCH_INVARIANT", case["batch_invariant"])
-    monkeypatch.setattr(utils.envs, "VLLM_RELOAD_MODE", case["reload_mode"])
+    monkeypatch.setitem(
+        utils.envs.environment_variables,
+        "VLLM_BATCH_INVARIANT",
+        lambda: case["batch_invariant"],
+    )
+    monkeypatch.setitem(
+        utils.envs.environment_variables,
+        "VLLM_RELOAD_MODE",
+        lambda: case["reload_mode"],
+    )
     draft_config = SimpleNamespace(
         dtype=case["dtype"], head_dtype=case["head_dtype"] or case["dtype"]
     )

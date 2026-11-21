@@ -145,6 +145,7 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
         speculator=None,
         rejection_sampler=rejection_sampler,
         speculative_config=SimpleNamespace(),
+        is_last_pp_rank=False,
     )
     budget_warmups = []
     manager.warmup_budget_kernel = lambda: budget_warmups.append(
@@ -174,6 +175,8 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
 def test_kernel_warmup_runs_same_rounds_on_every_pp_stage(monkeypatch, speculative):
     """PP receivers need a matching sender for every speculative warmup round."""
     rounds = []
+    monkeypatch.setattr(warmup, "warmup_processed_gumbel", lambda *a, **kw: None)
+    monkeypatch.setattr(warmup, "warmup_top_k_top_p", lambda *a, **kw: None)
     monkeypatch.setattr(
         warmup,
         "_warmup_kernels",
@@ -184,6 +187,15 @@ def test_kernel_warmup_runs_same_rounds_on_every_pp_stage(monkeypatch, speculati
         runner = SimpleNamespace(
             adaptive_verification=None,
             speculator=None,
+            is_last_pp_rank=is_last_pp_rank,
+            is_pooling_model=False,
+            model_config=SimpleNamespace(
+                get_vocab_size=lambda: 64, use_fp64_gumbel=False
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+            max_num_reqs=4,
+            decode_query_len=1,
+            device=torch.device("cpu"),
             speculative_config=SimpleNamespace() if speculative else None,
             rejection_sampler=(
                 SimpleNamespace(enable_adaptive_verification=False)

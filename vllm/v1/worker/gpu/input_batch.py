@@ -10,6 +10,14 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.boundary_checkpoint import (
+    MAX_BOUNDARY_STOP_TOKENS,
+    NUM_BOUNDARY_CHECKPOINT_SLOTS,
+)
+from vllm.v1.worker.gpu.boundary_checkpoint import (
+    BoundaryCheckpointState,
+    prepare_boundary_capture,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
@@ -589,11 +597,23 @@ def _post_update_kernel(
     draft_tokens_ptr,
     draft_tokens_out_ptr,
     num_draft_tokens,
+    boundary_metadata_ptr=None,
+    boundary_stop_tokens_ptr=None,
+    boundary_seen_ptr=None,
+    boundary_capture_tokens_ptr=None,
+    boundary_capture_bias_ptr=None,
+    boundary_capture_rows_ptr=None,
+    NUM_CAPTURES: tl.constexpr = 0,
+    BOUNDARY_METADATA_WIDTH: tl.constexpr = 0,
+    BOUNDARY_STOP_CAPACITY: tl.constexpr = 0,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
         # Filter rows with negative index entries.
+        if boundary_capture_tokens_ptr is not None:
+            for kind in range(NUM_CAPTURES):
+                tl.store(boundary_capture_tokens_ptr + req_id * NUM_CAPTURES + kind, 0)
         return
 
     if draft_tokens_ptr is not None:
@@ -605,6 +625,38 @@ def _post_update_kernel(
 
     total_len = tl.load(total_len_ptr + req_state_idx)
     num_sampled = tl.load(num_sampled_ptr + req_id)
+    num_rejected = tl.load(num_rejected_ptr + req_id)
+    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+    if query_start_loc_ptr is None:
+        query_start = 0
+        query_len = 0
+    else:
+        query_start = tl.load(query_start_loc_ptr + req_id)
+        query_len = tl.load(query_start_loc_ptr + req_id + 1) - query_start
+    if boundary_metadata_ptr is not None:
+        num_sampled, num_rejected = prepare_boundary_capture(
+            req_state_idx,
+            req_id,
+            num_computed,
+            total_len,
+            query_start,
+            query_len,
+            num_sampled,
+            num_rejected,
+            sampled_tokens_ptr,
+            sampled_tokens_stride,
+            boundary_metadata_ptr,
+            boundary_stop_tokens_ptr,
+            boundary_seen_ptr,
+            boundary_capture_tokens_ptr,
+            boundary_capture_bias_ptr,
+            boundary_capture_rows_ptr,
+            STOP_CAPACITY=BOUNDARY_STOP_CAPACITY,
+            NUM_CAPTURES=NUM_CAPTURES,
+            METADATA_WIDTH=BOUNDARY_METADATA_WIDTH,
+        )
+        tl.store(num_sampled_ptr + req_id, num_sampled)
+        tl.store(num_rejected_ptr + req_id, num_rejected)
     if num_sampled > 0:
         token_id = tl.load(
             sampled_tokens_ptr + req_id * sampled_tokens_stride + num_sampled - 1
@@ -628,17 +680,8 @@ def _post_update_kernel(
             count = tl.load(token_ptr)
             tl.store(token_ptr, count + 1)
 
-    if query_start_loc_ptr is None:
-        query_len = 0
-    else:
-        query_start = tl.load(query_start_loc_ptr + req_id)
-        query_end = tl.load(query_start_loc_ptr + req_id + 1)
-        query_len = query_end - query_start
-    num_rejected = tl.load(num_rejected_ptr + req_id)
-
     computed_delta = query_len - num_rejected
     if computed_delta != 0:
-        num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
 
 
@@ -667,6 +710,8 @@ def post_update(
     draft_tokens: torch.Tensor | None = None,
     # [max_num_reqs, num_speculative_steps], contiguous; required with draft_tokens
     draft_tokens_out: torch.Tensor | None = None,
+    boundary_state: BoundaryCheckpointState | None = None,
+    boundary_capture: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     if draft_tokens is not None:
@@ -691,6 +736,19 @@ def post_update(
         draft_tokens,
         draft_tokens_out,
         draft_tokens.shape[1] if draft_tokens is not None else 0,
+        boundary_state.metadata if boundary_state is not None else None,
+        boundary_state.stop_tokens if boundary_state is not None else None,
+        boundary_state.seen if boundary_state is not None else None,
+        boundary_capture[0] if boundary_capture is not None else None,
+        boundary_capture[1] if boundary_capture is not None else None,
+        boundary_capture[2] if boundary_capture is not None else None,
+        NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS
+        if boundary_capture is not None
+        else 0,
+        BOUNDARY_METADATA_WIDTH=(
+            boundary_state.metadata.shape[1] if boundary_state is not None else 0
+        ),
+        BOUNDARY_STOP_CAPACITY=MAX_BOUNDARY_STOP_TOKENS,
         num_warps=1,
     )
 

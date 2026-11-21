@@ -101,7 +101,42 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
+
+@pytest.mark.parametrize("enabled,expected", [(False, 0), (True, 15)])
+def test_request_boundary_reserve_blocks_policy(enabled, expected):
+    config = SimpleNamespace(
+        use_request_boundary_checkpoints=enabled,
+        scheduler_config=SimpleNamespace(
+            max_num_scheduled_tokens=32, max_num_batched_tokens=32
+        ),
+        model_config=SimpleNamespace(max_model_len=128),
+    )
+    assert kv_cache_utils._request_boundary_reserve_blocks(config, 2) == expected
+
+
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("enabled,expected", [(False, 100), (True, 250)])
+def test_boundary_reserve_in_group_memory_estimate(enabled, expected):
+    from vllm.v1.core.kv_cache_planning import _max_memory_usage_bytes_from_groups
+
+    config = SimpleNamespace(
+        use_request_boundary_checkpoints=enabled,
+        scheduler_config=SimpleNamespace(
+            max_num_scheduled_tokens=32, max_num_batched_tokens=32
+        ),
+        model_config=SimpleNamespace(max_model_len=128),
+        attention_config=SimpleNamespace(hisparse_config=None),
+    )
+    builder = SimpleNamespace(_get_pool_bytes_per_block=lambda config, groups: 10)
+    groups = [
+        SimpleNamespace(
+            host_resident=False, max_allocated_blocks_per_request=lambda config: 5
+        )
+        for _ in range(2)
+    ]
+    assert _max_memory_usage_bytes_from_groups(builder, config, groups) == expected
 
 
 def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
@@ -112,6 +147,7 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
         model_config=SimpleNamespace(max_model_len=10 * block_size),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         max_in_flight_tokens=10 * block_size,
+        use_request_boundary_checkpoints=False,
     )
     attn_spec = AttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.float16

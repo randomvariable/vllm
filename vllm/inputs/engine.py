@@ -26,6 +26,9 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    recurrent_instruction_boundary: NotRequired[int]
+    """Verified token boundary after leading chat instructions."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

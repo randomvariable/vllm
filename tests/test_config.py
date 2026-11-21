@@ -72,6 +72,91 @@ from vllm.v1.worker.gpu.spec_decode.lilicorr.config import LiLiCorrSpeculatorCon
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "policy,model_type,prefix,mode,backend,expected",
+    [
+        ("auto", "qwen3_8_flash_next_text", True, "align", "b12x", True),
+        ("request_boundaries", "qwen4_exp", True, "align", "b12x", True),
+        ("aligned", "qwen4_exp", True, "align", "b12x", False),
+        ("auto", "deepseek_v4", True, "align", "b12x", False),
+        ("auto", "qwen4_exp", False, "align", "b12x", False),
+        ("auto", "qwen4_exp", True, "none", "b12x", False),
+        ("auto", "qwen4_exp", True, "align", "auto", False),
+    ],
+)
+def test_request_boundary_checkpoint_policy(
+    monkeypatch, policy, model_type, prefix, mode, backend, expected
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = VllmConfig()
+    config.cache_config.recurrent_checkpoint_policy = policy
+    config.cache_config.enable_prefix_caching = prefix
+    config.cache_config.mamba_cache_mode = mode
+    config.kernel_config.linear_backend = backend
+    config.model_config = SimpleNamespace(
+        enable_sleep_mode=False, hf_text_config=SimpleNamespace(model_type=model_type)
+    )
+    assert config.use_request_boundary_checkpoints is expected
+
+
+@pytest.mark.parametrize("policy", ["auto", "aligned", "request_boundaries"])
+def test_recurrent_checkpoint_policy_cli(policy):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--recurrent-checkpoint-policy", policy])
+    assert args.recurrent_checkpoint_policy == policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instruction_ids,expected", [([1, 2], 2), ([1, 9], None)])
+async def test_recurrent_instruction_boundary_requires_exact_prefix(
+    instruction_ids, expected
+):
+    from vllm.renderers import ChatParams, TokenizeParams
+    from vllm.renderers.online_renderer import OnlineRenderer
+
+    class Renderer:
+        async def render_chat_async(self, *args, **kwargs):
+            return ([],), ({"type": "token", "prompt_token_ids": instruction_ids},)
+
+    renderer = object.__new__(OnlineRenderer)
+    renderer.renderer = Renderer()
+    engine_input = {"type": "token", "prompt_token_ids": [1, 2, 3]}
+    await renderer._set_recurrent_instruction_boundary(
+        [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}],
+        ChatParams(),
+        TokenizeParams(max_total_tokens=None),
+        engine_input,
+        skip_mm_cache=False,
+    )
+    assert engine_input.get("recurrent_instruction_boundary") == expected
+
+
+def test_request_boundary_connector_capability(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = VllmConfig()
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.mamba_cache_mode = "align"
+    config.kernel_config.moe_backend = "b12x"
+    config.model_config = SimpleNamespace(
+        enable_sleep_mode=False,
+        hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next"),
+    )
+    config.kv_transfer_config = KVTransferConfig(kv_connector="test", kv_role="kv_both")
+
+    class Connector:
+        @classmethod
+        def supports_request_boundary_checkpoints(cls, config):
+            return False
+
+    monkeypatch.setattr(KVConnectorFactory, "get_connector_class", lambda _: Connector)
+    assert not config.use_request_boundary_checkpoints
+
+
 def test_nested_rope_validation_patch_preserves_flat_rope_parameters(monkeypatch):
     calls = []
 

@@ -30,6 +30,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -84,6 +85,7 @@ class Request:
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
         block_hashes: list["BlockHash"] | None = None,
+        recurrent_instruction_boundary: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -153,6 +155,14 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, prompt_embeds
         )
+        if recurrent_instruction_boundary is not None and not (
+            0 < recurrent_instruction_boundary < self.num_prompt_tokens
+        ):
+            raise ValueError(
+                "The recurrent instruction boundary must be inside the prompt"
+            )
+        self.recurrent_instruction_boundary = recurrent_instruction_boundary
+        self.recurrent_prefill_tail_boundary: int | None = None
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = TokenBuffer([0] * self.num_prompt_tokens)
@@ -219,6 +229,9 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        self.use_boundary_checkpoints = False
+        self.boundary_checkpoint: BoundaryCheckpoint | None = None
+        self.boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
         # DeepSeek-V4.1 only: SWA bounded replay. The request holds no
         # sliding-window KV below this position; 0 when nothing replays.
         self.replay_start = 0
@@ -286,6 +299,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
             block_hashes=block_hashes,
         )
 

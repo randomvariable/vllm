@@ -621,6 +621,68 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def use_request_boundary_checkpoints(self) -> bool:
+        """Whether this runner has a complete recurrent boundary-state adapter."""
+        from vllm.platforms import current_platform
+
+        cache = self.cache_config
+        model = self.model_config
+        parallel = self.parallel_config
+        return bool(
+            cache.recurrent_checkpoint_policy in ("auto", "request_boundaries")
+            and cache.enable_prefix_caching
+            and cache.mamba_cache_mode == "align"
+            and (
+                cache.kv_cache_layout is None
+                or cache.get_resolved_kv_cache_layout().is_block_outermost
+            )
+            and current_platform.is_cuda()
+            and model is not None
+            and not model.enable_sleep_mode
+            and not self.aux_output_config.enable_return_routed_experts
+            and self.lora_config is None
+            and model.hf_text_config.model_type
+            in (
+                "qwen3_8_flash_next_text",
+                "qwen3_8_flash_next",
+                "qwen4_exp_text",
+                "qwen4_exp",
+            )
+            and (
+                self.speculative_config is None
+                or (
+                    self.speculative_config.method == "mtp"
+                    and not self.speculative_config.uses_dynamic_speculative_decoding()
+                )
+            )
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+            and (
+                self.kernel_config.linear_backend == "b12x"
+                or self.kernel_config.moe_backend == "b12x"
+            )
+            and self.external_boundary_checkpoint_adapter_available
+            and cache.kv_offloading_size is None
+        )
+
+    @property
+    def external_boundary_checkpoint_adapter_available(self) -> bool:
+        """Require an explicit atomic target/draft adapter for external storage.
+
+        Aligned connectors must not enable request-boundary retention merely
+        because they can transfer ordinary KV chunks. Worker initialization
+        additionally validates the negotiated server protocol and byte layout.
+        """
+        if self.kv_transfer_config is None:
+            return True
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        return connector.supports_request_boundary_checkpoints(self)
+
+    @property
     def gpu_iteration_timing(self) -> bool:
         """Whether the output worker times logged iterations with CUDA events.
         Otherwise they are logged without an elapsed time."""
@@ -1405,6 +1467,17 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        if (
+            self.kv_transfer_config.kv_connector
+            == "LMCacheRecurrentCheckpointConnector"
+            and self.kv_transfer_config.kv_connector_extra_config.get(
+                "lmcache.mp.mp_transfer_mode"
+            )
+            == "engine_driven"
+        ):
+            # The connector accesses current virtual addresses rather than
+            # retaining registrations of GPU physical pages.
             return
 
         raise ValueError(

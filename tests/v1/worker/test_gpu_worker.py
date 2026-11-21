@@ -285,7 +285,8 @@ def test_memory_profile_bounds_decode_logits_rows(monkeypatch, kv_cache_memory_b
     class Profiled(Exception):
         pass
 
-    def profile_run(*, randomize_inputs=False):
+    def profile_run(prepare_profile_state, *, randomize_inputs=False):
+        assert callable(prepare_profile_state)
         assert randomize_inputs is True
         # Without the config context, the helper falls back to all 32768
         # batched tokens, which would reserve 128 GiB at 1M context.
@@ -299,6 +300,8 @@ def test_memory_profile_bounds_decode_logits_rows(monkeypatch, kv_cache_memory_b
         model_runner=SimpleNamespace(profile_run=profile_run, model_memory_usage=0),
         init_snapshot=SimpleNamespace(free_memory=2),
         _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
+        _prepare_b12x_profile_state=lambda: None,
+        _release_b12x_profile_state=lambda: None,
     )
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda _: None)
     monkeypatch.setattr(
@@ -338,7 +341,8 @@ def test_cudagraph_memory_profile_runs_only_when_applied(
     calls = []
     warnings = []
 
-    def profile_cudagraph_memory():
+    def profile_cudagraph_memory(prepare_profile_state):
+        assert callable(prepare_profile_state)
         calls.append(1)
         return estimate
 
@@ -358,7 +362,7 @@ def test_cudagraph_memory_profile_runs_only_when_applied(
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
         model_runner=SimpleNamespace(
-            profile_run=lambda **kwargs: None,
+            profile_run=lambda prepare_profile_state, **kwargs: None,
             model_memory_usage=0,
             profile_cudagraph_memory=profile_cudagraph_memory,
         ),
@@ -366,7 +370,10 @@ def test_cudagraph_memory_profile_runs_only_when_applied(
             free_memory=80 * GiB_bytes, total_memory=80 * GiB_bytes
         ),
         requested_memory=72 * GiB_bytes,
+        device=torch.device("cpu"),
         _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
+        _prepare_b12x_profile_state=lambda: None,
+        _release_b12x_profile_state=lambda: None,
     )
     profile_result = SimpleNamespace(
         after_profile=SimpleNamespace(free_memory=60 * GiB_bytes),
@@ -381,6 +388,15 @@ def test_cudagraph_memory_profile_runs_only_when_applied(
         lambda *args, **kwargs: nullcontext(profile_result),
     )
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        gpu_worker,
+        "MemorySnapshot",
+        lambda device: SimpleNamespace(
+            free_memory=profile_result.after_profile.free_memory
+        ),
+    )
     monkeypatch.setattr(
         gpu_worker.logger, "warning", lambda msg, *args: warnings.append(msg)
     )

@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the V2 model runner's InputBatch (vllm.v1.worker.gpu.input_batch)."""
 
+import copy
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -15,6 +19,153 @@ from vllm.v1.worker.gpu import cp_utils
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("method", "draft_width"), [(None, None), ("mtp", 16), ("mtp", 8)]
+)
+def test_external_checkpoint_layout_restarts_with_a_different_pool_capacity(
+    monkeypatch, method, draft_width
+):
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace())
+
+    def make_state(num_blocks):
+        pool = torch.zeros(num_blocks, 256, dtype=torch.uint8)
+        recurrent = pool.view(torch.float32).as_strided(
+            (num_blocks, 2, 2), (64, 2, 1), storage_offset=4
+        )
+        model = torch.nn.Module()
+        if draft_width == 16:
+            model.get_mtp_target_hidden_states = lambda: torch.zeros(2, 16)
+        state = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_num_reqs=2,
+            model=model,
+            get_recurrent_checkpoint_tensors=lambda: (torch.zeros(2, 2),),
+            model_config=SimpleNamespace(
+                get_hidden_size=lambda: 8, dtype=torch.float32
+            ),
+            vllm_config=SimpleNamespace(
+                speculative_config=None
+                if method is None
+                else SimpleNamespace(method=method)
+            ),
+        )
+        groups = [
+            SimpleNamespace(
+                layer_names=["attn"], kv_cache_specs={"attn": object()}, block_size=8
+            ),
+            SimpleNamespace(
+                layer_names=["recurrent"],
+                kv_cache_specs={
+                    "recurrent": MambaSpec(
+                        block_size=4, shapes=((2, 2),), dtypes=(torch.float32,)
+                    )
+                },
+                block_size=4,
+            ),
+        ]
+        return BoundaryCheckpointState(
+            state,
+            SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=groups),
+            {
+                "attn": SimpleNamespace(kv_cache=pool),
+                "recurrent": SimpleNamespace(kv_cache=(recurrent,)),
+            },
+        )
+
+    producer, consumer = make_state(16), make_state(24)
+    layout = producer.get_external_checkpoint_layout()
+    assert json.loads(json.dumps(layout)) == layout
+    assert consumer.get_external_checkpoint_layout() == layout
+    consumer.initialize_external_checkpoint_layout(layout)
+    row = consumer.get_external_checkpoint_page_pool()[7].view(torch.float32)
+    row[2:10].copy_(torch.arange(8))
+    torch.testing.assert_close(
+        consumer.get_hidden_states(7), torch.arange(8).float().view(1, 8)
+    )
+    if method == "mtp":
+        row[10 : 10 + draft_width].copy_(torch.arange(draft_width) + 50)
+        torch.testing.assert_close(
+            consumer.get_hidden_states(7, draft=True),
+            (torch.arange(draft_width) + 50).float().view(1, draft_width),
+        )
+    else:
+        assert layout["draft_hidden"] is None
+    for key in ("schema_version", "page_bytes"):
+        invalid = copy.deepcopy(layout)
+        invalid[key] += 1
+        with pytest.raises(ValueError, match="incompatible"):
+            consumer.initialize_external_checkpoint_layout(invalid)
+    layout["auxiliary_fields"][0]["shape"][0] += 1
+    with pytest.raises(ValueError, match="incompatible"):
+        consumer.initialize_external_checkpoint_layout(layout)
+
+
+def test_boundary_capture_trims_stop_and_keeps_middle_steps_private():
+    from vllm.v1.worker.gpu.input_batch import post_update
+
+    def t(data):
+        return torch.tensor(data, dtype=torch.int32, device=DEVICE)
+
+    state = SimpleNamespace(
+        metadata=t(
+            [
+                [1, 7, 0, 7, 8, 1, 0],
+                [1, 7, 0, 7, 30, 1, 0],
+                [0, 7, 0, 7, 30, 1, 0],
+                [1, 7, 0, 12, 30, 1, 0],
+                [1, 9, 4, 9, 30, 1, 4],
+            ]
+        ),
+        stop_tokens=torch.full((5, 128), 99, dtype=torch.int32, device=DEVICE),
+        seen=t([[0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]]),
+    )
+    sampled = t(
+        [
+            [10, 0, 0, 0],
+            [10, 99, 12, 13],
+            [10, 99, 12, 13],
+            [99, 10, 99, 11],
+            [0, 0, 0, 0],
+        ]
+    )
+    computed, total = t([0, 8, 8, 8, 0]), t([7, 9, 9, 9, 9])
+    num_sampled, rejected = t([1, 4, 4, 4, 0]), t([0, 0, 0, 0, 0])
+    last_sampled = t([0, 0, 0, 0, 0])
+    all_tokens = torch.zeros((5, 32), dtype=torch.int32, device=DEVICE)
+    capture = torch.empty((3, 5, 4), dtype=torch.int32, device=DEVICE)
+    post_update(
+        t([0, 1, 2, 3, 4]),
+        computed,
+        last_sampled,
+        None,
+        sampled,
+        num_sampled,
+        rejected,
+        t([0, 7, 11, 15, 19, 23]),
+        all_tokens,
+        total,
+        boundary_state=state,
+        boundary_capture=capture,
+    )
+    assert capture[0].tolist() == [
+        [7, 7, 0, 0],
+        [0, 10, 0, 0],
+        [0, 0, 0, 0],
+        [0, 11, 0, 0],
+        [0, 0, 4, 4],
+    ]
+    assert num_sampled.tolist() == [1, 2, 4, 3, 0]
+    assert computed.tolist() == [7, 10, 12, 11, 4]
+    assert total.tolist() == [8, 11, 13, 12, 9]
+    assert last_sampled.tolist() == [10, 99, 13, 99, 0]
+    assert capture[2][1, 1].item() == 8
+    assert capture[2][3, 1].item() == 17
+    assert capture[2][4, 2:].tolist() == [22, 22]
 
 
 @pytest.mark.parametrize(

@@ -38,9 +38,11 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 
 logger = init_logger(__name__)
 
@@ -326,6 +328,42 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         for c in self._connectors:
             c.bind_gpu_block_pool(gpu_block_pool)
+
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        for c in self._connectors:
+            c.bind_boundary_capture_releaser(releaser)
+
+    @classmethod
+    def supports_request_boundary_checkpoints(cls, config: "VllmConfig") -> bool:
+        # A chain is only usable when every child can carry the atomic bundle.
+        return all(
+            connector_cls.supports_request_boundary_checkpoints(temp_config)
+            for connector_cls, temp_config in cls._get_connector_classes_and_configs(
+                config
+            )
+        )
+
+    def bind_boundary_checkpoint_cache(self, manager: "KVCacheManager") -> None:
+        for c in self._connectors:
+            c.bind_boundary_checkpoint_cache(manager)
+
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        for c in self._connectors:
+            c.bind_boundary_checkpoint_state(state)
+
+    def boundary_checkpoint_external_tokens(self, request: "Request") -> int:
+        return sum(
+            c.boundary_checkpoint_external_tokens(request) for c in self._connectors
+        )
+
+    def store_boundary_checkpoint(
+        self, request: "Request", checkpoint: "BoundaryCheckpoint"
+    ) -> None:
+        for c in self._connectors:
+            c.store_boundary_checkpoint(request, checkpoint)
+
+    def poll_boundary_checkpoint(self, request: "Request") -> bool:
+        return all(c.poll_boundary_checkpoint(request) for c in self._connectors)
 
     # We must override the base class method here because we need to bind
     # the metadata to each connector in the order of the connectors in the

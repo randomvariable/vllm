@@ -13,6 +13,10 @@ class MTPSpeculator(TargetDependentARSpeculator):
     share_mtp_topk_indices: bool = False
     rollback_qsa_interval_starts: bool = False
     prefill_outputs_are_compact: bool = False
+    # Set by the runner while the drafter must capture draft-side recurrent
+    # state for request-boundary checkpoints: (state, idx_mapping, capture).
+    # Cleared right after propose() returns.
+    boundary_checkpoint_capture = None
 
     def load_draft_model(
         self,
@@ -26,7 +30,7 @@ class MTPSpeculator(TargetDependentARSpeculator):
             draft_model.model.set_prefill_rows(self.last_token_indices)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
-            spec_config.draft_model_config.hf_text_config
+            spec_config.draft_model_config.hf_config
             if spec_config is not None
             else None
         )
@@ -58,6 +62,9 @@ class MTPSpeculator(TargetDependentARSpeculator):
             )
 
     def on_prefill_end(self, num_reqs: int) -> None:
+        if self.boundary_checkpoint_capture is not None:
+            state, idx_mapping, capture = self.boundary_checkpoint_capture
+            state.capture_draft(idx_mapping, capture)
         # Step 0 (prefill) wrote topk indices for every query token in the
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.

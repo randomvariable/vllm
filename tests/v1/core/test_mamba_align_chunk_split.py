@@ -164,6 +164,18 @@ def _split(
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
+def test_boundary_policy_splits_only_at_requested_endpoints():
+    (req,) = create_requests(num_requests=1, num_tokens=300, req_ids=["boundary"])
+    req.use_boundary_checkpoints = True
+    req.recurrent_instruction_boundary = 77
+    req.recurrent_prefill_tail_boundary = 180
+    assert _split(req, 250) == 77
+    req.num_computed_tokens = 77
+    assert _split(req, 200) == 103
+    req.num_computed_tokens = 180
+    assert _split(req, 80) == 80
+
+
 @pytest.mark.parametrize(
     ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
     [
@@ -298,6 +310,15 @@ def _prefill(prompt_len: int, budgets: list[int]) -> int:
     state_at = _run_chunked_prefill(manager, request, budgets)
     assert request.num_computed_tokens == prompt_len, "prefill did not complete"
     return _count_cached_boundary_states(manager, request, state_at)
+
+
+def test_boundary_policy_does_not_hash_intermediate_mamba_states() -> None:
+    manager = _make_hybrid_kv_cache_manager()
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    request.use_boundary_checkpoints = True
+    state_at = _run_chunked_prefill(manager, request, [700, 700, PROMPT_LEN])
+    assert request.num_computed_tokens == PROMPT_LEN
+    assert _count_cached_boundary_states(manager, request, state_at) == 0
 
 
 def test_fragmented_first_chunk_does_not_poison_mamba_prefix_cache() -> None:

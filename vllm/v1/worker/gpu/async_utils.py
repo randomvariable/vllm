@@ -126,6 +126,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         pending_aux_output: "PendingAuxOutput | None",
         num_drafted_tokens_per_req: torch.Tensor | None = None,
         num_verified_tokens_per_req: torch.Tensor | None = None,
+        boundary_checkpoint_tokens: torch.Tensor | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -133,6 +134,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        self.boundary_checkpoint_tokens = boundary_checkpoint_tokens
         self.pending_aux_output = pending_aux_output
         self.num_drafted_tokens_per_req = num_drafted_tokens_per_req
         self.num_verified_tokens_per_req = num_verified_tokens_per_req
@@ -157,6 +159,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.boundary_checkpoint_tokens_np = (
+                async_copy_to_np(boundary_checkpoint_tokens)
+                if boundary_checkpoint_tokens is not None
+                else None
+            )
             self.num_drafted_tokens_per_req_np = (
                 async_copy_to_np(num_drafted_tokens_per_req)
                 if num_drafted_tokens_per_req is not None
@@ -201,6 +208,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
+        if self.boundary_checkpoint_tokens_np is not None:
+            tokens = self.boundary_checkpoint_tokens_np.tolist()
+            if any(any(row) for row in tokens):
+                self.model_runner_output.boundary_checkpoint_tokens = tokens
         if self.num_drafted_tokens_per_req_np is not None:
             assert self.num_verified_tokens_per_req_np is not None
             num_drafted = self.num_drafted_tokens_per_req_np.tolist()

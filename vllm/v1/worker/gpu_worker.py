@@ -1137,6 +1137,11 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+    def wait_for_boundary_checkpoint_copies(self) -> None:
+        state = self.model_runner.boundary_checkpoint_state
+        if state is not None:
+            state.wait_for_copies()
+
     def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
         from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
             _find_simple_cpu_offload_connector,
