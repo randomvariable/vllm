@@ -6,13 +6,12 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from transformers import Qwen4ExpTextConfig
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-
-from ..config import Qwen4ExpTextConfig
 
 
 class QSAIndexer(nn.Module):

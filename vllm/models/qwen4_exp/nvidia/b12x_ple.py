@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers import Qwen4ExpTextConfig
 
 import vllm.envs as envs
 from vllm.distributed import (
@@ -36,7 +37,6 @@ from vllm.utils.b12x import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from ..config import Qwen4ExpTextConfig
 from .ple_shared_table import (
     SharedTableConfig,
     SharedTableGeometry,

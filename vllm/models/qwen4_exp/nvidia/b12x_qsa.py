@@ -10,6 +10,7 @@ from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
+from transformers import Qwen4ExpTextConfig
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -82,7 +83,6 @@ from ..common.b12x_qsa_cache import (
     qsa_logical_positions,
     qsa_padded_page_size_bytes,
 )
-from ..config import Qwen4ExpTextConfig
 from .b12x_indexer_qsa import QSAIndexer
 
 _QSA_COMPRESS_RATIO = 4
@@ -1039,9 +1039,14 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self._selector_index_inputs: tuple[torch.Tensor, ...] | None = None
         self._selector_metadata_views: _StagedQSAMetadata | None = None
         self._native_selection_width = self.budget + self.compress_ratio - 1
+        # The MTP speculator reads the same draft-config attribute; the
+        # Transformers config class does not define it, so absent means off.
+        spec_config = vllm_config.speculative_config
+        draft_config = spec_config.draft_model_config if spec_config else None
         self._share_mtp_indices = bool(
             self.layer_id >= int(config.num_hidden_layers)
-            and config.index_share_for_mtp_iteration
+            and draft_config is not None
+            and getattr(draft_config.hf_config, "index_share_for_mtp_iteration", False)
             and self.max_speculative_tokens > 1
         )
         self.skip_topk = False
