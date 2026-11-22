@@ -884,8 +884,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             kwargs["swa_topk_lens"] = torch.zeros_like(kwargs["swa_topk_lens"])
             sink = None
         kwargs["sinks"] = sink
-        for start in range(0, query.shape[0], 256):
-            rows = slice(start, start + 256)
+        # Gathered heads can exceed the SM12x prefill kernel's envelope.
+        # Keep each launch within the decode kernel's 64-row limit.
+        for start in range(0, query.shape[0], 64):
+            rows = slice(start, start + 64)
             full_q = group.all_gather(query[rows, :heads].contiguous(), dim=1)
             chunk = dict(kwargs)
             for key in (
