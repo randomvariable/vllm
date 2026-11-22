@@ -650,7 +650,13 @@ def sparse_attn_indexer(
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
-        # Reserve workspace for indexer during profiling run
+        # An unsharded prefill chunk cannot gather more than one compressed
+        # context per scheduled request, even when its workspace limit is larger.
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and not use_pcp and dcp_world_size == 1:
+            total_seq_lens = min(
+                total_seq_lens, cfg.scheduler_config.max_num_seqs * max_model_len
+            )
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
