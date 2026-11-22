@@ -523,10 +523,16 @@ def get_b12x_session(worker: Worker):
         namespace=namespace,
     )
     if session.autotune and os.environ.get("B12X_AUTOTUNE", "1") != "0":
-        from vllm.distributed.parallel_state import get_tp_group
+        from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
 
         tp_group = get_tp_group()
         ranks = tuple(sorted(int(rank) for rank in tp_group.ranks))
+        dcp_group = get_dcp_group()
+        if dcp_group.world_size > 1:
+            # QSA tuning keys include the DCP-local rank. DCP groups may
+            # span PCP ranks, so intersect the matching positions with TP.
+            peers = {group[dcp_group.rank_in_group] for group in dcp_group.group_ranks}
+            ranks = tuple(rank for rank in ranks if rank in peers)
         session.configure_tuning_shard(int(worker.rank), ranks)
     worker._b12x_session = session
     return session

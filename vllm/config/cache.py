@@ -41,6 +41,9 @@ def _layout_from_name(layout_name: str) -> KVCacheLayout:
         ) from None
 
 
+DSV41_INLINE_FP4_KV_CACHE_DTYPE = "fp8_dsv41_inline_fp4_ca"
+DSV41_INLINE_KV_CACHE_DTYPES = ("fp8_dsv41_inline", DSV41_INLINE_FP4_KV_CACHE_DTYPE)
+
 CacheDType = Literal[
     "auto",
     "float16",
@@ -50,6 +53,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "fp8_dsv41_inline",
+    "fp8_dsv41_inline_fp4_ca",
     "nvfp4_ds_mla",
     "turboquant_k8v4",
     "turboquant_4bit_nc",

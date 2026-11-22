@@ -4,15 +4,36 @@
 the MXFP8 linear and MXFP4 expert methods on CUDA only; a ROCm GPU, which
 can also report capability 9.x, keeps the stock methods."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from vllm.config import ModelConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.models.deepseek_v41 import quant_config
 from vllm.models.deepseek_v41.nvidia import quantization
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_method", "expected"),
+    [("fp8", "fp8"), ("mxfp4_csf", "mxfp4_csf")],
+)
+def test_model_config_detects_checkpoint_quantization(
+    tmp_path, checkpoint_method, expected
+):
+    config = {
+        "model_type": "deepseek_v41",
+        "architectures": ["DeepseekV41ForCausalLM"],
+        "num_hidden_layers": 6,
+        "max_position_embeddings": 4096,
+        "quantization_config": {"quant_method": checkpoint_method},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_config = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    assert model_config.quantization == expected
 
 
 @pytest.fixture

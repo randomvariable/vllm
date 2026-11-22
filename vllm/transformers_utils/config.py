@@ -503,8 +503,25 @@ class HFConfigParser(ConfigParserBase):
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
+        if model_type == "qwen4_exp":
+            _normalize_qwen4_exp_layer_types(config)
         config = _maybe_remap_hf_config_attrs(config)
         return config_dict, config
+
+
+def _normalize_qwen4_exp_layer_types(config: PreTrainedConfig) -> None:
+    """Rename the legacy `full_attention` layer type of Qwen4Exp checkpoints.
+
+    Qwen3.8-Flash-Next checkpoints converted by local-inference-lab name the
+    attention layers `full_attention`; the Qwen4Exp model accepts only
+    `indexed_attention` (or the older `qwen_sparse_attention`) for them.
+    """
+    text_config = config.get_text_config()
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types and "full_attention" in layer_types:
+        text_config.layer_types = [
+            "indexed_attention" if t == "full_attention" else t for t in layer_types
+        ]
 
 
 class MistralConfigParser(ConfigParserBase):

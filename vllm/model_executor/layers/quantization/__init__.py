@@ -37,6 +37,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
+    "mxfp4_csf",
     "inkling2",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
@@ -134,6 +135,11 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         from vllm.models.deepseek_v4 import DeepseekV4FP8Config
 
         deepseek_config = DeepseekV4FP8Config
+
+    if quantization == "mxfp4_csf":
+        from vllm.models.deepseek_v41.nvidia.mxfp4_csf import DeepseekV41Mxfp4CsfConfig
+
+        return DeepseekV41Mxfp4CsfConfig
 
     from vllm.models.inkling2.quant_config import Inkling2QuantConfig
 

@@ -73,6 +73,7 @@ def read_csf_contract(root, *, families):
     model_type = text.get("model_type", config.get("model_type"))
     family = {
         "deepseek_v4_1": "deepseek_v41",
+        "deepseek_v41_text": "deepseek_v41",
         "deepseek_v4": "deepseek_v4_flash",
     }.get(model_type, model_type)
     if family not in families:
@@ -132,8 +133,8 @@ class CsfTensorReader(ExitStack):
                 for name in ("fixed", "exceptions")
             )
             plane = CsfSource(
-                (fixed[None], exceptions),
-                torch.tensor([0, exceptions.numel()], dtype=torch.int64),
+                (fixed.reshape(1, rows // 16, -1), exceptions),
+                torch.tensor([0, exceptions.numel()], dtype=torch.int64, device="cpu"),
                 rows,
                 columns,
                 self.codec,

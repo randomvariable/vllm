@@ -162,15 +162,19 @@ def _load_mxfp4_csf_weights(
                     f"expert={expert}, projection={matrix}"
                 )
             if matrix < 2:
-                w13[expert, matrix * local : (matrix + 1) * local].copy_(
-                    view[first:last, :].view(torch.uint8)
-                )
+                target = w13[expert, matrix * local : (matrix + 1) * local]
+                packed = view[first:last, :].view(torch.uint8)
                 rows, columns = intermediate_size, hidden_size // 32
                 row_slice, column_slice = (first, last), (0, columns)
             else:
-                w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
+                target = w2[expert]
+                packed = view[:, first // 2 : last // 2].view(torch.uint8)
                 rows, columns = hidden_size, intermediate_size // 32
                 row_slice, column_slice = (0, rows), (first // 32, last // 32)
+            if target.is_cuda:
+                # Direct CUDA copies from safetensors mmap slices can stall on GB10.
+                packed = packed.clone(memory_format=torch.contiguous_format)
+            target.copy_(packed)
             scales = projection.scales
             if (scales.rows, scales.columns, scales.quantization) != (
                 rows,

@@ -25,11 +25,6 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.mhc.tilelang import (
-    mhc_post_tilelang,
-    mhc_pre_delayed_tilelang,
-)
-from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -111,17 +106,19 @@ from ..common.engram import (
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .ops.mhc import (
+    B12X_MHC_MAX_TOKENS,
     MHC_OVERLAP_MAX_TOKENS,
+    B12xMHC,
     ampere_mhc_max_tokens,
     ampere_projection_splits,
     boundary_all_reduce,
-    hc_expand,
     init_ampere_all_reduce,
     init_mhc_all_reduce,
     mhc_all_reduce_max_tokens,
     mhc_boundary_weight,
-    mhc_pre_delayed_ampere,
-    mhc_pre_delayed_overlap,
+    mhc_collapse,
+    mhc_post,
+    mhc_pre_delayed,
     mhc_shifted_post_pre,
     prepare_ampere_mhc,
     supports_ampere_all_reduce,
@@ -438,7 +435,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
-        if vllm_config.kernel_config.enable_jit_warmup and current_platform.is_cuda():
+        self._b12x_mhc = B12xMHC.for_layer(self)
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if self.use_sequence_parallel:
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            max_tokens = (max_tokens + tp_size - 1) // tp_size
+        native_mhc_covers_workload = (
+            self._b12x_mhc is not None
+            and max_tokens <= B12X_MHC_MAX_TOKENS
+            and self._b12x_mhc.supports_lagged(self, self.attn_norm)
+            and self._b12x_mhc.supports_lagged(self, self.ffn_norm)
+        )
+        if (
+            vllm_config.kernel_config.enable_jit_warmup
+            and current_platform.is_cuda()
+            and not native_mhc_covers_workload
+        ):
             from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                 mhc_fused_post_pre_splits,
             )
@@ -449,10 +461,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            if self.use_sequence_parallel:
-                tp_size = vllm_config.parallel_config.tensor_parallel_size
-                max_tokens = (max_tokens + tp_size - 1) // tp_size
             if is_deep_gemm_supported():
                 hc_dim = self.hc_mult * self.hidden_size
                 is_broadcast_layer = (
@@ -616,17 +624,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             # Use overlap only in FULL graphs; eager warmup initializes Mega mHC.
             mhc_stream = None
-        mhc_pre: Callable[
-            ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ]
-        if self.ampere_mhc:
-            mhc_pre = partial(mhc_pre_delayed_ampere, stream=mhc_stream)
-        else:
-            mhc_pre = (
-                partial(mhc_pre_delayed_overlap, stream=mhc_stream)
-                if mhc_stream is not None
-                else mhc_pre_delayed_tilelang
-            )
+        mhc_pre = partial(
+            mhc_pre_delayed,
+            hc_mult=self.hc_mult,
+            stream=mhc_stream,
+            b12x=self._b12x_mhc,
+        )
         # The reference collapses each sublayer's input with the *previous*
         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
         # for the first layer), the FFN uses this layer's attention pre-mix.
@@ -636,9 +639,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # First layer: the stream is the embedding broadcast to hc
                 # copies and the identity pre-mix selects copy 0.
                 assert self.hc_attn_fn_broadcast is not None
-                residual = hc_expand(x, self.hc_mult)
-                post_mix, res_mix, x, attn_pre = mhc_pre(
-                    residual,
+                residual, post_mix, res_mix, x, attn_pre = mhc_pre(
+                    x,
                     self.hc_attn_fn_broadcast,
                     self.hc_attn_scale,
                     self.hc_attn_base,
@@ -647,7 +649,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_eps,
                     self.hc_post_alpha,
                     self.hc_sinkhorn_iters,
-                    x=x,
                     norm_weight=self.attn_norm.weight,
                     norm_eps=self.attn_norm.variance_epsilon,
                 )
@@ -659,7 +660,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         engram_hashes[:, self.engram.layer_hash_index],
                         engram_mask,
                     )
-                post_mix, res_mix, x, attn_pre = mhc_pre(
+                residual, post_mix, res_mix, x, attn_pre = mhc_pre(
                     residual,
                     self.hc_attn_fn,
                     self.hc_attn_scale,
@@ -682,16 +683,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             assert isinstance(x, torch.Tensor)
             if self.fuse_mhc_all_reduce:
                 x = boundary_all_reduce(x)
-            previous_post = mhc_post_tilelang(x, residual, post_mix, res_mix)
+            previous_post = mhc_post(
+                x, residual, post_mix, res_mix, b12x=self._b12x_mhc
+            )
             if capture_previous_aux:
-                previous_aux = previous_post.mean(dim=1)
+                previous_aux = mhc_collapse(previous_post, None, b12x=self._b12x_mhc)
             residual = self.engram(
                 previous_post,
                 engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
             )
             del previous_post
-            post_mix, res_mix, x, attn_pre = mhc_pre(
+            residual, post_mix, res_mix, x, attn_pre = mhc_pre(
                 residual,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -728,6 +731,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stream=mhc_stream,
                 reduce_results=self.fuse_mhc_all_reduce,
                 boundary_weight=self.hc_attn_boundary_weight,
+                b12x=self._b12x_mhc,
             )
             if capture_previous_aux:
                 previous_aux = aux
@@ -762,6 +766,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_ffn_boundary_weight,
+            b12x=self._b12x_mhc,
+            b12x_plan_name="ffn",
         )
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
@@ -804,6 +810,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=self.attn_norm.variance_epsilon,
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_attn_boundary_weight,
+            b12x=self._b12x_mhc,
         )
         self.attn.forward_kv(positions, x)
 
@@ -1396,7 +1403,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
-        hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        hidden_states = mhc_collapse(
+            hidden_states, pre_mix, b12x=self.layers[self.end_layer - 1]._b12x_mhc
+        )
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
@@ -1478,9 +1487,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # The last layer has no successor to fold its post into.
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        b12x_mhc = self.layers[self.end_layer - 1]._b12x_mhc
+        hidden_states = mhc_post(
+            hidden_states, residual, post_mix, res_mix, b12x=b12x_mhc
+        )
         if self.end_layer in self.aux_hidden_state_layers:
-            final_aux = hidden_states.mean(dim=1)
+            final_aux = mhc_collapse(hidden_states, None, b12x=b12x_mhc)
             if self.use_sequence_parallel:
                 final_aux = sp_all_gather(final_aux)[:full_num_tokens]
             aux_hidden_by_layer[self.end_layer] = final_aux

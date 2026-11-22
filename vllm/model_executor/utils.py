@@ -90,6 +90,14 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     a CPU temporary. Sources with at most one element are skipped: they count
     as contiguous with any stride, which `view(torch.uint8)` rejects.
     """
+    from vllm.model_executor.weight_transfer import (
+        copy_weight,
+        is_weight_transfer_active,
+    )
+
+    if is_weight_transfer_active():
+        return copy_weight(dst, src)
+
     if (
         src.device.type == "cpu"
         and src.dtype == dst.dtype

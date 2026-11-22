@@ -682,6 +682,12 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    adaptive_verification_cost_scale: float = Field(
+        default=1.0, gt=0.0, allow_inf_nan=False
+    )
+    """Weight the target verification cost above the no-draft baseline.
+    Non-default values require DSpark adaptive verification."""
+
     prefill_context_kv_only: bool = False
     """Set on a P/D prefill instance (Model Runner V2, DFlash-based speculators)
     to only store the drafter's context K/V, which the decode instance reads:
@@ -808,6 +814,7 @@ class SpeculativeConfig:
             "synthetic_acceptance_rates",
             "synthetic_acceptance_length",
             "enable_adaptive_verification",
+            "adaptive_verification_cost_scale",
             "draft_sample_method",
             "dspark_draft_topk",
             "xpress_topc",
@@ -1996,6 +2003,13 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.adaptive_verification_cost_scale != 1.0 and (
+            self.method != "dspark" or not self.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "adaptive_verification_cost_scale requires DSpark adaptive verification"
+            )
+
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "

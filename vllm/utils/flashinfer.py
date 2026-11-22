@@ -499,6 +499,21 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
 
 
 @functools.cache
+def has_flashinfer_dsv41_inline_fp4_ca() -> bool:
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    from flashinfer import mla
+    from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4
+
+    return (
+        "kv_cache_format"
+        in inspect.signature(trtllm_batch_decode_sparse_mla_dsv4).parameters
+        and callable(getattr(mla, "dsv41_fp8_quantize_pack_sparse_mla_cache", None))
+        and callable(getattr(mla, "dsv41_fp4_quantize_pack_sparse_mla_cache", None))
+    )
+
+
+@functools.cache
 def has_flashinfer_prims_ts_sparse_mla() -> bool:
     """Return `True` if FlashInfer ships the task-scheduled (prims_ts) sparse
     MLA decode wrapper with the plan API vLLM calls. Its quantized formats are

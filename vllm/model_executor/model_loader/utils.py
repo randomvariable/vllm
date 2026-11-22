@@ -282,7 +282,10 @@ def online_quantization_timing_context(
 
     assert isinstance(quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
     quant_config = layer.quant_config
-    assert quant_config is not None
+    if quant_config is None:
+        # A runtime-quantized vocabulary head can opt in at the layer level.
+        yield
+        return
     online_quantization_config = (
         quant_config
         if isinstance(quant_config, OnlineQuantizationConfig)

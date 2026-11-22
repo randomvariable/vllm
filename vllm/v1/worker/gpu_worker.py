@@ -192,6 +192,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.model_executor.warmup.b12x_prepare import B12xPreparedBatch
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
@@ -310,9 +311,9 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._b12x_session = None
-        self._b12x_stage = None
-        self._b12x_profile_batch = None
-        self._b12x_tuning_batch = None
+        self._b12x_stage: str | None = None
+        self._b12x_profile_batch: B12xPreparedBatch | None = None
+        self._b12x_tuning_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_cache = False
         self._pp_send_work: list[Handle] = []
         # Chosen by VLLM_PP_TRANSPORT in load_model; None sends over NCCL.

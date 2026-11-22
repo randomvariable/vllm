@@ -399,6 +399,7 @@ _B12X_SUBMODULES = {
         "b12x.gemm.bf16_gemv",
         "b12x.gemm.bf16_vocab_projection",
         "b12x.gemm.blockscaled",
+        "b12x.gemm.hyperconnection_gate",
         "b12x.gemm.mla_query_projection",
         "b12x.gemm.wo_projection",
         "b12x.norm.mhc",
@@ -411,6 +412,9 @@ _B12X_SUBMODULES = {
         "b12x.sequence.gdn_decode",
         "b12x.sequence.gdn_prefill",
         "b12x.sequence.kda_prefill",
+        "b12x.sequence._shared.disk_table",
+        "b12x.sequence.engram",
+        "b12x.sequence.engram.host",
         "b12x.sequence.mtp_feedback",
         "b12x.sequence.ple",
         "b12x.sequence.ple_embedding",
@@ -451,6 +455,22 @@ def get_b12x_wo_projection() -> ModuleType | None:
 
 def get_b12x_mhc() -> ModuleType | None:
     return _get_submodule("b12x.norm.mhc")
+
+
+def get_b12x_hyperconnection_gate() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.hyperconnection_gate")
+
+
+def get_b12x_engram() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.engram")
+
+
+def get_b12x_engram_host() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.engram.host")
+
+
+def get_b12x_disk_table() -> ModuleType | None:
+    return _get_submodule("b12x.sequence._shared.disk_table")
 
 
 def get_b12x_compressed_sparse_mla() -> ModuleType | None:

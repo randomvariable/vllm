@@ -205,6 +205,27 @@ def mxfp8_linear_method_cls() -> type[ModelOptLinearMethod]:
 
 
 @functools.cache
+def b12x_wo_projection_method_cls() -> type[ModelOptLinearMethod]:
+    from vllm.model_executor.layers.quantization.modelopt import (
+        WEIGHT,
+        ModelOptLinearMethod,
+    )
+
+    class B12xWoProjectionLinearMethod(ModelOptLinearMethod):
+        # Checkpoint parameters stay in their loader layout; the attention
+        # layer packs the two projections together after both have loaded.
+        supports_pre_processed_weights = True
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            self.wkey.process(layer, WEIGHT)
+
+        def apply(self, layer, x, bias=None):
+            raise RuntimeError("WO-A and WO-B must run together in b12x WO projection")
+
+    return B12xWoProjectionLinearMethod
+
+
+@functools.cache
 def _identity_index(device: torch.device, length: int) -> torch.Tensor:
     """`arange(length)` as INT32 on `device`, one copy per process: a
     weight reload rebuilds the experts, and the captured CUDA graphs keep

@@ -622,6 +622,7 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
 
     layer = torch.nn.Module()
     packed = types.SimpleNamespace(out_features=48)
+    layer.b12x_activation_mode = "auto"
     layer.b12x_mxfp8_packed_weight = packed
     x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
     bias = torch.empty((48,), dtype=torch.bfloat16)
@@ -979,6 +980,36 @@ def test_b12x_nvfp4_w4a16_uses_weight_only_scale_and_a16_dispatch(monkeypatch):
     torch.testing.assert_close(output, torch.full((2, 3, 48), 4.0, dtype=x.dtype))
     with pytest.raises(ValueError, match="requires BF16 input"):
         kernel.apply_weights(layer, x.float())
+
+
+@pytest.mark.parametrize("k", [48, 64])
+@torch.inference_mode()
+def test_b12x_nvfp4_w4a16_accepts_k16_tail(k: int) -> None:
+    supported, reason = B12xNvFp4W4A16LinearKernel.is_supported()
+    if not supported:
+        pytest.skip(reason)
+
+    n = 48
+    layer = torch.nn.Module()
+    # Both nibbles encode +1.0. Give the last group a different scale so
+    # dropping the tail or swizzling it into the wrong group changes the result.
+    layer.weight = torch.nn.Parameter(
+        torch.full((n, k // 2), 0x22, dtype=torch.uint8, device="cuda"),
+        requires_grad=False,
+    )
+    scales = torch.ones((n, k // 16), device="cuda")
+    scales[:, -1] = 2
+    layer.weight_scale = torch.nn.Parameter(
+        scales.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_global_scale = torch.tensor([0.5], device="cuda")
+    kernel = B12xNvFp4W4A16LinearKernel(None)
+    kernel.process_weights_after_loading(layer)
+
+    x = torch.ones((2, k), device="cuda", dtype=torch.bfloat16)
+    kernel.get_b12x_warmup_unit(layer, (2,), x.dtype).compile()
+    out = kernel.apply_weights(layer, x)
+    torch.testing.assert_close(out, x.new_full((2, n), (k + 16) / 2))
 
 
 @pytest.mark.parametrize("m,n,k", [(2, 136, 96), (17, 256, 256)])

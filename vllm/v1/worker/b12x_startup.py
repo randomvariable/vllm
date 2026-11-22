@@ -14,8 +14,10 @@ import os
 import pickle
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
+from vllm import envs
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -43,6 +45,19 @@ def _scoped_key(key: str, ranks: tuple[int, ...]) -> str:
 
 def _unscoped_key(key: str) -> str:
     return key.split("|", 1)[1]
+
+
+def _control_get(store, key: str) -> bytes:
+    # Store.get uses the shared handle's timeout; wait explicitly first.
+    seconds = envs.VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS
+    try:
+        store.wait([key], timedelta(seconds=seconds))
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"B12X preparation control wait failed for {key!r} "
+            f"(deadline {seconds}s): {error}"
+        ) from error
+    return store.get(key)
 
 
 class B12xPreparationCoordinator:
@@ -148,7 +163,7 @@ class B12xPreparationCoordinator:
                 self._control.set("stop", b"1")
             self._stop |= self._control.check(["stop"])
             if self._control.check(["failed"]):
-                self._error = pickle.loads(self._control.get("failed"))
+                self._error = pickle.loads(_control_get(self._control, "failed"))
                 self._safe_close()
         try:
             with self._timing.span("local") if self._timing else nullcontext():
@@ -256,7 +271,7 @@ class B12xPreparationCoordinator:
         self._control.set(f"{prefix}/{self.global_rank}", pickle.dumps(payload))
         if self.global_rank == self.world_ranks[0]:
             gathered = [
-                pickle.loads(self._control.get(f"{prefix}/{rank}"))
+                pickle.loads(_control_get(self._control, f"{prefix}/{rank}"))
                 for rank in self.world_ranks
             ]
             try:
@@ -272,7 +287,7 @@ class B12xPreparationCoordinator:
                     done=False,
                 )
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
-        return pickle.loads(self._control.get(f"{prefix}/decision"))
+        return pickle.loads(_control_get(self._control, f"{prefix}/decision"))
 
     def _decision(self, gathered):
         self._validate_domain(gathered)

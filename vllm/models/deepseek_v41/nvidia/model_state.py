@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pcp_group, get_pp_group
@@ -20,6 +22,7 @@ from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
     DecoderReplayCudaGraphManager,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils import b12x_row_prefetch
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import NewRequestData
@@ -256,6 +259,36 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         if self.disk_engrams and self.disk_hash is None:
             raise RuntimeError("Disk Engram layers require an n-gram hash state")
+        native_layers = [
+            layer
+            for layer in self.disk_engrams
+            if layer.embed_tokens.disk_table is not None
+        ]
+        self.row_cache_sampler = None
+        self.row_prefetcher = None
+        if native_layers:
+
+            def resolve_table(layer: Engram):
+                return layer.embed_tokens.disk_table
+
+            self.row_cache_sampler = b12x_row_prefetch.RowCacheSampler(
+                tuple(("engram", partial(resolve_table, m)) for m in native_layers)
+            )
+        if envs.VLLM_PLE_PREFETCH and native_layers and self.disk_hash is not None:
+            from vllm.models.deepseek_v41.common.engram_prefetch import (
+                engram_prefetch_targets,
+            )
+
+            targets = engram_prefetch_targets(self.disk_hash, native_layers)
+            if targets:
+                self.row_prefetcher = b12x_row_prefetch.RowPrefetcher(
+                    targets,
+                    history_len=self.disk_hash.lookback_depth,
+                    history_pad=-1,
+                    max_num_reqs=self.max_num_reqs,
+                    num_speculative_tokens=vllm_config.num_speculative_tokens,
+                    device=device,
+                )
         self.lookback_token_ids: torch.Tensor | None = None
         if depth > 0:
             # Persistent so a captured graph can read it on replay.
@@ -375,12 +408,26 @@ class DeepseekV41ModelState(DefaultModelState):
                 image_sentinel_mask(self.lookback_token_ids),
             )
             for layer in self.disk_engrams:
-                layer.embed_tokens._disk.start(hashes[:, layer.layer_hash_index])
+                layer.embed_tokens.start_disk_lookup(hashes[:, layer.layer_hash_index])
             for layer in self.disk_engrams:
-                table = layer.embed_tokens
-                compact_ids = table._disk.finish()
-                table.lookup(compact_ids, layer.staged_rows[: ids.shape[0]])
+                layer.embed_tokens.finish_disk_lookup(
+                    hashes[:, layer.layer_hash_index], layer.staged_rows[: ids.shape[0]]
+                )
         return model_inputs
+
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        if self.row_prefetcher is not None:
+            self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
+
+    def row_cache_stats(self):
+        return b12x_row_prefetch.row_cache_stats(
+            self.row_prefetcher, self.row_cache_sampler
+        )
 
     def _fill_lookback(self, input_batch: InputBatch, req_states: RequestState) -> None:
         """Gather the batch's lookback windows into `lookback_token_ids`."""

@@ -40,6 +40,14 @@ You can configure how the quantization scales are computed in vLLM using three d
 - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
 - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
 
+#### DeepSeek V4.1 on SM12x
+
+With a compatible FlashInfer sparse MLA backend, `auto` selects
+`fp8_dsv41_inline_fp4_ca`: the sliding-window cache uses inline FP8 records,
+and the compressed-attention cache uses inline FP4 records. Set
+`--kv-cache-dtype fp8_dsv41_inline` to use inline FP8 for both caches, or
+`--kv-cache-dtype fp8` to keep the legacy packed FP8 layout.
+
 ### Skipping Specific Layers from KV-Cache Quantization
 
 Some attention layer types (e.g. sliding-window) are more sensitive to KV-cache quantization. The `--kv-cache-dtype-skip-layers` flag leaves the specified layers at the model's native dtype while keeping the rest of the layers under the chosen quantized dtype. The flag accepts either layer indices or layer-type names:

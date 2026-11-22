@@ -28,7 +28,7 @@ from vllm.utils.math_utils import cdiv
 
 from .attention import AttentionConfig, HiSparseConfig
 from .aux_output import AuxOutputConfig
-from .cache import CacheConfig
+from .cache import DSV41_INLINE_KV_CACHE_DTYPES, CacheConfig
 from .compilation import (
     CompilationConfig,
     CompilationMode,
@@ -1717,6 +1717,17 @@ class VllmConfig:
         self._limit_max_model_len_to_draft()
         self.try_verify_and_update_config()
         self._reject_mismatched_float_kv_cache()
+        cache_dtype = self.cache_config.cache_dtype
+        if (
+            self.model_config is not None
+            and cache_dtype in DSV41_INLINE_KV_CACHE_DTYPES
+            and (
+                self.model_config.hf_text_config.model_type != "deepseek_v41"
+                or not current_platform.is_cuda()
+                or not current_platform.is_device_capability_family(120)
+            )
+        ):
+            raise ValueError(f"{cache_dtype} requires DeepSeek V4.1 on SM12x CUDA")
         self._resolve_and_verify_engram_config()
 
         self._check_supports_watermarking()

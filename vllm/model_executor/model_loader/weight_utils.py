@@ -1164,6 +1164,20 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def filter_b12x_indexed_shards(
+    files: list[str], folder: str, index_file: str, is_unused: Callable[[str], bool]
+) -> list[str]:
+    """Drop indexed shards that hold no requested tensors without opening them."""
+    index = os.path.join(folder, index_file)
+    if not os.path.isfile(index):
+        return files
+    with open(index) as handle:
+        weight_map = json.load(handle)["weight_map"]
+    used = {file for name, file in weight_map.items() if not is_unused(name)}
+    keep = {os.path.realpath(os.path.join(folder, file)) for file in used}
+    return [file for file in files if os.path.realpath(file) in keep]
+
+
 def safetensors_file_sources(path: str) -> dict[str, FileTensorSource]:
     """Read exact tensor ranges from a header, never from tensor payloads."""
     path = os.path.abspath(path)

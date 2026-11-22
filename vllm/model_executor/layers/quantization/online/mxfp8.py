@@ -44,6 +44,10 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
 
     activation_quant_key: QuantKey | None = None
 
+    def __init__(self, *, head_activation_mode: str | None = None):
+        super().__init__()
+        self.head_activation_mode = head_activation_mode
+
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
         kernel = getattr(self, "kernel", None)
@@ -80,7 +84,24 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
             **extra_weight_attrs,
         )
 
-        self.kernel = init_mxfp8_linear_kernel(weight_shape=layer.weight.shape)
+        if self.head_activation_mode is None:
+            self.kernel = init_mxfp8_linear_kernel(weight_shape=layer.weight.shape)
+        else:
+            from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+                B12xMxfp8LinearKernel,
+                Mxfp8LinearLayerConfig,
+            )
+
+            supported, reason = B12xMxfp8LinearKernel.is_supported()
+            if not supported or params_dtype != torch.bfloat16:
+                raise ValueError(
+                    "VLLM_MXFP8_LM_HEAD requires BF16 and a supported B12X kernel: "
+                    f"{reason or params_dtype}"
+                )
+            layer.b12x_activation_mode = self.head_activation_mode
+            self.kernel = B12xMxfp8LinearKernel(
+                Mxfp8LinearLayerConfig(weight_shape=tuple(layer.weight.shape))
+            )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():

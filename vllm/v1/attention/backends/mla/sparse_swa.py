@@ -124,6 +124,8 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype in (
             "fp8_ds_mla",
             "nvfp4_ds_mla",
+            "fp8_dsv41_inline",
+            "fp8_dsv41_inline_fp4_ca",
         )
         spec = MLAAttentionSpec(
             block_size=self.block_size,

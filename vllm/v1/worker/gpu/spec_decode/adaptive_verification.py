@@ -249,7 +249,10 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
         max_concurrent_batches: int = 2,
+        *,
+        cost_scale: float = 1.0,
     ):
+        self.cost_scale = cost_scale
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
         device = req_states.device
@@ -460,14 +463,17 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
-        costs = (
-            draft_cost_ms[len(req_ids)]
-            + verify_cost_ms[
-                num_non_draft_tokens_total : num_non_draft_tokens_total
-                + max_draft_budget
-                + 1
-            ]
-        )
+        verify_costs = verify_cost_ms[
+            num_non_draft_tokens_total : num_non_draft_tokens_total
+            + max_draft_budget
+            + 1
+        ]
+        costs = draft_cost_ms[num_reqs] + verify_costs
+        if self.cost_scale != 1.0:
+            baseline = verify_costs[0]
+            costs = (draft_cost_ms[num_reqs] + baseline) + self.cost_scale * (
+                verify_costs - baseline
+            )
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
@@ -616,6 +622,7 @@ def maybe_create_adaptive_verification_manager(
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     copy_admitted_drafts_to_host: bool = False,
+    adaptive_verification_cost_scale: float = 1.0,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -666,4 +673,5 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
         max_concurrent_batches=vllm_config.max_concurrent_batches,
+        cost_scale=adaptive_verification_cost_scale,
     )

@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
+import torch.nn.functional as F
 
 from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
@@ -156,15 +159,29 @@ class B12xNvFp4W4A16LinearKernel(B12xNvFp4LinearKernel):
         return None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight
+        logical_k = weight.shape[1] * 2
+        pad_k = (-logical_k) % 32
+        if pad_k:
+            # FlashInfer requires K32 storage, but the activation keeps logical K.
+            weight = F.pad(weight, (0, pad_k // 2))
+            scale = layer.weight_scale
+            replace_parameter(
+                layer,
+                "weight_scale",
+                F.pad(scale.view(torch.uint8), (0, pad_k // 16)).view(scale.dtype),
+            )
         super().process_weights_after_loading(layer)
         blockscaled = _import_b12x_blockscaled()
         assert blockscaled is not None
         packed_weight = blockscaled.pack_weight(
-            layer.weight,
+            weight,
             layer.weight_scale,
             recipe="nvfp4",
             global_scale=layer.weight_global_scale,
         )
+        if pad_k:
+            packed_weight = replace(packed_weight, in_features=logical_k)
         layer.b12x_nvfp4_packed_weight = reuse_packed_weight_storage(
             getattr(layer, "b12x_nvfp4_packed_weight", None), packed_weight
         )

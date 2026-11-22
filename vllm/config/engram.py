@@ -49,6 +49,15 @@ class EngramConfig:
     read each step's rows on the host instead of allocating the table.
     Takes precedence over cpu_offload."""
 
+    disk_resident_scales: bool = False
+    """Keep DeepSeek V4.1's E8M0 scale rows in pinned host memory while
+    reading weight rows from disk. Requires disk_offload."""
+
+    projection_tp: bool = False
+    """Shard DeepSeek V4.1's WKV projection over TP and gather its output.
+    By default each rank keeps the full projection. Sequence parallelism
+    requires replication; specialized backends may require sharding."""
+
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
@@ -83,6 +92,8 @@ class EngramConfig:
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
+        if self.disk_resident_scales and not self.disk_offload:
+            raise ValueError("disk_resident_scales requires disk_offload=True")
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
@@ -117,6 +128,11 @@ class EngramConfig:
             for option in ("dp_shared_memory", "embedding_across_dp", "disk_offload"):
                 if getattr(self, option):
                     raise ValueError(f"Flash Engram does not support {option}")
+        if (
+            self.disk_resident_scales
+            and model_config.architecture != "DeepseekV41ForCausalLM"
+        ):
+            raise ValueError("disk_resident_scales requires DeepSeek V4.1")
         if self.disk_offload:
             from vllm.platforms import current_platform
 

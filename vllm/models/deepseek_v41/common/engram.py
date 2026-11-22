@@ -558,6 +558,11 @@ def _engram_lookup_kernel(
     WORD: tl.constexpr = tl.uint8,
     PACKED_FP4: tl.constexpr = False,
     SOFTWARE_FP8: tl.constexpr = False,
+    DISK_STAGED: tl.constexpr = False,
+    RESIDENT_SCALES: tl.constexpr = False,
+    scale_ids=None,
+    SCALE_STRIDE_T: tl.constexpr = 0,
+    SCALE_STRIDE_H: tl.constexpr = 0,
 ):
     """Gather FP8 or MXFP4 rows as dequantized BF16, or FP8 rows as packed
     values/scales (copied WORD at a time).
@@ -589,7 +594,12 @@ def _engram_lookup_kernel(
             dst = rows
             owned = valid & (head < TOTAL_HEADS)
             owned &= (index >= vocab_start) & (index < vocab_end)
-            local = index - vocab_start
+            if DISK_STAGED:
+                # The final rank's staged rows omit its padded heads.
+                width: tl.constexpr = min(LOCAL_HEADS, TOTAL_HEADS - HEAD_START)
+                local = token * width + head - HEAD_START
+            else:
+                local = index - vocab_start
         local = tl.where(owned, local, 0)
         ROW_BYTES: tl.constexpr = DIM // 2 if PACKED_FP4 else DIM
         if PEER_ROWS:
@@ -605,15 +615,26 @@ def _engram_lookup_kernel(
         else:
             row_weight, row_scales = weight, scales
         row_weight += local * ROW_BYTES
-        row_scales += local * (DIM // QUANT_BLOCK)
+        scale_row = local
+        if RESIDENT_SCALES:
+            # Disk lookup is never sorted. Use original ids, not staged offsets.
+            token = (rows // LOCAL_HEADS).to(tl.int64)
+            head = HEAD_START + rows % LOCAL_HEADS
+            original = tl.load(
+                scale_ids + token * SCALE_STRIDE_T + head * SCALE_STRIDE_H,
+                mask=owned,
+                other=0,
+            ).to(tl.int64)
+            scale_row = tl.where(owned, original - vocab_start, 0)
+        row_scales += scale_row * (DIM // QUANT_BLOCK)
         if PACKED:
             # Copy values and scales WORD at a time: one memory request a word.
             word_bytes: tl.constexpr = WORD.primitive_bitwidth // 8
             value_words = tl.arange(0, DIM // word_bytes)
             scale_words = tl.arange(0, DIM // QUANT_BLOCK // word_bytes)
-            width: tl.constexpr = DIM + DIM // QUANT_BLOCK
+            packed_width: tl.constexpr = DIM + DIM // QUANT_BLOCK
             dst = dst.to(tl.int64)
-            dst = dst // LOCAL_HEADS * OUT_STRIDE + dst % LOCAL_HEADS * width
+            dst = dst // LOCAL_HEADS * OUT_STRIDE + dst % LOCAL_HEADS * packed_width
             out_row = (out + dst).to(tl.pointer_type(WORD))
             # Load both first: a load after a store waits out its round trip.
             values = tl.load(
@@ -1064,6 +1085,7 @@ class ParallelEngramEmbedding(nn.Module):
         packed_fp4: bool = False,
         peer_group: EngramPeerGroup | None = None,
         disk_offload: bool = False,
+        disk_resident_scales: bool = False,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -1160,6 +1182,7 @@ class ParallelEngramEmbedding(nn.Module):
                 self.n_hash_cols,
                 cfg.scheduler_config.max_num_batched_tokens,
                 cfg.load_config.load_format == "dummy",
+                resident_scales=disk_resident_scales,
             )
         if self._disk is not None:
             self._weight_loader = self._load_disk_weight
@@ -1212,6 +1235,35 @@ class ParallelEngramEmbedding(nn.Module):
     ) -> None:
         assert self._disk is not None
         self._disk.keep_view(param.disk_plane, loaded_weight)
+
+    @property
+    def disk_table(self):
+        return self._disk.disk_table if self._disk is not None else None
+
+    def start_disk_lookup(self, indices: torch.Tensor) -> None:
+        assert self._disk is not None
+        if self.disk_table is None:
+            self._disk.start(indices)
+
+    def finish_disk_lookup(self, indices: torch.Tensor, out: torch.Tensor) -> None:
+        assert self._disk is not None
+        if (table := self.disk_table) is None:
+            self.lookup(
+                self._disk.finish(),
+                out,
+                scale_indices=indices if self._disk.resident_scales else None,
+            )
+        elif indices.numel():
+            start, end = self._disk.heads
+            ids = indices[:, start:end].to(torch.int64).contiguous()
+            with table.transaction():
+                table.read_rows(ids, ids.numel())
+                self.lookup(
+                    indices,
+                    out,
+                    disk_staged=True,
+                    scale_indices=indices if self._disk.resident_scales else None,
+                )
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         scale_dim = self.dim // self.block_size
@@ -1363,7 +1415,13 @@ class ParallelEngramEmbedding(nn.Module):
         return self._views
 
     def lookup(
-        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+        self,
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        background: bool = False,
+        *,
+        disk_staged: bool = False,
+        scale_indices: torch.Tensor | None = None,
     ) -> None:
         """Look up local heads into BF16, or packed FP8 bytes followed by scales.
 
@@ -1436,6 +1494,11 @@ class ParallelEngramEmbedding(nn.Module):
             PEER_ROWS=self.peer_rows,
             PACKED_FP4=self.packed_fp4,
             SOFTWARE_FP8=software_fp8,
+            DISK_STAGED=disk_staged,
+            RESIDENT_SCALES=scale_indices is not None,
+            scale_ids=scale_indices,
+            SCALE_STRIDE_T=scale_indices.stride(0) if scale_indices is not None else 0,
+            SCALE_STRIDE_H=scale_indices.stride(1) if scale_indices is not None else 0,
             WORD=tl.uint64 if wide else tl.uint8,
             num_warps=8 if block_r == 128 else 4,
         )
@@ -1446,15 +1509,16 @@ class ParallelEngramEmbedding(nn.Module):
         num_tokens = indices.shape[0]
         if self.dp_size > 1:
             indices = gather_engram_hashes(indices)
-        if self._disk is not None:
-            self._disk.start(indices)
-            indices = self._disk.finish()
         out = torch.empty(
             (indices.shape[0], self.part_n_hash_cols, self.dim),
             dtype=torch.bfloat16,
             device=indices.device,
         )
-        self.lookup(indices, out)
+        if self._disk is None:
+            self.lookup(indices, out)
+        else:
+            self.start_disk_lookup(indices)
+            self.finish_disk_lookup(indices, out)
         if self.dp_size > 1:
             out = _gather_engram_rows(out, num_tokens)
         if self.tp_size > 1:
@@ -1836,6 +1900,13 @@ class Engram(nn.Module):
         self.wkv = self._create_wkv(
             n_hash_cols * layout.head_dim, quant_config, f"{prefix}.wkv"
         )
+        engram_config = get_current_vllm_config().engram_config
+        assert engram_config is not None
+        if not engram_config.projection_tp and self.wkv.tp_size > 1:
+            raise ValueError(
+                f"projection_tp=False is not supported by {type(self).__name__} "
+                "with a sharded WKV projection; set projection_tp=True."
+            )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
             requires_grad=False,
@@ -1851,8 +1922,9 @@ class Engram(nn.Module):
     def _create_wkv(
         self, input_size: int, quant_config: QuantizationConfig | None, prefix: str
     ) -> ColumnParallelLinear:
-        # Without sequence parallelism every TP rank holds every token, so
-        # shard the output columns instead of replicating the projection.
+        engram_config = get_current_vllm_config().engram_config
+        assert engram_config is not None
+        # Sequence-parallel ranks hold different tokens, so cannot gather WKV.
         return ColumnParallelLinear(
             input_size,
             self.dim * (self.hc_mult + 1),
@@ -1861,7 +1933,7 @@ class Engram(nn.Module):
             quant_config=quant_config,
             return_bias=False,
             prefix=prefix,
-            disable_tp=self.use_sequence_parallel,
+            disable_tp=self.use_sequence_parallel or not engram_config.projection_tp,
         )
 
     def _create_embedding(
@@ -1884,6 +1956,7 @@ class Engram(nn.Module):
             packed_fp4=layout.packed_fp4,
             peer_group=peer_group,
             disk_offload=engram_config.disk_offload,
+            disk_resident_scales=engram_config.disk_resident_scales,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
@@ -2002,7 +2075,7 @@ class Engram(nn.Module):
             kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
         else:
             kv = self.wkv(self.embed(hash_ids).flatten(-2))
-        if self._gather_columns is not None:
+        if self._gather_columns is not None and self.wkv.tp_size > 1:
             kv = self._gather_columns(kv)
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)

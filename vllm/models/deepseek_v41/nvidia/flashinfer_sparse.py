@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.cache import CacheDType
+from vllm.config.cache import DSV41_INLINE_FP4_KV_CACHE_DTYPE, CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     get_flashinfer_dsv4_workspace,
@@ -60,6 +60,8 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
     ]
 
     @staticmethod
@@ -113,7 +115,15 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                None,
+                "auto",
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "fp8_dsv41_inline",
+                DSV41_INLINE_FP4_KV_CACHE_DTYPE,
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -579,6 +589,41 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
+    @property
+    def packed_kv_cache_dtype(self) -> CacheDType:
+        from vllm.utils.flashinfer import has_flashinfer_dsv41_inline_fp4_ca
+
+        if has_flashinfer_dsv41_inline_fp4_ca():
+            return "fp8_dsv41_inline_fp4_ca"
+        return "fp8_ds_mla"
+
+    def _inline_cache_kwargs(self, has_extra: bool) -> dict[str, str]:
+        if self.kv_cache_dtype not in (
+            "fp8_dsv41_inline",
+            DSV41_INLINE_FP4_KV_CACHE_DTYPE,
+        ):
+            return {}
+        return {
+            "backend": "sparse",
+            "kv_cache_format": (
+                self.kv_cache_dtype if has_extra else "fp8_dsv41_inline"
+            ),
+        }
+
+    def _inline_indices(
+        self, indices: torch.Tensor, cache: torch.Tensor
+    ) -> torch.Tensor:
+        if self.kv_cache_dtype not in (
+            "fp8_dsv41_inline",
+            DSV41_INLINE_FP4_KV_CACHE_DTYPE,
+        ):
+            return indices
+        page = cache.shape[1]
+        span = packed_block_span(cache)
+        return torch.where(
+            indices < 0, indices, indices // page * span + indices % page
+        )
+
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
         return get_flashinfer_dsv4_workspace(device)
@@ -596,10 +641,83 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         return pad_to_supported_q_heads(num_heads)
 
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return dsv41_o_proj(self, attn_out, positions)
+        if self._b12x_wo is None:
+            return dsv41_o_proj(self, attn_out, positions)
+        # Decode and chunked prefill both write BF16 in the rotated KV basis.
+        # The projection applies the inverse rotation, not the attention kernel.
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        local = torch.ops.vllm.dsv41_b12x_wo_projection(
+            attn_out, positions, self.hidden_size, self._b12x_wo.name
+        )
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            return tensor_model_parallel_all_reduce(local)
+        return local
+
+    def _setup_b12x_wo(self, vllm_config: VllmConfig) -> None:
+        from vllm.utils.b12x import (
+            b12x_layer_prefix,
+            get_b12x_preparation,
+            get_b12x_wo_projection,
+            register_b12x_layer,
+            set_b12x_preparation_provider,
+        )
+
+        self._b12x_wo = None
+        if (
+            not current_platform.is_device_capability_family(120)
+            or vllm_config.lora_config is not None
+            or vllm_config.model_config.dtype != torch.bfloat16
+        ):
+            return
+        api = get_b12x_wo_projection()
+        if api is None or get_b12x_preparation() is None or not api.is_supported():
+            return
+
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Static,
+        )
+        from vllm.models.deepseek_v41.nvidia.ops.o_proj import B12xWoProjection
+        from vllm.models.deepseek_v41.nvidia.quantization import (
+            b12x_wo_projection_method_cls,
+        )
+
+        projections = (self.wo_a, self.wo_b)
+        if not all(
+            type(p.quant_method) is ModelOptLinearMethod
+            and p.quant_method.spec.weight == kMxfp8Static
+            and p.quant_method.ctx.scale_block_size == (32, 32)
+            for p in projections
+        ):
+            return
+        if (
+            self.wo_a.weight.shape[1] % 128
+            or self.wo_b.weight.shape[1] % 128
+            or self.o_lora_rank % 32
+            or self.hidden_size % 32
+        ):
+            return
+        method_cls = b12x_wo_projection_method_cls()
+        for p in projections:
+            method = p.quant_method
+            assert type(method) is ModelOptLinearMethod
+            p.quant_method = method_cls(method.spec, method.ctx, method.fmt)
+            p.__dict__.pop("_input_quant_key", None)
+        name = b12x_layer_prefix(self)
+        self._b12x_wo = B12xWoProjection(api, name)
+        register_b12x_layer(name, self)
+        set_b12x_preparation_provider(self, self._b12x_wo)
+
+    def process_weights_after_loading(self) -> None:
+        if self._b12x_wo is not None:
+            self._b12x_wo.pack(self)
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
+        self._setup_b12x_wo(vllm_config)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
         required_topk = required_sm120_sparse_topk(vllm_config, self.window_size)
@@ -791,7 +909,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_indices is not None
         assert swa_lens is not None
         q = self._prepare_query(q, output)
-        swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
+        swa_pool = self.swa_cache_layer.kv_cache
+        swa_indices = self._inline_indices(swa_indices, swa_pool)
+        if extra_sparse_indices is not None and kv_cache is not None:
+            extra_sparse_indices = self._inline_indices(extra_sparse_indices, kv_cache)
+        swa_cache = self._as_sparse_cache(swa_pool)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
         if extra_cache is not None and extra_sparse_indices is None:
             raise RuntimeError(
@@ -810,6 +932,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
+            **self._inline_cache_kwargs(extra_cache is not None),
         )
 
     def _forward_prefill(
@@ -880,7 +1003,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     "Compressed sparse MLA layers require their compressed KV cache."
                 )
             extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
+            assert extra_sparse_indices is not None
+            extra_sparse_indices = self._inline_indices(
+                extra_sparse_indices, compressed_k_cache
+            )
 
+        prefill_swa_indices = self._inline_indices(
+            swa_metadata.prefill_swa_indices, swa_k_cache
+        )
         num_chunks = (
             num_prefills + self.PREFILL_CHUNK_SIZE - 1
         ) // self.PREFILL_CHUNK_SIZE
@@ -906,7 +1036,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             q_chunk = q[query_start:query_end]
-            swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
+            swa_indices_chunk = prefill_swa_indices[query_start:query_end]
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(
@@ -925,4 +1055,5 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                **self._inline_cache_kwargs(extra_kv_paged is not None),
             )

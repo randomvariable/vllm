@@ -107,7 +107,7 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
 CPU offload requires a GPU with UVA support;
 vLLM fails fast when it is unavailable.
 
-## Disk offload (Qwen4Exp)
+## Disk offload
 
 `disk_offload` keeps Qwen4Exp PLE tables in the checkpoint files: no table
 is allocated in GPU or pinned host memory, and nothing is copied to an offload
@@ -120,7 +120,19 @@ the same pool as the weights and the KV cache:
 vllm serve <qwen4exp-checkpoint> --engram-config '{"disk_offload": true}'
 ```
 
-It applies only to Qwen4Exp on CUDA and takes precedence over `cpu_offload`.
+Disk offload also supports DeepSeek V4.1 private TP shards on CUDA and takes
+precedence over `cpu_offload`. DeepSeek V4.1 reads both planes by default. To
+read only FP8 or MXFP4 weights from disk, keep each rank's original E8M0 scale
+bytes in pinned host memory:
+
+```bash
+vllm serve <deepseek-v41-checkpoint> \
+  --engram-config '{"disk_offload": true, "disk_resident_scales": true}'
+```
+
+Budget one host byte per quantization block per owned row in each Engram layer
+(8 bytes per row for 256 columns and block size 32). This mode keeps the disk
+weight-row cache on GPUs that support it.
 
 Rows are read with `preadv` and copied to fixed device buffers before the
 forward, so CUDA graphs replay unchanged. They stay in the checkpoint format

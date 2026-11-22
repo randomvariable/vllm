@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
+    filter_b12x_indexed_shards,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     filter_mm_encoder_only_safetensors_files,
@@ -191,6 +192,7 @@ class DefaultModelLoader(BaseModelLoader):
             load_format == "safetensors"
             or load_format == "fastsafetensors"
             or load_format == "instanttensor"
+            or load_format == "b12x"
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -295,11 +297,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors, index_file
 
-    def _get_weights_iterator(
-        self, source: Source
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
-        extra_config = self.load_config.model_loader_extra_config
+    def _prepare_source(self, source: Source) -> tuple[str, list[str], bool, str]:
+        """Resolve and filter the shards for a checkpoint source."""
         hf_folder, hf_weights_files, use_safetensors, index_file = (
             self._prepare_weights(
                 source.model_or_path,
@@ -328,9 +327,21 @@ class DefaultModelLoader(BaseModelLoader):
                     f"{self._encoder_only_lm_prefixes}"
                 )
         if source.is_unused_weight is not None and use_safetensors:
+            if self.load_config.load_format == "b12x":
+                hf_weights_files = filter_b12x_indexed_shards(
+                    hf_weights_files, hf_folder, index_file, source.is_unused_weight
+                )
             hf_weights_files = filter_safetensors_files_by_weight_name(
                 hf_weights_files, source.is_unused_weight
             )
+        return hf_folder, hf_weights_files, use_safetensors, index_file
+
+    def _get_weights_iterator(
+        self, source: Source
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights based on the load format."""
+        extra_config = self.load_config.model_loader_extra_config
+        hf_folder, hf_weights_files, use_safetensors, _ = self._prepare_source(source)
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False

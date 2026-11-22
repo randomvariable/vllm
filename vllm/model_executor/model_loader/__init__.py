@@ -8,6 +8,7 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
@@ -54,6 +55,7 @@ LoadFormats = Literal[
     "tensorizer",
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
+    "b12x": B12xModelLoader,
     "auto": DefaultModelLoader,
     "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,

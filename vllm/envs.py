@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS: float = 2.0
     VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA: float = 0.25
     VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS: float = 1.0
+    VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS: int = 600
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -373,9 +374,11 @@ if TYPE_CHECKING:
 
     VLLM_B12X_ACTIVATION_MODE_A16_M: int = 0
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_LM_HEAD_A16: bool = True
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
-    VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
     VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
@@ -866,6 +869,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # readers to free a block. Sleeps double from 50 us up to this.
     "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS": lambda: float(
         os.getenv("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", "1.0")
+    ),
+    # Per-read deadline in seconds for the B12X preparation control store.
+    "VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS": lambda: int(
+        os.getenv("VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS", "600")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -2576,6 +2583,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
         "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
     ),
+    "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
     # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
     "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
@@ -2584,9 +2596,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
-    ),
-    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
-        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
     ),
     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
@@ -2746,6 +2755,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SHM_BROADCAST_ADAPTIVE_MAX_GRACE_MS",
         "VLLM_SHM_BROADCAST_ADAPTIVE_ALPHA",
         "VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS",
+        "VLLM_B12X_PREPARATION_CONTROL_TIMEOUT_SECONDS",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",

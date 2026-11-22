@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -16,7 +18,6 @@ from vllm.utils.b12x import B12xWarmupUnit, reuse_packed_weight_storage
 from vllm.utils.b12x import (
     get_b12x_mxfp8_linear as _import_b12x_mxfp8,
 )
-from vllm.utils.torch_utils import current_stream
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -33,11 +34,21 @@ def _apply_b12x_mxfp8_packed_linear(
 
     mxfp8 = _import_b12x_mxfp8()
     assert mxfp8 is not None
+    options = {}
+    source = input_2d
+    if layer.b12x_activation_mode == "a16":
+        if input_2d.dtype != torch.bfloat16:
+            raise ValueError("B12X MXFP8 A16 requires BF16 activations")
+        options["required_mode"] = "a16"
+    elif layer.b12x_activation_mode == "quantized":
+        source = mxfp8_e4m3_quantize(input_2d)
+        options["out_dtype"] = input_2d.dtype
     output = mxfp8.mm(
-        input_2d,
+        source,
         packed_weight,
         bias=bias,
         expected_m=max(1, int(input_2d.shape[0])),
+        **options,
     )
     return output.view(*output_shape)
 
@@ -102,6 +113,9 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         )
         replace_parameter(layer, "weight", weight.new_empty((0,)))
         replace_parameter(layer, "weight_scale", weight_scale.new_empty((0,)))
+        layer.b12x_activation_mode = getattr(layer, "b12x_activation_mode", None) or (
+            envs.VLLM_B12X_MXFP8_ACTIVATION_MODE or envs.VLLM_B12X_DENSE_ACTIVATION_MODE
+        )
         layer.b12x_warmup_provider = self
 
     def get_b12x_warmup_unit(
@@ -122,12 +136,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
                     dtype=output_dtype,
                     device=device,
                 )
-                mxfp8.mm(
-                    source,
-                    packed_weight,
-                    expected_m=max(1, int(tokens)),
-                    stream=current_stream().cuda_stream,
-                )
+                self.apply_weights(layer, source)
 
         return B12xWarmupUnit(
             name="MXFP8",
@@ -138,6 +147,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
                 int(packed_weight.padded_in_features),
                 int(packed_weight.out_features),
                 output_dtype,
+                layer.b12x_activation_mode,
             ),
             compile=compile,
         )

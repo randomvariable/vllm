@@ -784,6 +784,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
+            adaptive_verification_cost_scale=(
+                self.speculative_config.adaptive_verification_cost_scale
+                if self.speculative_config is not None
+                else 1.0
+            ),
         )
 
         self.block_tables = BlockTables(

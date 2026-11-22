@@ -21,10 +21,6 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.mhc.tilelang import (
-    mhc_post_tilelang,
-)
-from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -75,6 +71,8 @@ from .ops.mhc import (
     ampere_all_reduce_ready,
     boundary_all_reduce,
     mhc_all_reduce_ready,
+    mhc_collapse,
+    mhc_post,
     supports_ampere_mhc_overlap,
 )
 from .specialized_decode import decode_backend, register_draft
@@ -317,13 +315,16 @@ class DSparkDeepseekV4Model(nn.Module):
             )
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        b12x_mhc = self.layers[-1]._b12x_mhc
+        hidden_states = mhc_post(
+            hidden_states, residual, post_mix, res_mix, b12x=b12x_mhc
+        )
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference forward_head applies (hc_pre with the
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
         assert pre_mix is not None
-        hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        hidden_states = mhc_collapse(hidden_states, pre_mix, b12x=b12x_mhc)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         return hidden_states

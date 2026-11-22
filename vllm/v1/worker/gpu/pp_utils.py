@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import TypedDict
 
 import numpy as np
 import torch
@@ -16,6 +17,14 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 PP_POSITIONS_KEY = "pp_positions"
+
+
+class PPSampledOutputs(TypedDict):
+    sampled_tokens: torch.Tensor
+    num_sampled: torch.Tensor
+    num_rejected: torch.Tensor
+    idx_mapping: torch.Tensor
+    draft_tokens: torch.Tensor | None
 
 
 @dataclass(slots=True)
@@ -211,7 +220,7 @@ class PPHandler:
             )
         return hidden_states, aux_hidden_states
 
-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
+    def get_prev_sampled_outputs(self) -> PPSampledOutputs | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """

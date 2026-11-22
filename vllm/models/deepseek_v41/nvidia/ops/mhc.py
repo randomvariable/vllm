@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dispatch DSV4.1 mHC operations and overlap coefficient generation."""
 
+from collections.abc import Callable
 from functools import cache, partial
-from typing import TYPE_CHECKING, cast
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -15,14 +17,25 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_delayed_tilelang,
 )
+from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe.moe_output import (
     MoEOutput,
     UnfinalizedMoEOutput,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    get_b12x_mhc,
+    get_b12x_preparation,
+    get_b12x_scratch_buffers,
+    set_b12x_preparation_provider,
+)
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
 from .mega_mhc import (
     can_use_mega_mhc,
@@ -39,6 +52,8 @@ logger = init_logger(__name__)
 
 # GB200 TP4/FlashInfer improves through 16 tokens; larger screens tie or regress.
 MHC_OVERLAP_MAX_TOKENS = 16
+# Some b12x mHC kernels put the token dimension on CUDA grid Y or Z.
+B12X_MHC_MAX_TOKENS = 65_535
 
 # The fused all-reduce + mHC kernel of the overlap path, built once by
 # init_mhc_all_reduce.
@@ -46,6 +61,463 @@ _all_reduce_mhc: "AllReduceMHC | None" = None
 # The SM80 boundaries' two-shot Lamport all-reduce, built once by
 # init_ampere_all_reduce.
 _ampere_all_reduce: "AmpereAllReduce | None" = None
+
+
+def _b12x_mhc_numerics(
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    post_mult: float,
+    iters: int,
+) -> bool:
+    # The pinned native finalizer specializes these values and uses one HC eps.
+    return (
+        rms_eps in (1e-20, 1e-6, 1e-5)
+        and hc_pre_eps == hc_sinkhorn_eps == 1e-6
+        and post_mult == 2.0
+        and iters == 20
+    )
+
+
+class B12xMHC:
+    """Prepared lagged mHC plans owned by a target or draft decoder layer."""
+
+    def __init__(self, api: ModuleType) -> None:
+        self.api = api
+        self._plans: dict[str, dict[int, Any]] = {}
+
+    @staticmethod
+    def for_layer(layer) -> "B12xMHC | None":
+        if not (
+            current_platform.is_device_capability_family(120)
+            and layer.hc_mult == 4
+            and layer.hidden_size in (4096, 5120, 7168)
+        ):
+            return None
+        api = get_b12x_mhc()
+        if api is None or get_b12x_preparation() is None:
+            return None
+        try:
+            if not api.is_supported():
+                return None
+        except ImportError:
+            return None
+        provider = B12xMHC(api)
+        set_b12x_preparation_provider(layer, provider)
+        return provider
+
+    @staticmethod
+    def supports_lagged(layer, norm) -> bool:
+        return norm.weight.dtype in (torch.bfloat16, torch.float32) and (
+            _b12x_mhc_numerics(
+                layer.rms_norm_eps,
+                layer.hc_eps,
+                layer.hc_eps,
+                layer.hc_post_alpha,
+                layer.hc_sinkhorn_iters,
+            )
+        )
+
+    def get_b12x_preparation_units(
+        self, layer, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        device = layer.hc_attn_fn.device
+        if device.type != "cuda":
+            return ()
+        declarations: dict[str, dict[str, Any]] = {
+            "post": dict(operation="post", output_mode="functional"),
+            "collapse": dict(operation="collapse", collapse_weighted=True),
+            "mean": dict(operation="collapse"),
+        }
+        for name, norm in (("attn", layer.attn_norm), ("ffn", layer.ffn_norm)):
+            if not self.supports_lagged(layer, norm):
+                continue
+            common = dict(
+                output_mode="provided",
+                lagged_mix=True,
+                has_norm_weight=True,
+                norm_weight_dtype=str(norm.weight.dtype).removeprefix("torch."),
+                rms_eps=layer.rms_norm_eps,
+                hc_eps=layer.hc_eps,
+                sinkhorn_iters=layer.hc_sinkhorn_iters,
+                norm_eps=norm.variance_epsilon,
+            )
+            declarations[name] = dict(**common, operation="post_pre")
+            if name == "attn":
+                declarations["pre"] = dict(
+                    **common, operation="pre", expanded_residual=True
+                )
+                if layer.hc_attn_fn_broadcast is not None:
+                    declarations["broadcast"] = dict(**common, operation="pre")
+
+        max_tokens = min(workload.max_tokens, B12X_MHC_MAX_TOKENS)
+        requests = []
+        for name, invocation in declarations.items():
+            # The lagged projection uses small-M tactics. Post and collapse
+            # have dynamic M and only need the max-capacity plan.
+            lagged = invocation.get("lagged_mix", False)
+            capacities = (max_tokens,)
+            if lagged:
+                capacities = (*range(1, min(9, max_tokens)), *capacities)
+            plans = self._plans.setdefault(name, {})
+            for tokens in capacities:
+                if tokens not in plans:
+                    plans[tokens] = self.api.plan(
+                        self.api.Caps(
+                            device=device,
+                            max_tokens=tokens,
+                            hidden_size=layer.hidden_size,
+                        ),
+                        invocation=invocation,
+                    )
+                prepare = self._prepare_call(layer, name, tokens if lagged else 1)
+                requests.append(
+                    plans[tokens].request(
+                        name=f"dsv41.mhc.{id(layer):x}.{name}.m{tokens}",
+                        prepare_call=prepare,
+                        benchmark_call=prepare,
+                    )
+                )
+        return (
+            B12xPreparationUnit(
+                name="V41MHC",
+                key=(id(layer), workload.max_tokens, workload.fixed_token_counts),
+                requests=tuple(requests),
+                stage="weights",
+            ),
+        )
+
+    def _prepare_call(self, layer, name, tokens):
+        def prepare(state):
+            # As in the fork, prime the selected implementation directly: its
+            # public entry point requires the plan to have been published.
+            impl = self.api._impl
+            query = state.query
+            fn = layer.hc_ffn_fn if name == "ffn" else layer.hc_attn_fn
+            device = fn.device
+            h = layer.hidden_size
+            x = torch.zeros((tokens, h), dtype=torch.bfloat16, device=device)
+            residual = torch.zeros((tokens, 4, h), dtype=x.dtype, device=device)
+            mix = torch.zeros((tokens, 4), dtype=torch.float32, device=device)
+            comb = None
+            prev_post = None
+
+            def produce():
+                residual.normal_(std=0.25)
+                if query.operation != "collapse":
+                    x.normal_(std=0.25)
+                mix.zero_()
+                mix[:, 0].fill_(1)
+                if comb is not None:
+                    comb.normal_(mean=0.25, std=0.05)
+                if prev_post is not None:
+                    prev_post.normal_(mean=1.0, std=0.1)
+
+            if query.operation == "collapse":
+                run = partial(
+                    impl._run_collapse_impl,
+                    residual,
+                    mix if query.collapse_weighted else None,
+                    out=x,
+                    _state=state,
+                )
+            else:
+                comb = torch.zeros((tokens, 4, 4), dtype=torch.float32, device=device)
+                if query.operation == "post":
+                    run = partial(
+                        impl._b12x_mhc_post_impl, x, residual, mix, comb, _state=state
+                    )
+                else:
+                    is_ffn = name == "ffn"
+                    if name == "broadcast":
+                        fn = layer.hc_attn_fn_broadcast
+                    args = (
+                        fn,
+                        layer.hc_ffn_scale if is_ffn else layer.hc_attn_scale,
+                        layer.hc_ffn_base if is_ffn else layer.hc_attn_base,
+                    )
+                    scratch = [
+                        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                        for spec in state.scratch_specs()
+                    ]
+                    out, post, comb_out, y, pre_out = _b12x_mhc_outputs(residual)
+                    binding = state.bind(
+                        scratch=scratch,
+                        tokens=tokens,
+                        out=out,
+                        post=post,
+                        comb=comb_out,
+                        y=y,
+                        pre_out=pre_out,
+                    )
+                    kwargs = dict(
+                        rms_eps=query.rms_eps,
+                        hc_eps=query.hc_eps,
+                        sinkhorn_iters=query.sinkhorn_iters,
+                        norm_eps=query.norm_eps,
+                        norm_weight=(
+                            layer.ffn_norm if is_ffn else layer.attn_norm
+                        ).weight,
+                        pre_mix=mix,
+                        binding=binding,
+                        _state=state,
+                    )
+                    if query.operation == "pre":
+                        run = partial(
+                            impl._b12x_mhc_pre_impl,
+                            residual if query.expanded_residual else x,
+                            *args,
+                            **kwargs,
+                        )
+                    else:
+                        prev_post = torch.empty_like(mix)
+                        run = partial(
+                            impl._b12x_mhc_post_pre_impl,
+                            x,
+                            residual,
+                            prev_post,
+                            comb,
+                            *args,
+                            **kwargs,
+                        )
+            preparation = get_b12x_preparation()
+            assert preparation is not None
+            return preparation.PreparedCall(run=run, produce=produce)
+
+        return prepare
+
+    def plan_for(self, name: str, residual: torch.Tensor) -> Any | None:
+        if (
+            not residual.is_cuda
+            or residual.dtype != torch.bfloat16
+            or not residual.is_contiguous()
+            or (residual.ndim == 3 and residual.shape[1] != 4)
+        ):
+            return None
+        plans = self._plans.get(name)
+        if not plans:
+            return None
+        tokens = residual.shape[0]
+        if tokens in plans and plans[tokens].prepared is not None:
+            return plans[tokens]
+        capacity = max(plans)
+        plan = plans[capacity]
+        if tokens <= capacity and plan.prepared is not None:
+            return plan
+        return None
+
+
+def mhc_post(x, residual, post_mix, comb, *, b12x: B12xMHC | None):
+    plan = b12x.plan_for("post", residual) if b12x is not None else None
+    if plan is not None:
+        assert b12x is not None
+        return b12x.api.run_post(x, residual, post_mix, comb, plan=plan)
+    return mhc_post_tilelang(x, residual, post_mix, comb)
+
+
+def mhc_collapse(residual, pre_mix, *, b12x: B12xMHC | None):
+    name = "mean" if pre_mix is None else "collapse"
+    plan = b12x.plan_for(name, residual) if b12x is not None else None
+    if plan is not None and (pre_mix is None or pre_mix.is_contiguous()):
+        assert b12x is not None
+        out = residual.new_empty((residual.shape[0], residual.shape[-1]))
+        return b12x.api.run_collapse(residual, pre_mix, out=out, plan=plan)
+    if pre_mix is None:
+        return residual.mean(dim=1)
+    return hc_collapse_triton(residual, pre_mix)
+
+
+def _b12x_mhc_outputs(
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, hidden = residual.shape[0], residual.shape[-1]
+    return (
+        residual.new_empty((rows, 4, hidden)),
+        residual.new_empty((rows, 4), dtype=torch.float32),
+        residual.new_empty((rows, 4, 4), dtype=torch.float32),
+        residual.new_empty((rows, hidden)),
+        residual.new_empty((rows, 4), dtype=torch.float32),
+    )
+
+
+def _run_b12x_lagged_mhc(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    plan_handle: int,
+    x: torch.Tensor | None = None,
+    prev_post: torch.Tensor | None = None,
+    prev_comb: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    outputs = _b12x_mhc_outputs(residual)
+    rows = residual.shape[0]
+    if rows == 0:
+        return outputs
+
+    api = get_b12x_mhc()
+    preparation = get_b12x_preparation()
+    assert api is not None and preparation is not None
+    plan = preparation.plan_from_handle(plan_handle)
+    if pre_mix is None:
+        pre_mix = residual.new_zeros((rows, 4), dtype=torch.float32)
+        pre_mix[:, 0].fill_(1)
+
+    out, post, comb, y, pre_out = outputs
+    scratch = get_b12x_scratch_buffers(plan)
+    binding = api.bind(
+        plan,
+        scratch=scratch,
+        tokens=rows,
+        out=out,
+        post=post,
+        comb=comb,
+        y=y,
+        pre_out=pre_out,
+    )
+    retain_cuda_graph_capture_resource(scratch)
+    query = plan.query
+    kwargs = dict(
+        binding=binding,
+        pre_mix=pre_mix,
+        norm_weight=norm_weight,
+        norm_eps=query.norm_eps,
+        rms_eps=query.rms_eps,
+        hc_eps=query.hc_eps,
+        sinkhorn_iters=query.sinkhorn_iters,
+    )
+    # norm.mhc includes the FP32 projection and RMS stats. The BF16
+    # gemm.hyperconnection_gate computes a different gate-and-mean operation.
+    if x is None:
+        api.run_pre(residual, fn, hc_scale, hc_base, **kwargs)
+    else:
+        assert prev_post is not None and prev_comb is not None
+        api.run_post_pre(
+            x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, **kwargs
+        )
+    return outputs
+
+
+def _fake_b12x_lagged_mhc(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    norm_weight,
+    pre_mix,
+    plan_handle,
+    x=None,
+    prev_post=None,
+    prev_comb=None,
+):
+    return _b12x_mhc_outputs(residual)
+
+
+direct_register_custom_op(
+    op_name="dsv41_b12x_lagged_mhc",
+    op_func=_run_b12x_lagged_mhc,
+    fake_impl=_fake_b12x_lagged_mhc,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _b12x_pre_plan(
+    b12x: B12xMHC | None,
+    name: str,
+    residual: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    post_mult: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> Any | None:
+    if (
+        b12x is None
+        or norm_weight is None
+        or not _b12x_mhc_numerics(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, post_mult, sinkhorn_repeat
+        )
+    ):
+        return None
+    plan = b12x.plan_for(name, residual)
+    if plan is not None and (
+        plan.query.rms_eps == rms_eps
+        and plan.query.norm_eps == norm_eps
+        and plan.query.norm_weight_dtype
+        == str(norm_weight.dtype).removeprefix("torch.")
+    ):
+        return plan
+    return None
+
+
+def mhc_pre_delayed(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    *,
+    hc_mult: int,
+    stream: torch.cuda.Stream | None,
+    b12x: B12xMHC | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run lagged pre, expanding a broadcast embedding as part of the boundary."""
+    broadcast = residual.ndim == 2
+    plan = _b12x_pre_plan(
+        b12x if hc_mult == 4 else None,
+        "broadcast" if broadcast else "pre",
+        residual,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+    )
+    if plan is not None:
+        assert norm_weight is not None
+        residual_out, post, comb, y, next_pre = torch.ops.vllm.dsv41_b12x_lagged_mhc(
+            residual, fn, hc_scale, hc_base, norm_weight, pre_mix, plan.handle
+        )
+        return residual_out, post.unsqueeze(-1), comb, y, next_pre
+
+    x = residual if broadcast else None
+    if broadcast:
+        residual = hc_expand(residual, hc_mult)
+    pre: Callable[..., tuple[Any, Any, Any, Any]]
+    if use_ampere_mhc():
+        pre = partial(mhc_pre_delayed_ampere, stream=stream)
+    elif stream is not None:
+        pre = partial(mhc_pre_delayed_overlap, stream=stream)
+    else:
+        pre = mhc_pre_delayed_tilelang
+    return residual, *pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        pre_mix=pre_mix,
+        x=x,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
 
 
 def supports_mhc_overlap(vllm_config: VllmConfig) -> bool:
@@ -571,10 +1043,12 @@ def mhc_shifted_post_pre(
     stream: torch.cuda.Stream | None = None,
     reduce_results: bool = False,
     boundary_weight: torch.Tensor | None = None,
+    b12x: B12xMHC | None = None,
+    b12x_plan_name: str = "attn",
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Dispatch shifted post/pre to overlap, Mega-mHC, or fused TileLang.
+    """Dispatch shifted post/pre to b12x, overlap, Mega-mHC, or TileLang.
 
     `boundary_weight` (`fn` laid out by `prepare_boundary_weight`, see
     `mhc_boundary_weight`) runs decode-size Mega-mHC batches on the CuTe DSL kernel.
@@ -799,6 +1273,38 @@ def mhc_shifted_post_pre(
         return residual, *pre_outputs, aux
 
     assert isinstance(x, torch.Tensor)
+    plan = _b12x_pre_plan(
+        b12x,
+        b12x_plan_name,
+        residual,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+    )
+    if plan is not None:
+        assert norm_weight is not None
+        residual, post, comb, y, next_pre = torch.ops.vllm.dsv41_b12x_lagged_mhc(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            pre_mix,
+            plan.handle,
+            x,
+            post_layer_mix,
+            comb_res_mix,
+        )
+        aux = (
+            mhc_collapse(residual, None, b12x=b12x)
+            if capture_aux
+            else residual.new_empty((0, residual.shape[-1]))
+        )
+        return residual, post.unsqueeze(-1), comb, y, next_pre, aux
     if _split_projection(residual, residual.shape[1] * residual.shape[2], norm_weight):
         # SM80 prefill: the stock post kernel, then the split-k projection
         # and the stock epilogue.

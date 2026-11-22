@@ -269,7 +269,14 @@ CSF_SCALE_ENCODINGS: dict[str, tuple[tuple[str, ...], Callable[..., np.ndarray]]
 def decode_csf_scale(encoding: str, streams: dict[str, torch.Tensor]) -> torch.Tensor:
     """Rebuild one `[rows, cols]` float8_e4m3fn block-scale matrix."""
     names, decode = CSF_SCALE_ENCODINGS[encoding]
-    out = decode(*(streams[name].cpu() for name in names))
+    from vllm.model_executor.weight_transfer import materialize_weight
+
+    def cpu_stream(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_meta:
+            tensor = materialize_weight(tensor)
+        return tensor.cpu()
+
+    out = decode(*(cpu_stream(streams[name]) for name in names))
     return torch.from_numpy(out).view(torch.float8_e4m3fn)
 
 

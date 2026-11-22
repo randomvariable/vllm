@@ -13,6 +13,7 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -324,6 +325,11 @@ class B12xNGramEmbedding(nn.Module):
         self._weight_scale_loaded = False
         self._weight_scale_2_loaded = False
         self._embedding_validated = False
+        # Dummy weights never pass through load_weights, so no shard covers
+        # the table; its parameters are filled in place instead.
+        self._dummy_weights = (
+            get_current_vllm_config().load_config.load_format == "dummy"
+        )
 
         device = torch.device(current_platform.current_device())
         common_caps = {
@@ -644,7 +650,8 @@ class B12xNGramEmbedding(nn.Module):
         if self._embedding_validated:
             return
         try:
-            _require_embedding_coverage(self)
+            if not self._dummy_weights:
+                _require_embedding_coverage(self)
         except ValueError:
             # Waiting replicas must not attach to a table this process cannot fill.
             abort_shared_table = getattr(

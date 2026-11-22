@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
@@ -22,6 +23,100 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+
+
+@pytest.fixture
+def dspark_d3_config(tmp_path):
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+    DeepseekV41Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        text_config={
+            "hidden_size": 768,
+            "num_hidden_layers": 2,
+            "n_routed_experts": 384,
+            "num_experts_per_tok": 6,
+            "dspark_n_routed_experts": 128,
+            "dspark_num_experts_per_tok": 3,
+            "n_shared_experts": 1,
+            "moe_intermediate_size": 128,
+            "num_attention_heads": 12,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 4096,
+        },
+    ).save_pretrained(tmp_path)
+    return dict(
+        method="dspark",
+        num_speculative_tokens=3,
+        target_model_config=ModelConfig(
+            model=str(tmp_path), tokenizer_mode="skip", max_model_len=2048
+        ),
+        target_parallel_config=ParallelConfig(),
+        enable_adaptive_verification=True,
+    )
+
+
+@pytest.mark.parametrize("scale", [None, 1.0, 0.5])
+def test_cost_scale_config(dspark_d3_config, scale):
+    if scale is not None:
+        dspark_d3_config["adaptive_verification_cost_scale"] = scale
+    config = SpeculativeConfig(**dspark_d3_config)
+    assert config.num_speculative_tokens == 3
+    assert config.adaptive_verification_cost_scale == (1.0 if scale is None else scale)
+
+
+@pytest.mark.parametrize("scale", [0, -0.5, float("nan"), float("inf"), -float("inf")])
+def test_cost_scale_config_rejects_invalid_values(dspark_d3_config, scale):
+    with pytest.raises(ValueError, match=r"adaptive_verification_cost_scale\n"):
+        SpeculativeConfig(**dspark_d3_config, adaptive_verification_cost_scale=scale)
+
+
+@pytest.mark.parametrize("method", ["ngram", "dspark"])
+def test_cost_scale_config_requires_dspark_adaptive(dspark_d3_config, method):
+    dspark_d3_config.update(method=method, enable_adaptive_verification=False)
+    SpeculativeConfig(**dspark_d3_config, adaptive_verification_cost_scale=1.0)
+    with pytest.raises(ValueError, match="cost_scale requires DSpark adaptive"):
+        SpeculativeConfig(**dspark_d3_config, adaptive_verification_cost_scale=0.5)
+
+
+@pytest.mark.parametrize(("scale", "expected"), [(None, 1), (1.0, 1), (0.5, 2)])
+def test_cost_scale_budget(monkeypatch, dspark_d3_config, scale, expected):
+    # 4 ms fixed cost (2 draft + 2 base verify), with a 1.5 ms increment.
+    # For 0.3 expected extra tokens, only halving the increment makes the
+    # first draft worthwhile; halving either fixed cost as well does not.
+    def make_cpu_manager(*args, cost_scale, **kwargs):
+        manager = make_manager(
+            np.array([[0.3, 0.1, 0.1]]), np.array([1.0, 2.0, 3.5, 100.0, 100.0])
+        )
+        assert manager.cost_tables is not None
+        manager.cost_tables[0][1] = 2.0
+        manager.cost_scale = cost_scale
+        return manager
+
+    options = {}
+    if scale is not None:
+        dspark_d3_config["adaptive_verification_cost_scale"] = scale
+    config = SpeculativeConfig(**dspark_d3_config)
+    if scale is not None:
+        options["adaptive_verification_cost_scale"] = (
+            config.adaptive_verification_cost_scale
+        )
+    monkeypatch.setattr(
+        adaptive_module, "AdaptiveVerificationManager", make_cpu_manager
+    )
+    manager = maybe_create_adaptive_verification_manager(
+        enable_adaptive_verification=config.enable_adaptive_verification,
+        attn_groups=[],
+        req_states=SimpleNamespace(num_speculative_steps=config.num_speculative_tokens),
+        query_start_loc=torch.zeros(2, dtype=torch.int32),
+        num_bonus_tokens=1,
+        max_total_logits=4,
+        vllm_config=SimpleNamespace(max_concurrent_batches=2),
+        **options,
+    )
+    assert manager is not None
+    assert manager.get_num_tokens({"low": 4}, {"low": [1, 2, 3]}) == expected
 
 
 def make_manager(
@@ -40,6 +135,7 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager.cost_scale = 1.0
     return manager
 
 
@@ -80,9 +176,10 @@ def tp_consensus_worker(rank: int, world_size: int, store: str) -> None:
     adaptive_module.assign_draft_token_budget = assign_budget
     adaptive_module.async_tensor_h2d = tensor_h2d
 
-    def layout(stale, current, verify_cost_ms):
+    def layout(stale, current, verify_cost_ms, scale=1.0):
         """Each rank's batch layout for one step with one draft per request."""
-        manager = make_manager(stale, np.array(verify_cost_ms))
+        manager = make_manager(stale, np.array(verify_cost_ms, dtype=float))
+        manager.cost_scale = scale
         manager._confidence_probs = torch.from_numpy(current)
         manager._batch_draft_capacity = torch.empty(2, dtype=torch.int32)
         manager._num_non_draft_tokens = torch.empty(2, dtype=torch.int32)
@@ -108,6 +205,11 @@ def tp_consensus_worker(rank: int, world_size: int, store: str) -> None:
     # Budget: accepted/cost of 0 and 1 drafts tie at exactly 0.5.
     stale = np.array([[up if rank == 0 else down], [0.1]], dtype=np.float32)
     budget_layouts = layout(stale, stale, [1, 1, 1, 1.25, 100])
+    # At scale 0.5, the first draft costs an extra 0.25 ms against a
+    # baseline of 1 ms. Only rank zero would admit it without broadcast.
+    scaled_stale = np.array([[0.75 if rank == 0 else 0.25], [0.1]])
+    scaled_layouts = layout(scaled_stale, scaled_stale, [1, 1, 1, 1.5, 100], 0.5)
+    assert [layout[0] for layout in scaled_layouts] == [3] * world_size
     # Boundaries: same budget (1 of 2 drafts), but the requests' current
     # confidences swap order, so each rank would admit a different draft.
     stale = np.full((2, 1), 0.5, dtype=np.float32)

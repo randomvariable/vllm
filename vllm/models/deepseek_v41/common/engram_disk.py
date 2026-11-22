@@ -8,11 +8,25 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ngram_embedding import _maps_entry
+from vllm.platforms import current_platform
+from vllm.utils.b12x import get_b12x_disk_table
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 # Parameter names of a table's planes: FP8 or packed MXFP4 values, then E8M0
 # block scales.
 PLANES = ("weight", "weight_scale_inv")
+
+
+def _maps_entry(ptr: int) -> tuple[str, int]:
+    """Locate the checkpoint file and byte offset of an mmap view."""
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            fields = line.split(maxsplit=5)
+            low, high = (int(bound, 16) for bound in fields[0].split("-"))
+            if low <= ptr < high:
+                path = fields[5].rstrip("\n") if len(fields) > 5 else ""
+                return path, ptr - low + int(fields[2], 16)
+    return "", 0
 
 
 def _read_rows(fd: int, base: int, ids: torch.Tensor, rows: torch.Tensor) -> None:
@@ -38,7 +52,8 @@ class EngramDiskRows:
 
     The loader's zero-copy views of the safetensors files only locate the
     rows: `bind` records each plane's file and offset and drops the views, so
-    the table takes no device or pinned host memory. Each step, `start`
+    the full weight table takes no device or pinned host memory. With resident
+    scales, `bind` copies only the rank's scale plane to host memory. Each step, `start`
     copies the rank's hash ids to the host, and a worker thread reads the
     distinct rows they select with `preadv` into pinned staging while the GPU
     runs the layers before the Engram layer. `finish` uploads that compact
@@ -55,17 +70,37 @@ class EngramDiskRows:
         num_heads: int,
         max_tokens: int,
         dummy: bool,
+        resident_scales: bool = False,
     ) -> None:
         """`vocab`: the rank's [start, end) table rows; `heads`: its
         [start, end) hash heads out of `num_heads`; `dummy`: weights are
         not loaded, so rows read as zeros."""
         self.vocab, self.heads, self._dummy = vocab, heads, dummy
+        self.resident_scales = resident_scales and not dummy
+        self._scale_host: torch.Tensor | None = None
+        self._scale_view: torch.Tensor | None = None
         self._weight_dtype = weight_dtype
-        device = torch.get_default_device()
+        self._device = device = torch.get_default_device()
+        self._views: dict[str, torch.Tensor] = {}
+        self._fds: dict[str, int] = {}
+        self._bound = False
+        self._plane_bytes = plane_bytes
+        self.disk_table = None
+        self._native = None
+        max_rows = max_tokens * (heads[1] - heads[0])
+        if (
+            not dummy
+            and device.type == "cuda"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120, device.index or 0)
+        ):
+            self._native = getattr(get_b12x_disk_table(), "DiskRowCache", None)
+        if self._native is not None:
+            self._max_rows = max_rows
+            return
         # Placeholder (meta) modules never run, so allocate nothing real.
         host = device if device.type == "meta" else torch.device("cpu")
         pin = device.type == "cuda"
-        max_rows = max_tokens * (heads[1] - heads[0])
 
         def staging(*shape: int, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
             return (
@@ -73,8 +108,9 @@ class EngramDiskRows:
                 torch.empty(shape, dtype=dtype, device=device),
             )
 
+        staged_bytes = plane_bytes[:1] if self.resident_scales else plane_bytes
         self._planes = [
-            staging(max_rows, size, dtype=torch.uint8) for size in plane_bytes
+            staging(max_rows, size, dtype=torch.uint8) for size in staged_bytes
         ]
         self._host_ids = torch.empty(
             max_tokens,
@@ -92,10 +128,7 @@ class EngramDiskRows:
         self._worker = ThreadPoolExecutor(1, thread_name_prefix="engram-disk")
         self._pending: Future[int] | None = None
         self._num_tokens = 0
-        self._views: dict[str, torch.Tensor] = {}
         self._sources: list[tuple[int, int]] = []
-        self._fds: dict[str, int] = {}
-        self._bound = False
 
     def __del__(self) -> None:
         for fd in getattr(self, "_fds", {}).values():
@@ -125,7 +158,7 @@ class EngramDiskRows:
             loaded_weight = loaded_weight.view(torch.uint8)
         start, end = self.vocab
         rows = loaded_weight.narrow(0, start, end - start).view(torch.uint8)
-        width = self._planes[PLANES.index(plane)][0].shape[1]
+        width = self._plane_bytes[PLANES.index(plane)]
         if rows.shape != (end - start, width):
             raise ValueError(
                 f"Engram {plane} rows {tuple(rows.shape)} do not fit "
@@ -138,6 +171,7 @@ class EngramDiskRows:
         if self._bound or self._dummy:
             self._bound = True
             return
+        sources = []
         for plane in PLANES:
             view = self._views.get(plane)
             if view is None:
@@ -150,16 +184,66 @@ class EngramDiskRows:
                     f"({path or 'anonymous'}); disk offload reads the "
                     "safetensors files the loader maps"
                 )
-            if path not in self._fds:
-                self._fds[path] = os.open(path, os.O_RDONLY)
-            self._sources.append((self._fds[path], offset))
+            if plane == PLANES[1] and self.resident_scales:
+                # Copy only this rank's original E8M0 bytes. Keep the pinned
+                # owner alive alongside the CUDA alias used by the lookup.
+                device = self._device
+                host = torch.empty_like(
+                    view, device="cpu", pin_memory=device.type == "cuda"
+                )
+                host.copy_(view)
+                self._scale_host = host
+                self._scale_view = (
+                    get_accelerator_view_from_cpu_tensor(host)
+                    if device.type == "cuda"
+                    else host
+                )
+            else:
+                sources.append((path, offset))
+        if self._native is not None:
+            # The Engram facade fixes FP8 widths and uniform TP row shards.
+            # Use its underlying table with our checkpoint's head boundaries.
+            start, end = self.vocab
+            weight_bytes, scale_bytes = self._plane_bytes
+            table = self._native(
+                device=self._device,
+                max_lookups=self._max_rows,
+                table_rows=end,
+                shard_start=start,
+                shard_end=end,
+                shard_rows=end,
+                weight_row_bytes=weight_bytes,
+                scale_row_bytes=0 if self.resident_scales else scale_bytes,
+            )
+            try:
+                for i, (path, offset) in enumerate(sources):
+                    table.add_shard(
+                        0, path, offset - start * self._plane_bytes[i], scale=i == 1
+                    )
+                table.freeze()
+            except Exception:
+                table.close()
+                raise
+            self.disk_table = table
+        else:
+            for path, offset in sources:
+                if path not in self._fds:
+                    self._fds[path] = os.open(path, os.O_RDONLY)
+                self._sources.append((self._fds[path], offset))
         self._views.clear()
         self._bound = True
 
     @property
     def tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The values and scales staged on the device for the last step."""
-        values, scales = (device for _, device in self._planes)
+        if (table := self.disk_table) is not None:
+            values = table.weight
+            scales = table.scale if self._scale_view is None else self._scale_view
+        else:
+            values = self._planes[0][1]
+            scales = (
+                self._planes[1][1] if self._scale_view is None else self._scale_view
+            )
         return values.view(self._weight_dtype), scales
 
     def start(self, hash_ids: torch.Tensor) -> None:

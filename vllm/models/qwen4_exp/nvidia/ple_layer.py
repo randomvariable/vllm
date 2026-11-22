@@ -854,7 +854,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def unbind_kv_cache(self) -> None:
         self._state_caps = None
         self._state_plans = {}
-        super().unbind_kv_cache()
+        # Defining this replaces clear_layer_kv_caches' default reset.
+        self.kv_cache = ()
 
     def _prepare_metadata(
         self,

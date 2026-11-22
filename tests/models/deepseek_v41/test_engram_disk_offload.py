@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,11 @@ from safetensors.torch import save_file
 
 from vllm.config.engram import EngramConfig
 from vllm.models.deepseek_v41.common import engram
+
+
+def test_resident_scales_require_disk_offload():
+    with pytest.raises(ValueError, match="disk_resident_scales requires disk_offload"):
+        EngramConfig(disk_resident_scales=True)
 
 
 def test_disk_offload_rejects_microbatching():
@@ -34,7 +40,14 @@ class ReferenceKernel:
             valid = (selected >= start) & (selected < end)
             local = (selected - start).masked_fill(~valid, 0)
             values = weight.float()[local]
-            scale = (scales[local].int() << 23).view(torch.float32)
+            scale_local = local
+            if (scale_ids := kw.get("scale_ids")) is not None:
+                scale_local = torch.zeros_like(local)
+                scale_local[:, valid_heads] = (
+                    scale_ids[:, heads[valid_heads]].long() - start
+                )
+                scale_local.masked_fill_(~valid, 0)
+            scale = (scales[scale_local].int() << 23).view(torch.float32)
             result = values.unflatten(-1, (-1, kw["QUANT_BLOCK"])) * scale.unsqueeze(-1)
             out.copy_(
                 result.flatten(-2)
@@ -46,7 +59,10 @@ class ReferenceKernel:
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_disk_lookup_matches_resident_checkpoint_tp_shard(tmp_path, monkeypatch, rank):
+@pytest.mark.parametrize("resident_scales", [False, True])
+def test_disk_lookup_matches_resident_checkpoint_tp_shard(
+    tmp_path, monkeypatch, rank, resident_scales
+):
     monkeypatch.setattr(engram, "get_engram_dp_size", lambda: 1)
     monkeypatch.setattr(engram, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(engram, "get_tensor_model_parallel_rank", lambda: rank)
@@ -68,7 +84,7 @@ def test_disk_lookup_matches_resident_checkpoint_tp_shard(tmp_path, monkeypatch,
     weights = (torch.arange(15 * 32).reshape(15, 32).float() % 8).to(
         torch.float8_e4m3fn
     )
-    scales = torch.full((15, 1), 127, dtype=torch.uint8)
+    scales = torch.arange(120, 135, dtype=torch.uint8).reshape(15, 1)
     path = tmp_path / "model.safetensors"
     save_file(
         {
@@ -78,7 +94,13 @@ def test_disk_lookup_matches_resident_checkpoint_tp_shard(tmp_path, monkeypatch,
         path,
     )
     resident = engram.ParallelEngramEmbedding(15, 32, (3, 3, 3, 3, 3))
-    disk = engram.ParallelEngramEmbedding(15, 32, (3, 3, 3, 3, 3), disk_offload=True)
+    disk = engram.ParallelEngramEmbedding(
+        15,
+        32,
+        (3, 3, 3, 3, 3),
+        disk_offload=True,
+        disk_resident_scales=resident_scales,
+    )
     with safe_open(path, framework="pt") as checkpoint:
         for table in (resident, disk):
             table.weight.weight_loader(
@@ -95,13 +117,19 @@ def test_disk_lookup_matches_resident_checkpoint_tp_shard(tmp_path, monkeypatch,
     )
     expected = torch.empty((3, 3, 32), dtype=torch.bfloat16)
     actual = torch.empty_like(expected)
-    resident.lookup(ids, expected)
-    disk._disk.start(ids)
-    compact = disk._disk.finish()
-    disk.lookup(compact, actual)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    disk._disk.start(ids.flip(0))
-    compact = disk._disk.finish()
-    disk.lookup(compact, actual)
-    resident.lookup(ids.flip(0), expected)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    read_sizes = []
+    preadv = os.preadv
+
+    def record_read(fd, buffers, offset):
+        count = preadv(fd, buffers, offset)
+        read_sizes.append(count)
+        return count
+
+    monkeypatch.setattr(os, "preadv", record_read)
+    for batch in (ids, ids.flip(0)):
+        resident.lookup(batch, expected)
+        disk.start_disk_lookup(batch)
+        disk.finish_disk_lookup(batch, actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert 32 in read_sizes
+    assert (1 in read_sizes) is not resident_scales

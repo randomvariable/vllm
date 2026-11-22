@@ -1660,8 +1660,6 @@ def test_b12x_mxfp4_csf_checkpoint_loading_preserves_generation(
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    # Compare matching GEMM layouts to isolate scale storage from arithmetic.
-    monkeypatch.setenv("B12X_W4A8_CSF_INLINE", str(int(intermediate % 128 == 64)))
     config = Qwen3MoeConfig(
         vocab_size=128,
         hidden_size=256,
@@ -1719,11 +1717,7 @@ def test_b12x_mxfp4_csf_checkpoint_loading_preserves_generation(
                 assert layer.w13_weight_scale.numel() == 0
                 assert layer.w2_weight_scale.numel() == 0
                 prepared = layer._b12x_prepared_experts
-                inline = intermediate % 128 == 64
-                assert (prepared.mxfp4_csf_inline is not None) == (
-                    compressed and inline
-                )
-                assert (prepared.mxfp4_csf is not None) == (compressed and not inline)
+                assert (prepared.nvfp4_csf is not None) == compressed
                 pointers.append(
                     (
                         prepared.w1_blockscale.data_ptr(),
@@ -1821,7 +1815,6 @@ def test_b12x_mxfp4_resident_scales_match_plain_scales(
     """CSF preserves scales and outputs for cached live capacities and graph replays."""
     from vllm.v1.worker.workspace import lock_workspace
 
-    monkeypatch.setenv("B12X_W4A8_CSF_INLINE", str(int(intermediate % 128 == 64)))
     set_random_seed(29)
     num_experts, hidden = 8, 256
     config = make_dummy_moe_config(
@@ -1875,21 +1868,13 @@ def test_b12x_mxfp4_resident_scales_match_plain_scales(
         assert isinstance(resident_experts, B12xExperts)
         plain = plain_experts._prepared()
         resident = resident_experts._prepared()
-        inline = intermediate % 128 == 64
-        assert (resident.mxfp4_csf_inline is not None) == inline
+        assert plain.nvfp4_csf is None
+        assert resident.nvfp4_csf is not None
         assert (
             layers[1].w13_weight_scale.numel() == layers[1].w2_weight_scale.numel() == 0
         )
 
-        if inline:
-            assert resident.mxfp4_csf is None
-        else:
-            assert resident.mxfp4_csf is not None
-            resident.mxfp4_csf.decode(
-                torch.arange(num_experts, device="cuda", dtype=torch.int32),
-                resident.w1_blockscale,
-                resident.w2_blockscale,
-            )
+        resident.nvfp4_csf.decode_all(resident.w1_blockscale, resident.w2_blockscale)
         for expanded, expected in zip(
             (resident.w1_blockscale, resident.w2_blockscale),
             (plain.w1_blockscale, plain.w2_blockscale),
@@ -1926,7 +1911,7 @@ def test_b12x_mxfp4_resident_scales_match_plain_scales(
             )
 
         def assert_outputs_match(csf_out, plain_out):
-            if inline:
+            if intermediate % 128 == 64:
                 torch.testing.assert_close(csf_out, plain_out, rtol=0, atol=0)
                 return
             # The plain layer runs the legacy plan/bind path here, not the native one.

@@ -329,6 +329,30 @@ class VocabParallelEmbedding(PluggableLayer):
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
         is_embedding_layer = not isinstance(self, ParallelLMHead)
+        if not is_embedding_layer and envs.VLLM_MXFP8_LM_HEAD:
+            from vllm.compilation import backends
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.online.mxfp8 import (
+                Mxfp8OnlineLinearMethod,
+            )
+
+            config = get_current_vllm_config_or_none()
+            model_config = config.model_config if config is not None else None
+            tied = getattr(
+                getattr(model_config, "hf_text_config", None),
+                "tie_word_embeddings",
+                False,
+            )
+            if (
+                backends.model_tag == "backbone"
+                and not tied
+                and isinstance(
+                    quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+                )
+            ):
+                mode = "a16" if envs.VLLM_LM_HEAD_A16 else "quantized"
+                quant_method = Mxfp8OnlineLinearMethod(head_activation_mode=mode)
         quant_method_implements_embedding = method_has_implemented_embedding(
             type(quant_method)
         )

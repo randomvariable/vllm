@@ -379,7 +379,7 @@ class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
         return Qwen4ExpQSAMetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [MultipleOf(_qsa_manager_block_alignment())]
 
     @classmethod
@@ -451,7 +451,7 @@ class Qwen4ExpQSAImpl(AttentionImpl[Qwen4ExpQSAMetadata]):
     """Native vLLM main-K/V writer for the merged QSA owner."""
 
     is_sparse: ClassVar[bool] = True
-    supports_dense_mha_prefill: ClassVar[bool] = False
+    supports_dense_mha_prefill: bool = False
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
     supports_mtp_with_cp_non_trivial_interleave_size: bool = True
