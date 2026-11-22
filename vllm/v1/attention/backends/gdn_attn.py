@@ -8,6 +8,7 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.abstract import (
@@ -18,6 +19,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -75,6 +77,39 @@ class GDNFlashInferCheckpointPlan:
     cu_starts: torch.Tensor
     # Per checkpoint row, its state among the ``num_checkpoints`` emitted.
     rows: torch.Tensor
+
+
+@triton.jit(do_not_specialize=["num_reqs", "source_stride", "accepted_stride"])
+def _fill_uniform_spec_metadata(
+    source,
+    accepted_source,
+    state_indices,
+    accepted,
+    sequence_masks,
+    token_indices,
+    query_start_loc,
+    num_reqs,
+    source_stride,
+    accepted_stride,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = token // WINDOW
+    column = token % WINDOW
+    live = row < num_reqs
+    state = tl.load(source + row.to(tl.int64) * source_stride + column, live, other=0)
+    tl.store(state_indices + token, state, live)
+    tl.store(token_indices + token, token, live)
+    first = live & (column == 0)
+    count = tl.load(
+        accepted_source + row.to(tl.int64) * accepted_stride, first, other=0
+    )
+    tl.store(accepted + row, count, first)
+    tl.store(sequence_masks + row, True, first)
+    tl.store(query_start_loc + row, token, first)
+    if tl.program_id(0) == 0:
+        tl.store(query_start_loc + num_reqs, num_reqs * WINDOW)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -299,6 +334,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
 
+        self._reuse_spec_decode_inputs = (
+            envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
+            and type(self) is GDNAttentionMetadataBuilder
+            and not self._adaptive_verification
+            and self.use_spec_decode
+            and self.use_full_cuda_graph
+        )
+        if self._reuse_spec_decode_inputs:
+            self._uniform_spec_masks_cpu = torch.ones(
+                self.decode_cudagraph_max_bs, dtype=torch.bool
+            )
+            self._uniform_spec_tokens = torch.arange(
+                self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
+            )
+            self._uniform_spec_query_start = torch.arange(
+                self.decode_cudagraph_max_bs + 1, dtype=torch.int32, device=device
+            ) * (self.num_spec + 1)
+
     @staticmethod
     def _check_chunk_metadata_override(
         builder_cls: type["GDNAttentionMetadataBuilder"], backend: str
@@ -323,6 +376,70 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"{builder_cls.__name__} builds its own FLA chunk metadata, which "
             "the 'aiter_flydsl' GDN prefill backend does not use. Select a "
             "different gdn_prefill_backend for this model."
+        )
+
+    def _build_uniform_spec_decode(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
+        mixed: B12xGdnMixedMetadata | None,
+    ) -> GDNAttentionMetadata:
+        """Populate uniform speculative metadata in builder-owned graph storage.
+
+        Everything the layers read is written into the builder-owned graph
+        buffers, exactly where the generic path writes it, so a full cudagraph
+        captured through either path replays correctly through the other.
+        """
+        num_reqs = m.num_reqs
+        num_tokens = m.num_actual_tokens
+        source = self.mamba_aligned_state_indices
+        assert source is not None
+        spec_state_indices = self.spec_state_indices_tensor[:num_reqs]
+        spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
+        spec_token_indx = self.spec_token_indx[:num_tokens]
+        spec_query_start_loc = self.spec_query_start_loc[: num_reqs + 1]
+        accepted = self.num_accepted_tokens[:num_reqs]
+        if source.is_cuda:
+            _fill_uniform_spec_metadata[(triton.cdiv(num_tokens, 128),)](
+                source,
+                num_accepted_tokens,
+                spec_state_indices,
+                accepted,
+                spec_sequence_masks,
+                spec_token_indx,
+                spec_query_start_loc,
+                num_reqs,
+                source.stride(0),
+                num_accepted_tokens.stride(0),
+                WINDOW=self.num_spec + 1,
+                BLOCK=128,
+            )
+        else:
+            spec_state_indices.copy_(source[:num_reqs, : self.num_spec + 1])
+            spec_sequence_masks.fill_(True)
+            spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens])
+            spec_query_start_loc.copy_(self._uniform_spec_query_start[: num_reqs + 1])
+            accepted.copy_(num_accepted_tokens[:num_reqs])
+        if self._b12x_prefill_live_counts is not None:
+            self._b12x_prefill_live_counts.zero_()
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_reqs,
+            num_spec_decode_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            spec_query_start_loc=spec_query_start_loc,
+            spec_state_indices_tensor=spec_state_indices,
+            spec_sequence_masks=spec_sequence_masks,
+            spec_sequence_masks_cpu=self._uniform_spec_masks_cpu[:num_reqs],
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+            num_accepted_tokens=accepted,
+            uniform_spec_sequence_length=self.num_spec + 1,
+            b12x_prefill_live_counts=self._b12x_prefill_live_counts,
+            b12x_mixed=mixed,
         )
 
     def _build_chunk_metadata(
@@ -399,6 +516,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
         else:
             mixed = None
+
+        window = self.num_spec + 1
+        if (
+            self._reuse_spec_decode_inputs
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+            and aligned_state_indices is not None
+            and aligned_state_indices.stride(1) == 1
+            and num_accepted_tokens is not None
+            and num_decode_draft_tokens_cpu is not None
+            and 0 < m.num_actual_tokens <= self.decode_cudagraph_max_bs
+            and m.num_actual_tokens == m.num_reqs * window
+            and bool(torch.all(num_decode_draft_tokens_cpu == self.num_spec))
+            and bool(torch.all(query_start_loc_cpu.diff() == window))
+            and (m.is_prefilling is None or not bool(torch.any(m.is_prefilling)))
+        ):
+            return self._build_uniform_spec_decode(m, num_accepted_tokens, mixed)
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None

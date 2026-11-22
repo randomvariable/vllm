@@ -591,3 +591,74 @@ def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
     # Row 1: state after 128 tokens of the first prefill. Row 3: after 192
     # tokens of the third prefill, whose states start at index 3.
     assert rows == [0, 1, 0, 5]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_uniform_spec_fastpath_parity_and_graph_buffers(monkeypatch, device):
+    flag = "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH"
+    monkeypatch.setenv(flag, "0")
+    generic = _create_gdn_builder(3, full_cuda_graph=True)
+    monkeypatch.setenv(flag, "1")
+    fast = GDNAttentionMetadataBuilder(
+        generic.kv_cache_spec, ["layer.0"], generic.vllm_config, torch.device(device)
+    )
+    monkeypatch.setenv(flag, "0")
+    generic = GDNAttentionMetadataBuilder(
+        fast.kv_cache_spec, ["layer.0"], fast.vllm_config, torch.device(device)
+    )
+    fast.vllm_config.cache_config.mamba_cache_mode = "align"
+    launch = fast._build_uniform_spec_decode
+    calls = 0
+
+    def record(*args):
+        nonlocal calls
+        calls += 1
+        return launch(*args)
+
+    monkeypatch.setattr(fast, "_build_uniform_spec_decode", record)
+    pointers = None
+    for step, (lengths, drafts, expected) in enumerate(
+        [
+            ([4, 4], [3, 3], 1),
+            ([4, 4], [3, 3], 2),
+            ([4, 0], [3, -1], 2),
+            ([4, 2], [3, 1], 2),
+        ]
+    ):
+        m = _common_attn_metadata(
+            fast, BatchSpec(seq_lens=[80, 96], query_lens=lengths)
+        )
+        m = m.replace(
+            query_start_loc=m.query_start_loc.to(device), uniform_decode_graph=True
+        )
+        aligned = (
+            torch.arange(8, dtype=torch.int32, device=device).view(2, 4) + 10 * step
+        )
+        generic.mamba_aligned_state_indices = fast.mamba_aligned_state_indices = aligned
+        args = (
+            0,
+            m,
+            torch.tensor([step % 4 + 1, 2], dtype=torch.int32, device=device),
+            torch.tensor(drafts),
+        )
+        ref = generic.build(*args)
+        result = fast.build(*args)
+        assert calls == expected
+        assert result.uniform_spec_sequence_length == ref.uniform_spec_sequence_length
+        assert result.num_spec_decode_tokens == ref.num_spec_decode_tokens
+        fields = (
+            "spec_query_start_loc",
+            "spec_state_indices_tensor",
+            "spec_sequence_masks",
+            "spec_token_indx",
+            "num_accepted_tokens",
+        )
+        current = []
+        for field in fields:
+            actual = getattr(result, field)
+            torch.testing.assert_close(actual, getattr(ref, field))
+            current.append(actual.data_ptr())
+        if pointers is None:
+            pointers = current
+        assert current == pointers

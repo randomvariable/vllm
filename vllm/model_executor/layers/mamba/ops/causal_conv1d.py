@@ -8,6 +8,7 @@
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -808,6 +809,8 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    HOIST_X: tl.constexpr,
+    SEQLEN_MAX: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -992,6 +995,67 @@ def _causal_conv1d_update_kernel(
     # STEP 5: compute each token
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
+
+    if HOIST_X and KERNEL_WIDTH == 4:
+        # Hoisted decode path: load every token row up front (one round trip
+        # instead of ``seqlen`` dependent ones), then run the unrolled token
+        # loop with exactly the generic loop's per-token arithmetic
+        # (bias -> col0*w0 -> col1*w1 -> col2*w2 -> x*w3 -> silu).
+        for t in tl.static_range(SEQLEN_MAX):
+            v = tl.load(
+                x_base_1d + t * stride_x_token,
+                mask=mask_x_1d & (t < seqlen),
+                other=0.0,
+            )
+            if t == 0:
+                xr0 = v
+            elif t == 1:
+                xr1 = v
+            elif t == 2:
+                xr2 = v
+            elif t == 3:
+                xr3 = v
+            elif t == 4:
+                xr4 = v
+            elif t == 5:
+                xr5 = v
+            elif t == 6:
+                xr6 = v
+            elif t == 7:
+                xr7 = v
+        for t in tl.static_range(SEQLEN_MAX):
+            if t == 0:
+                xr = xr0
+            elif t == 1:
+                xr = xr1
+            elif t == 2:
+                xr = xr2
+            elif t == 3:
+                xr = xr3
+            elif t == 4:
+                xr = xr4
+            elif t == 5:
+                xr = xr5
+            elif t == 6:
+                xr = xr6
+            else:
+                xr = xr7
+            if t < seqlen:
+                acc = acc_preload
+                acc += col0 * w_col0
+                acc += col1 * w_col1
+                acc += col2 * w_col2
+                acc += xr * w_col3
+                col0 = col1
+                col1 = col2
+                col2 = xr
+                if SILU_ACTIVATION:
+                    acc = acc / (1 + tl.exp(-acc))
+                o_ptrs = (
+                    o_ptr + o_offset + t * stride_o_token + (idx_feats * stride_o_dim)
+                )
+                tl.store(o_ptrs, acc, mask=mask_x_1d)
+        return
 
     for idx_token in tl.range(seqlen):
         acc = acc_preload
@@ -1248,6 +1312,7 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    hoist_x = envs.VLLM_CAUSAL_CONV1D_UPDATE_HOIST and width == 4 and 1 <= seqlen <= 8
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1287,8 +1352,10 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=64 if hoist_x else 256,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        HOIST_X=hoist_x,
+        SEQLEN_MAX=seqlen,
     )
     if unsqueeze:
         out = out.squeeze(-1)

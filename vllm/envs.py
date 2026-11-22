@@ -282,6 +282,8 @@ if TYPE_CHECKING:
         | None
     ) = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
+    VLLM_CAUSAL_CONV1D_UPDATE_HOIST: bool = False
+    VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = False
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
     VLLM_CONFIDENTIAL_COMPUTE: str | None = None
@@ -2139,6 +2141,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   consistent with SSM temporal state and LBHNC KV cache layout.
     "VLLM_SSM_CONV_STATE_LAYOUT": env_with_choices(
         "VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]
+    ),
+    # Opt-in decode fast paths for recurrent models.
+    "VLLM_CAUSAL_CONV1D_UPDATE_HOIST": lambda: (
+        os.getenv("VLLM_CAUSAL_CONV1D_UPDATE_HOIST", "0") == "1"
+    ),
+    "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: (
+        os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "0") == "1"
     ),
     # Enable checking whether the generated logits contain NaNs,
     # indicating corrupted output. Useful for debugging low level bugs

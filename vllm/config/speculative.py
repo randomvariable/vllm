@@ -588,7 +588,13 @@ class SpeculativeConfig:
     weight-only on the platform's W4A16 kernel. The target verifies with its
     own head, so only the acceptance length can change. When unset, MTP on
     DGX Spark (SM121) uses "nvfp4" for an unquantized BF16 head; "none"
-    keeps the drafter on the target head."""
+    keeps the drafter on the target head.
+
+    To migrate from VLLM_MTP_NVFP4_LM_HEAD=1, set
+    `--speculative-config '{"method":"mtp","num_speculative_tokens":3,
+    "draft_lm_head_quantization":"nvfp4"}'` (keep your existing draft
+    settings). SM120 does not use the SM121 auto-default.
+    """
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to

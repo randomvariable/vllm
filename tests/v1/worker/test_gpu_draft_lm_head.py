@@ -284,3 +284,48 @@ def test_default_draft_lm_head_quantization(
     assert (
         utils.default_draft_lm_head_quantization(vllm_config, drafter, head) == expected
     )
+
+
+@pytest.mark.parametrize("quantization", [None, "nvfp4"])
+def test_qwen_mtp_head_selection_on_sm120(monkeypatch, quantization):
+    from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils
+
+    target = torch.nn.Module()
+    target.model = torch.nn.Module()
+    target.lm_head = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+    draft = Qwen4ExpMTP.__new__(Qwen4ExpMTP)
+    torch.nn.Module.__init__(draft)
+    draft.model = torch.nn.Module()
+    draft.lm_head = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+    draft.logits_processor = lambda head, hidden: head(hidden)
+    config = SimpleNamespace(load_config=None)
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_config=SimpleNamespace(
+            dtype=torch.bfloat16, head_dtype=torch.bfloat16
+        ),
+        draft_lm_head_quantization=quantization,
+        apply_draft_overrides=lambda config: config,
+    )
+    monkeypatch.setattr(
+        utils.current_platform, "is_device_capability", lambda cap: cap == 120
+    )
+    monkeypatch.setattr(
+        utils, "get_draft_load_config", lambda config: config.load_config
+    )
+    monkeypatch.setattr(utils, "get_model", lambda **kwargs: draft)
+    monkeypatch.setattr(utils, "in_single_pp_stage", lambda: True)
+    packed = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+
+    def quantize(head, method):
+        assert head is target.lm_head
+        assert method == "nvfp4"
+        return packed
+
+    monkeypatch.setattr(utils, "quantized_lm_head_copy", quantize)
+    loaded = utils.load_eagle_model(target, config)
+    expected = packed if quantization else target.lm_head
+    assert loaded.lm_head is expected
+    hidden = torch.ones(1, 2, dtype=torch.bfloat16)
+    torch.testing.assert_close(loaded.compute_logits(hidden), expected(hidden))
