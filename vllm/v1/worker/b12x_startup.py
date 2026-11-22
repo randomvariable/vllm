@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
 
 _CONTROL_GROUPS: dict[tuple[int, int], StatelessProcessGroup] = {}
+# Preparation rounds per control group. StatelessProcessGroup is a slotted
+# dataclass, so the count cannot live on the group; control groups live for the
+# process (cached above or owned by the world group), so their ids are stable.
+_CONTROL_SEQUENCES: dict[int, int] = {}
 _TuningResult = tuple[
     str,
     tuple[int, ...],
@@ -99,8 +103,8 @@ class B12xPreparationCoordinator:
         self._control = None
         if not process_local_only and len(self.world_ranks) > 1:
             group = _get_control_group(world_group)
-            sequence = getattr(group, "_b12x_sequence", 0)
-            group._b12x_sequence = sequence + 1
+            sequence = _CONTROL_SEQUENCES.get(id(group), 0)
+            _CONTROL_SEQUENCES[id(group)] = sequence + 1
             import torch.distributed as dist
 
             self._control = dist.PrefixStore(f"stage-{sequence}", group.store)

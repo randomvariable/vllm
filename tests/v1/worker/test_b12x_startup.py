@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch.distributed as dist
 
+from vllm.distributed.utils import StatelessProcessGroup
 from vllm.v1.worker import b12x_startup
 
 
@@ -21,9 +22,9 @@ def make_coordinator(monkeypatch):
 
     def make(rank, ranks, session=None):
         # Each worker has its own stage counter but shares the underlying store.
-        monkeypatch.setattr(
-            b12x_startup, "_get_control_group", lambda _: SimpleNamespace(store=store)
-        )
+        # A real (slotted) control group: the coordinator cannot add attributes.
+        group = StatelessProcessGroup(rank=rank, world_size=len(ranks), store=store)
+        monkeypatch.setattr(b12x_startup, "_get_control_group", lambda _: group)
         return b12x_startup.B12xPreparationCoordinator(
             session,
             [] if session is None else [(("request",), True)],

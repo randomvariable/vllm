@@ -672,8 +672,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 "b12x MoE with compressed CSF scales does not support weight reloading"
             )
         self._source_parameters_released = False
-        self._refresh_quant_config(layer)
         if checkpoint_weights is None:
+            # Checkpoint-prepared experts carry their scales in the weights
+            # object; the layer registers no scale parameters to refresh from.
+            self._refresh_quant_config(layer)
             prepared = self._prepare_experts(
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
