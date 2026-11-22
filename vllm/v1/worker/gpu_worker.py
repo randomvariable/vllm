@@ -28,6 +28,7 @@ from vllm.config import (
 from vllm.config.compilation import CompilationMode
 from vllm.config.profiler import validate_profile_prefix
 from vllm.device_allocator import get_mem_allocator_instance
+from vllm.device_allocator.alloc_conf import expandable_segments_enabled
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -877,7 +878,14 @@ class Worker(WorkerBase):
             # counted as consumed and taken from the KV cache. Blocks above the
             # limit are never split, so they stay releasable. Exits before
             # memory_profiling measures, restoring the original limit.
-            self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB),
+            # Expandable segments release free pages on empty_cache(), so the
+            # limit is unnecessary there. It is also harmful: freed neighbours
+            # coalesce into blocks too large to serve the next oversize request,
+            # so every layer maps fresh pages (+10 GiB reserved for 1.2 GiB live
+            # on DeepSeek-V4.1 TP4), which on unified-memory GPUs is host RAM.
+            nullcontext()
+            if expandable_segments_enabled()
+            else self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB),
             set_current_vllm_config(self.vllm_config),
         ):
             try:
