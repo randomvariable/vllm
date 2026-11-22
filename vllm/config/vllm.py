@@ -3824,7 +3824,9 @@ class VllmConfig:
                 local_block_size,
             )
 
-    def validate_block_size(self) -> None:
+    def validate_block_size(
+        self, kv_cache_groups: Iterable[KVCacheGroup] | None = None
+    ) -> None:
         """Validate block_size against DCP and mamba constraints.
 
         Called after Platform.update_block_size_for_backend() has
@@ -3835,14 +3837,20 @@ class VllmConfig:
         # Runs after adjust_dcp_kv_cache_interleave_size, so an auto-resolved NIXL
         # interleave is already the local block size here.
         if self.parallel_config.decode_context_parallel_size > 1:
-            assert (
-                self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
-            ), (
-                f"Block_size({block_size}) should be greater "
-                "than or equal to and divisible by cp_kv_cache_interleave_size "
-                f"({self.parallel_config.cp_kv_cache_interleave_size})."
+            stripe = self.parallel_config.cp_kv_cache_interleave_size
+            block_sizes = (
+                {block_size}
+                if not kv_cache_groups
+                else {
+                    group.block_size for group in kv_cache_groups if group.dcp_sharded
+                }
             )
+            for size in sorted(block_sizes):
+                assert stripe <= size and size % stripe == 0, (
+                    f"Block_size({size}) should be greater "
+                    "than or equal to and divisible by cp_kv_cache_interleave_size "
+                    f"({stripe})."
+                )
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
             assert not self.scheduler_config.disable_chunked_mm_input, (

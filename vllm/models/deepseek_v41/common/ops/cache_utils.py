@@ -735,6 +735,10 @@ def compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_stripe: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local topk indices to global KV cache slots and count valid entries.
 
@@ -758,7 +762,12 @@ def compute_global_topk_indices_and_lens(
         block_table.stride(0),
         block_size,
         is_valid_token,
-        TRITON_BLOCK_SIZE=1024,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_STRIPE=dcp_stripe,
+        TRITON_BLOCK_SIZE=(
+            triton.next_power_of_2(topk_indices.shape[-1]) if dcp_size > 1 else 1024
+        ),
     )
     return global_topk_indices, topk_lens
 
@@ -776,6 +785,9 @@ def _compute_global_topk_indices_and_lens_kernel(
     block_table_stride: tl.constexpr,
     block_size: tl.constexpr,
     is_valid_token_ptr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_STRIPE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -793,6 +805,22 @@ def _compute_global_topk_indices_and_lens_kernel(
             other=-1,
         )
         is_valid = local_idx >= 0
+        if DCP_SIZE > 1:
+            is_valid &= is_valid_token & (
+                (local_idx // DCP_STRIPE) % DCP_SIZE == DCP_RANK
+            )
+            # Compact in selection order; the sparse kernel consumes a prefix.
+            order = tl.sort(tl.where(is_valid, offset, topk + offset), descending=False)
+            is_valid = order < topk
+            local_idx = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + order,
+                mask=is_valid,
+                other=0,
+            )
+            local_idx = (
+                local_idx // (DCP_SIZE * DCP_STRIPE) * DCP_STRIPE
+                + local_idx % DCP_STRIPE
+            )
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(

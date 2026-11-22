@@ -265,6 +265,37 @@ def _merge_local_topks_global_with_fake_dcp(
         sparse_indexer.get_dcp_group = original_get_dcp_group
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_dsv41_coarse_selection_pins_only_global_newest(monkeypatch):
+    """A larger local score survives when a peer owns the newest block."""
+    import vllm.distributed as distributed
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        dcp_candidate_blocks,
+    )
+
+    class Group:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_gather(self, value, dim):
+            if dim == 0:
+                peer = value.new_tensor([3])
+            elif value.is_floating_point():
+                peer = value.new_tensor([[float("inf"), 7.0]])
+            else:
+                peer = value.new_tensor([[3, 2]])
+            return torch.cat((value, peer), dim=dim)
+
+    monkeypatch.setattr(distributed, "get_dcp_group", Group)
+    logits = torch.tensor([[9.0, 1.0]], device="cuda")
+    ends = torch.tensor([2], device="cuda", dtype=torch.int32)
+    selected = torch.empty((1, 2), device="cuda", dtype=torch.int32)
+    dcp_candidate_blocks(logits, None, ends, selected, 1, 2, write=True)
+    assert selected.tolist() == [[3, 0]]
+    dcp_candidate_blocks(logits, None, ends, selected, 1, 2, write=False)
+    assert logits.tolist() == [[9.0, -float("inf")]]
+
+
 @pytest.mark.parametrize("world", [1, 2, 4])
 @pytest.mark.parametrize("interleave", [1, 2, 4])
 def test_get_dcp_local_seq_lens_matches_naive(world: int, interleave: int):

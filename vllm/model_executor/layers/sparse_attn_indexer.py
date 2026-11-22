@@ -31,6 +31,9 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    dcp_candidate_blocks,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
 from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
@@ -618,13 +621,11 @@ def sparse_attn_indexer(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    sharded_candidates = candidate_blocks is not None and dcp_world_size > 1
     if candidate_blocks is not None:
-        # Candidate blocks are request-local; the DCP-sharded logits layout
-        # would need per-rank translation that is not implemented.
-        assert dcp_world_size == 1, (
-            "v4.1 two-level candidate filtering is not supported with DCP."
-        )
         assert candidate_block_size > 0
+        if sharded_candidates and (use_pcp or use_fp4_cache):
+            raise ValueError("Sharded V4.1 candidates require FP8 without PCP")
 
     fused_mqa_topk = use_fused_mqa_topk(
         query_shape=q_quant.shape[1:],
@@ -637,6 +638,12 @@ def sparse_attn_indexer(
     # DeepSelect ranks BF16 decode logits directly; other top-k backends and
     # the DCP merge read an FP32 copy.
     fp32_decode_logits = topk_backend != "deep_select" or dcp_world_size != 1
+
+    decode_max_len = max_model_len
+    if dcp_world_size > 1 and not use_pcp:
+        stripe = cp_kv_cache_interleave_size
+        cycles, tail = divmod(max_model_len, stripe * dcp_world_size)
+        decode_max_len = cycles * stripe + min(stripe, tail)
 
     decode_budget = envs.VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB * 1024 * 1024
     chunk_decode = (
@@ -712,7 +719,7 @@ def sparse_attn_indexer(
             // torch.float32.itemsize
             * (logits_dtype.itemsize + copy_bytes),
             max_decode_tokens
-            * round_up(max_model_len, row_align)
+            * round_up(decode_max_len, row_align)
             * (logits_dtype.itemsize + decode_copy_bytes),
         )
         _ = torch.empty(
@@ -906,6 +913,33 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+                if dcp_world_size > 1 and deinterleave_idx is None:
+                    for sub in range(0, q_slice.shape[0], dense_rows):
+                        rows = slice(sub, min(sub + dense_rows, q_slice.shape[0]))
+                        end = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
+                        if sharded_candidates:
+                            assert candidate_blocks is not None
+                            dcp_candidate_blocks(
+                                logits[rows],
+                                None,
+                                end,
+                                candidate_blocks[
+                                    row_start + rows.start : row_start + rows.stop
+                                ],
+                                candidate_block_size,
+                                cp_kv_cache_interleave_size,
+                                write=candidate_write,
+                            )
+                        _merge_dcp_topk_global(
+                            logits[rows],
+                            topk_indices[rows],
+                            topk_tokens,
+                            dcp_rank,
+                            dcp_world_size,
+                            cp_kv_cache_interleave_size,
+                            logits_dtype=logits_dtype,
+                            num_positions=max_model_len,
+                        )
             elif fused_mqa_topk and fused_mqa_topk_chunk(
                 chunk.max_seqlen_k,
                 k_quant.shape[0],
@@ -986,7 +1020,18 @@ def sparse_attn_indexer(
                         if not use_deep_select:
                             logits = as_fp32_logits(logits, row_ends)
                     num_rows = logits.shape[0]
-                    if candidate_blocks is not None:
+                    if sharded_candidates:
+                        assert candidate_blocks is not None
+                        dcp_candidate_blocks(
+                            logits,
+                            row_starts,
+                            row_ends,
+                            candidate_blocks[tokens],
+                            candidate_block_size,
+                            cp_kv_cache_interleave_size,
+                            write=candidate_write,
+                        )
+                    elif candidate_blocks is not None:
                         # Two-level selection (v4.1): the candidate source
                         # publishes its top blocks; later indexers mask their
                         # scores to them. Both before the row top-k.
@@ -1023,22 +1068,18 @@ def sparse_attn_indexer(
                             topk_indices[rows],
                             topk_tokens,
                         )
-
-            if deinterleave_idx is None:
-                # Under the PCP path the top-k already ran over the whole
-                # context.
-                _merge_dcp_topk_global(
-                    logits,
-                    topk_indices,
-                    topk_tokens,
-                    dcp_rank,
-                    dcp_world_size,
-                    cp_kv_cache_interleave_size,
-                    row_starts=row_starts,
-                    logits_dtype=logits_dtype,
-                    num_positions=max_model_len,
-                    direct_max_rows=dcp_direct_topk_max_rows,
-                )
+                    if deinterleave_idx is None:
+                        _merge_dcp_topk_global(
+                            logits,
+                            topk_indices[rows],
+                            topk_tokens,
+                            dcp_rank,
+                            dcp_world_size,
+                            cp_kv_cache_interleave_size,
+                            row_starts=row_starts,
+                            logits_dtype=logits_dtype,
+                            num_positions=max_model_len,
+                        )
             # Free this chunk's logits before the next chunk allocates its own.
             del logits
 
@@ -1178,7 +1219,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=decode_max_len,
                 logits_dtype=logits_dtype,
                 indices=decode_metadata.indices,
             )
@@ -1189,7 +1230,18 @@ def sparse_attn_indexer(
             ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
         num_rows = logits.shape[0]
-        if candidate_blocks is not None:
+        if sharded_candidates:
+            assert candidate_blocks is not None
+            dcp_candidate_blocks(
+                logits,
+                None,
+                seq_lens.reshape(-1)[:num_rows],
+                candidate_blocks[:num_rows],
+                candidate_block_size,
+                cp_kv_cache_interleave_size,
+                write=candidate_write,
+            )
+        elif candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
             # for native spec decode (per-row effective lens) and (B, 1)
@@ -1374,7 +1426,11 @@ class SparseAttnIndexer(CustomOp):
             vllm_config.attention_config.resolve_indexer_logits_dtype("float32")
         ]
         self._parallel_config = parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_world_size = (
+            parallel_config.decode_context_parallel_size
+            if getattr(k_cache, "dcp_sharded", True)
+            else 1
+        )
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
@@ -1482,7 +1538,11 @@ class SparseAttnIndexer(CustomOp):
             self.use_fp4_cache,
             self.dcp_rank,
             self.dcp_world_size,
-            self._parallel_config.cp_kv_cache_interleave_size,
+            max(
+                1,
+                self._parallel_config.cp_kv_cache_interleave_size
+                // self.compress_ratio,
+            ),
             self.skip_topk_buffer_clear,
             candidate_blocks=self.candidate_blocks,
             candidate_block_size=self.candidate_block_size,

@@ -11,6 +11,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.cache import DSV41_INLINE_FP4_KV_CACHE_DTYPE
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_pcp_group,
@@ -231,6 +232,21 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     path.
     """
     backend = vllm_config.attention_config.backend
+    parallel = vllm_config.parallel_config
+    if parallel.decode_context_parallel_size > 1 and (
+        parallel.decode_context_parallel_size != 4
+        or parallel.tensor_parallel_size != 4
+        or parallel.prefill_context_parallel_size != 1
+        or not current_platform.is_device_capability_family(120)
+        or backend not in (None, AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41)
+        or vllm_config.attention_config.indexer_sparse_logits
+        or vllm_config.cache_config.cache_dtype
+        not in ("fp8_dsv41_inline", DSV41_INLINE_FP4_KV_CACHE_DTYPE)
+    ):
+        raise ValueError(
+            "DeepSeek V4.1 DCP requires TP4/DCP4, PCP1, SM12x FlashInfer "
+            "sparse attention, inline FP8/FP4 KV, and dense FP8 index scoring."
+        )
     if is_ampere():
         # No FlashMLA or DeepGEMM build runs on SM80; its own kernels do.
         if backend is not None or (

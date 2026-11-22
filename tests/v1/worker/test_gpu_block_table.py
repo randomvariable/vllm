@@ -369,6 +369,39 @@ def test_dummy_request_slot_mapping_is_pad():
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_dsv41_dcp4_slot_mapping(rank):
+    """Each full-cache stripe has one owner; SWA is replicated."""
+    device = torch.device("cuda")
+    tables = BlockTables(
+        block_sizes=[64, 32],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[2, 9],
+        device=device,
+        dcp_sharded=[True, False],
+        cp_size=4,
+        cp_rank=rank,
+        cp_interleave=64,
+    )
+    tables.append_block_ids(0, ([7, 4], list(range(1, 10))), overwrite=True)
+    tables.apply_staged_writes()
+    positions = [0, 63, 64, 127, 128, 191, 192, 255, 256, 264]
+    slots = tables.compute_slot_mappings(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0, len(positions)], dtype=torch.int32, device=device),
+        torch.tensor(positions, dtype=torch.int64, device=device),
+        num_tokens_padded=12,
+    )
+    expected = [[448, 511], [448, 511], [448, 511], [448, 511]]
+    owned = [PAD_SLOT_ID] * 12
+    owned[rank * 2 : rank * 2 + 2] = expected[rank]
+    if rank == 0:
+        owned[8:10] = [256, 264]
+    assert slots[0].tolist() == owned
+    assert slots[1].tolist() == [p + 32 for p in positions] + [PAD_SLOT_ID] * 2
+
+
 def test_gather_block_tables_nulls_blocks_below_sliding_window():
     """Entries wholly below the window of a request's first scheduled token
     may point at blocks the sliding-window manager already freed and reused;

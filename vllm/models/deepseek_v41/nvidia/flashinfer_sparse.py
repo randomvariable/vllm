@@ -8,6 +8,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import DSV41_INLINE_FP4_KV_CACHE_DTYPE, CacheDType
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     get_flashinfer_dsv4_workspace,
@@ -41,6 +42,7 @@ from vllm.v1.attention.backend import (
     max_decode_query_len,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+from vllm.v1.attention.ops.dcp import CPTritonContext, cp_lse_ag_out_rs
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
@@ -75,6 +77,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_DSV41"
+
+    @classmethod
+    def supports_dcp(cls) -> bool:
+        return current_platform.is_device_capability_family(120)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -717,15 +723,26 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
+        parallel = vllm_config.parallel_config
+        self._dcp_size = parallel.decode_context_parallel_size
+        self._dcp_group = get_dcp_group() if self._dcp_size > 1 else None
+        self._dcp_rank = self._dcp_group.rank_in_group if self._dcp_group else 0
+        self._dcp_stripe = parallel.cp_kv_cache_interleave_size
+        self._dcp_reduce_ctx = CPTritonContext() if self._dcp_group else None
         self._setup_b12x_wo(vllm_config)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
         required_topk = required_sm120_sparse_topk(vllm_config, self.window_size)
-        if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
+        kernel_heads = (
+            self.n_local_heads * self._dcp_size
+            if self.compress_ratio and self._dcp_size > 1
+            else self.padded_heads
+        )
+        if not has_flashinfer_sparse_mla_sm120_config(kernel_heads, required_topk):
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
                 "DSV4 sparse MLA decode specialization for "
-                f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
+                f"(num_q_heads={kernel_heads}, top_k={required_topk}). "
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
@@ -852,6 +869,42 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_only=swa_only,
         )
 
+    def _run_sparse_attention(
+        self, *, query: torch.Tensor, out: torch.Tensor, **kwargs
+    ) -> None:
+        if self._dcp_group is None or kwargs["compressed_kv_cache"] is None:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=query, out=out, **kwargs
+            )
+            return
+        group = self._dcp_group
+        heads = self.n_local_heads
+        sink = group.all_gather(self.attn_sink[:heads].contiguous(), dim=0)
+        if self._dcp_rank != 0:
+            kwargs["swa_topk_lens"] = torch.zeros_like(kwargs["swa_topk_lens"])
+            sink = None
+        kwargs["sinks"] = sink
+        for start in range(0, query.shape[0], 256):
+            rows = slice(start, start + 256)
+            full_q = group.all_gather(query[rows, :heads].contiguous(), dim=1)
+            chunk = dict(kwargs)
+            for key in (
+                "sparse_indices",
+                "swa_topk_lens",
+                "extra_sparse_indices",
+                "extra_sparse_topk_lens",
+            ):
+                chunk[key] = kwargs[key][rows]
+            partial, lse = flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=full_q,
+                return_lse=True,
+                **chunk,
+            )
+            out[rows, :heads].copy_(
+                cp_lse_ag_out_rs(partial, lse, group, ctx=self._dcp_reduce_ctx)
+            )
+            out[rows, heads:].zero_()
+
     def _prepare_query(self, q: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         if self.kv_cache_torch_dtype == torch.float8_e4m3fn:
             assert q.dtype == torch.float8_e4m3fn
@@ -901,6 +954,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 attn_metadata.block_table[:num_decodes],
                 block_size,
                 is_valid,
+                dcp_size=self._dcp_size,
+                dcp_rank=self._dcp_rank,
+                dcp_stripe=max(1, self._dcp_stripe // self.compress_ratio),
             )
             extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
 
@@ -919,7 +975,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+        self._run_sparse_attention(
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
@@ -987,6 +1043,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     attn_metadata.block_table,
                     block_size,
                     swa_metadata.is_valid_token[prefill_token_slice],
+                    dcp_size=self._dcp_size,
+                    dcp_rank=self._dcp_rank,
+                    dcp_stripe=max(1, self._dcp_stripe // self.compress_ratio),
                 )
             )
 
@@ -1042,7 +1101,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            self._run_sparse_attention(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),

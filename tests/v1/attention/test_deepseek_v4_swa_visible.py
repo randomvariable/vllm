@@ -790,6 +790,33 @@ def test_builder_replaying_group_builds_without_replay_start():
 
 
 @requires_accelerator
+def test_v41_sparse_slots_compact_owned_indices():
+    """Non-owned indices do not consume the selected prefix on a rank."""
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        compute_global_topk_indices_and_lens,
+    )
+
+    device = torch.device(DEVICE_TYPE)
+    selected = torch.tensor(
+        [[64, 160, 0, 128, 191, -1], [0, 1, 2, 3, 4, 5]],
+        dtype=torch.int32,
+        device=device,
+    )
+    slots, lengths = compute_global_topk_indices_and_lens(
+        selected,
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.tensor([[7, 4]], dtype=torch.int32, device=device),
+        32,
+        torch.tensor([True, False], device=device),
+        dcp_size=4,
+        dcp_rank=1,
+        dcp_stripe=32,
+    )
+    assert slots.tolist() == [[128, 159, -1, -1, -1, -1], [-1] * 6]
+    assert lengths.tolist() == [2, 0]
+
+
+@requires_accelerator
 def test_v41_flashinfer_mixed_sparse_indices_respect_replay_start():
     from vllm.models.deepseek_v41.common.ops.cache_utils import (
         build_flashinfer_mixed_sparse_indices as build_v41,

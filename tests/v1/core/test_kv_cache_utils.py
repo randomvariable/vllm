@@ -1712,6 +1712,36 @@ def test_group_block_table_width_matches_layer(layer_type, dcp_size, expected_wi
     assert multi.max_num_blocks_per_req(vllm_config, 1024) == expected_width
 
 
+def test_dcp_capacity_counts_sharded_and_replicated_pages():
+    config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
+    config.parallel_config.decode_context_parallel_size = 4
+    config.parallel_config.cp_kv_cache_interleave_size = 64
+    config.cache_config.block_size = 32
+    main = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+    )
+    replica = replace(main, block_size=32, dcp_sharded=False)
+    groups = [
+        new_kv_cache_group(["main"], main),
+        new_kv_cache_group(["replica"], replica),
+    ]
+    config.validate_block_size(groups)
+    assert [g.max_allocated_blocks_per_request(config) for g in groups] == [4, 32]
+    with pytest.raises(AssertionError, match=r"Block_size\(32\)"):
+        config.validate_block_size(
+            [
+                new_kv_cache_group(
+                    ["bad"],
+                    replace(replica, dcp_sharded=True),
+                )
+            ]
+        )
+
+
 def test_get_max_concurrency_for_kv_cache_config():
     # Create a VllmConfig
     model_id = "Qwen/Qwen1.5-7B"

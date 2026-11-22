@@ -197,7 +197,7 @@ class PackDCPTopkCandidatesKernel(
             + DCP_RANK * CP_INTERLEAVE
             + safe_local_idx % CP_INTERLEAVE
         )
-        global_id = tl.where(valid, global_id, -1)
+        global_id = tl.where(valid & (score != -float("inf")), global_id, -1)
 
         packed_base = packed + row * packed_stride0 + cols * packed_stride1
         tl.store(packed_base, score, mask=mask)

@@ -37,6 +37,7 @@ def _block_scores_kernel(
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
     FULL_WIDTH: tl.constexpr,
+    PIN_NEWEST: tl.constexpr = True,
 ):
     # Writes each row's valid block count; FULL_WIDTH also scores the -inf tail.
     row = tl.program_id(0).to(tl.int64)
@@ -60,7 +61,9 @@ def _block_scores_kernel(
         reduced = tl.reduce(values, 1, _max_with_nan)
         # Pin the newest block. DeepSelect leaves NaN rows partially written,
         # so also pin NaN blocks (torch.topk ranks NaN first too).
-        pinned = (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE)
+        pinned = (
+            PIN_NEWEST & (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE)
+        )
         if not FULL_WIDTH:
             pinned |= reduced != reduced
         reduced = tl.where(pinned, float("inf"), reduced)
@@ -224,6 +227,93 @@ def select_candidate_blocks(
         top.values.shape[1],
         topk_blocks,
         256,
+    )
+
+
+def dcp_candidate_blocks(
+    logits: torch.Tensor,
+    starts: torch.Tensor | None,
+    ends: torch.Tensor,
+    candidates: torch.Tensor,
+    block_size: int,
+    stripe: int,
+    *,
+    write: bool,
+) -> None:
+    """Select global coarse blocks or mask local FP8 scores to that selection."""
+    from vllm.distributed import get_dcp_group
+
+    group = get_dcp_group()
+    rank, size = group.rank_in_group, group.world_size
+    if stripe < block_size or stripe % block_size:
+        raise ValueError("DCP index stripes must contain whole candidate blocks")
+    stripe_blocks = stripe // block_size
+    if not write:
+        owner = candidates.div(stripe_blocks, rounding_mode="floor") % size
+        local = candidates.div(stripe_blocks * size, rounding_mode="floor")
+        local = local * stripe_blocks + candidates % stripe_blocks
+        local = torch.where((candidates >= 0) & (owner == rank), local, -1)
+        apply_candidate_mask(logits, starts, ends, local, block_size)
+        return
+
+    rows, width = logits.shape
+    k = candidates.shape[1]
+    nblocks = triton.cdiv(width, block_size)
+    local_last = (ends.clamp(max=width) - (0 if starts is None else starts) - 1).div(
+        block_size, rounding_mode="floor"
+    )
+
+    def to_global(ids):
+        return (
+            ids.div(stripe_blocks, rounding_mode="floor") * size + rank
+        ) * stripe_blocks + ids % stripe_blocks
+
+    last = torch.where(local_last >= 0, to_global(local_last), -1)
+    newest = group.all_gather(last.contiguous(), dim=0).view(size, rows).amax(0)
+    scores = logits.new_full((rows, k), -float("inf"), dtype=torch.float32)
+    ids = torch.full_like(candidates, -1)
+    if nblocks:
+        block_scores = logits.new_empty((rows, nblocks), dtype=torch.float32)
+        counts = torch.empty(rows, device=logits.device, dtype=torch.int32)
+        _block_scores_kernel[(rows, 32)](
+            logits,
+            starts,
+            ends,
+            block_scores,
+            counts,
+            *logits.stride(),
+            starts.stride(0) if starts is not None else 0,
+            ends.stride(0),
+            block_scores.stride(0),
+            width,
+            nblocks,
+            block_size,
+            starts is not None,
+            1,
+            TILE=128,
+            FULL_WIDTH=True,
+            PIN_NEWEST=False,
+        )
+        pin = (last >= 0) & (last == newest) & (local_last < nblocks)
+        block_scores.scatter_(
+            1,
+            local_last.clamp(0, nblocks - 1).long()[:, None],
+            torch.where(
+                pin[:, None],
+                float("inf"),
+                block_scores.gather(
+                    1, local_last.clamp(0, nblocks - 1).long()[:, None]
+                ),
+            ),
+        )
+        top = block_scores.topk(min(k, nblocks), dim=1)
+        scores[:, : top.values.shape[1]].copy_(top.values)
+        ids[:, : top.indices.shape[1]].copy_(to_global(top.indices).to(ids.dtype))
+    merged_scores = group.all_gather(scores, dim=1)
+    merged_ids = group.all_gather(ids.contiguous(), dim=1)
+    top = merged_scores.topk(k, dim=1)
+    candidates.copy_(
+        torch.where(top.values != -float("inf"), merged_ids.gather(1, top.indices), -1)
     )
 
 

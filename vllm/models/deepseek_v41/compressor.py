@@ -258,9 +258,9 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         self.kv_cache = kv_cache.squeeze(1)
 
     def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
-        del vllm_config
         spec = AttentionSpec(
             block_size=self.block_size,
+            dcp_sharded=vllm_config.parallel_config.decode_context_parallel_size == 1,
             num_kv_heads=1,
             max_tp_shards=1,
             head_size=self.state_dim,

@@ -685,6 +685,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 else None
             ),
             bounded_replay=swa_bounded_replay,
+            dcp_sharded=vllm_config.parallel_config.decode_context_parallel_size == 1,
         )
 
         # The attention layer itself was already registered with the
@@ -1375,6 +1376,10 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.sparse_logits = vllm_config.attention_config.indexer_sparse_logits
         self.candidate_indexer = False
+        self.dcp_sharded = (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+            or envs.VLLM_DS41_DCP_SHARD_INDEX
+        )
         # aiter's paged MXFP4 kernels write this cache and read it in place.
         self.rocm_mxfp4 = current_platform.is_rocm() and dsa_indexer_uses_fp4(
             vllm_config
@@ -1403,6 +1408,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         )
         spec = MLAAttentionSpec(
             block_size=self.cache_config.block_size,
+            dcp_sharded=self.dcp_sharded,
             num_kv_heads=1,
             max_tp_shards=1,
             head_size=self.head_dim,

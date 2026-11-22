@@ -182,11 +182,22 @@ class DeepseekV4SparseMLAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
-        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        parallel_config = vllm_config.parallel_config
+        self.dcp_size = (
+            parallel_config.decode_context_parallel_size
+            if kv_cache_spec.dcp_sharded
+            else 1
+        )
+        self.cp_interleave = parallel_config.cp_kv_cache_interleave_size
+        self.pcp_size = parallel_config.prefill_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=True,
+            supports_dcp_with_varlen=current_platform.is_device_capability_family(120),
+        )
         self.topk_tokens = self.model_config.hf_config.index_topk
 
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -234,6 +245,8 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_size,
+                cp_interleave=self.cp_interleave,
             )
             if self.pcp_size > 1:
                 slot_mapping = get_pcp_group().all_gather(

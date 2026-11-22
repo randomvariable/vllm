@@ -87,8 +87,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         packed_page_alignment: int = 576,
         packed_block_stride_alignment: int | None = None,
         bounded_replay: bool = False,
+        dcp_sharded: bool = True,
     ):
         super().__init__()
+        self.dcp_sharded = dcp_sharded
         self.backend_cls = backend_cls or DeepseekSparseSWABackend
         # DeepseekV4.1 SWA bounded replay.
         self.bounded_replay = bounded_replay
@@ -129,6 +131,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         )
         spec = MLAAttentionSpec(
             block_size=self.block_size,
+            dcp_sharded=self.dcp_sharded,
             num_kv_heads=1,
             max_tp_shards=1,
             head_size=self.head_dim,

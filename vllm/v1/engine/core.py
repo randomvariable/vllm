@@ -309,6 +309,7 @@ class EngineCore:
 
         global_kv_cache_groups = get_global_kv_cache_groups(vllm_config, layer_configs)
         vllm_config.adjust_dcp_kv_cache_interleave_size(global_kv_cache_groups)
+        vllm_config.validate_block_size(global_kv_cache_groups)
         self.model_executor.set_kv_cache_layout(
             layout.name, vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
@@ -370,8 +371,6 @@ class EngineCore:
         extensible = vllm_config.cache_config.enable_extensible_kv_cache
         if kv_cache_groups and not extensible:
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
-
-        vllm_config.validate_block_size()
 
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             scheduler_kv_cache_config, vllm_config

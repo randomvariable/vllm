@@ -953,8 +953,10 @@ def _uses_v41_device_decode_rows(vllm_config: VllmConfig) -> bool:
     spec = vllm_config.speculative_config
     model = vllm_config.model_config
     return (
-        spec is not None
-        and spec.enable_adaptive_verification
+        (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            or (spec is not None and spec.enable_adaptive_verification)
+        )
         and model is not None
         and "DeepseekV41ForCausalLM" in model.architectures
         and _supports_sm12x_device_query_lens()
@@ -1024,7 +1026,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_world_size = (
+            parallel_config.decode_context_parallel_size
+            if self.kv_cache_spec.dcp_sharded
+            else 1
+        )
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
@@ -1173,6 +1179,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 (
                     isinstance(self.kv_cache_spec, MLAAttentionSpec)
                     and self.kv_cache_spec.model_version == "deepseek_v4"
+                    and getattr(cfg, "model_type", None) != "deepseek_v41"
                 )
                 or self.cp_kv_cache_interleave_size % self.compress_ratio != 0
             )
@@ -1533,7 +1540,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
-        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        dcp_local_seq_lens = (
+            common_attn_metadata.dcp_local_seq_lens if self.dcp_world_size > 1 else None
+        )
 
         compressed_slot_mapping = slot_mapping
         if self.compress_ratio > 1:
