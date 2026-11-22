@@ -262,7 +262,8 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
     assert synchronized == [True]
 
 
-def test_b12x_warmup_covers_draft_head_capture_rows(monkeypatch) -> None:
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_b12x_warmup_covers_draft_head_capture_rows(monkeypatch, adaptive) -> None:
     """The drafter's own sampling head (e.g. the NVFP4 MTP lm_head) is outside
     the target's module tree; draft CUDA-graph capture runs it on one row per
     request, so it must be warmed for every request count before capture."""
@@ -293,8 +294,12 @@ def test_b12x_warmup_covers_draft_head_capture_rows(monkeypatch) -> None:
             max_num_seqs=6,
         ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
+        model_runner=SimpleNamespace(
+            cudagraph_manager=SimpleNamespace(planned_token_counts=lambda: (1, 20))
+        ),
         vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(compile_sizes=[])
+            compilation_config=SimpleNamespace(compile_sizes=[]),
+            speculative_config=SimpleNamespace(enable_adaptive_verification=adaptive),
         ),
     )
     platform = SimpleNamespace(
@@ -306,5 +311,6 @@ def test_b12x_warmup_covers_draft_head_capture_rows(monkeypatch) -> None:
 
     b12x_warmup(worker, [1, 2, 4, 8, 16])
 
-    assert calls["draft_lm_head"] == (1, 2, 3, 4, 5, 6, 8, 16, 64)
-    assert calls["target_linear"] == (1, 2, 4, 8, 16, 64)
+    tail = (20, 30, 40) if adaptive else ()
+    assert calls["draft_lm_head"] == (1, 2, 3, 4, 5, 6, 8, 16, *tail, 64)
+    assert calls["target_linear"] == (1, 2, 4, 8, 16, *tail, 64)

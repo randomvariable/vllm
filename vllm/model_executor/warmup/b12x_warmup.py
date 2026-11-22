@@ -70,6 +70,19 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         *cudagraph_capture_sizes,
         *(size for size in compile_sizes if isinstance(size, int)),
     ]
+    spec = getattr(worker.vllm_config, "speculative_config", None)
+    if spec is not None and spec.enable_adaptive_verification:
+        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+            preparation_tail_sizes,
+        )
+
+        manager = getattr(worker.model_runner, "cudagraph_manager", None)
+        planned = manager.planned_token_counts() if manager is not None else ()
+        capture_sizes = sorted(set(cudagraph_capture_sizes).union(planned))
+        serving_sizes.extend(planned)
+        serving_sizes.extend(
+            preparation_tail_sizes(capture_sizes, max_num_batched_tokens)
+        )
     max_tokens = max_num_batched_tokens
     max_num_scheduled_tokens = worker.scheduler_config.max_num_scheduled_tokens
     if max_num_scheduled_tokens is not None:
