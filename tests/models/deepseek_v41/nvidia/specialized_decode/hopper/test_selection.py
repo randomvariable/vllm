@@ -21,8 +21,13 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 def _config(backend=None, pcp=1):
     return SimpleNamespace(
-        attention_config=SimpleNamespace(backend=backend),
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        attention_config=SimpleNamespace(backend=backend, indexer_sparse_logits=False),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=4,
+        ),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
     )
 
 
@@ -30,6 +35,24 @@ def _config(backend=None, pcp=1):
 def sm90(monkeypatch):
     monkeypatch.setattr(model, "is_ampere", lambda: False)
     monkeypatch.setattr(model, "is_hopper", lambda: True)
+
+
+def test_sm12x_dcp_selects_flashinfer_with_auto_cache(monkeypatch):
+    """Backend selection precedes resolution of the packed cache format."""
+    monkeypatch.setattr(model, "is_ampere", lambda: False)
+    monkeypatch.setattr(model, "is_hopper", lambda: False)
+    monkeypatch.setattr(
+        model.current_platform, "is_device_capability_family", lambda n: n == 120
+    )
+    monkeypatch.setattr(
+        model.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=12),
+    )
+    config = _config()
+    config.parallel_config.decode_context_parallel_size = 4
+    selected = model._select_dsv4_attn_cls(config)
+    assert selected is model.DeepseekV4FlashInferSM120Attention
 
 
 def test_sm90_takes_the_hopper_layer(sm90):

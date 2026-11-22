@@ -725,6 +725,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         super().__init__(vllm_config, *args, **kwargs)
         parallel = vllm_config.parallel_config
         self._dcp_size = parallel.decode_context_parallel_size
+        if self._dcp_size > 1 and self.kv_cache_dtype not in (
+            "fp8_dsv41_inline",
+            DSV41_INLINE_FP4_KV_CACHE_DTYPE,
+        ):
+            raise ValueError(
+                "DeepSeek V4.1 DCP requires inline FP8/FP4 KV, "
+                f"got {self.kv_cache_dtype!r}."
+            )
         self._dcp_group = get_dcp_group() if self._dcp_size > 1 else None
         self._dcp_rank = self._dcp_group.rank_in_group if self._dcp_group else 0
         self._dcp_stripe = parallel.cp_kv_cache_interleave_size
