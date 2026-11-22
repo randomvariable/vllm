@@ -115,6 +115,38 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats.iteration_records == [iteration_details]
 
 
+def test_prefill_compute_metrics_round_trip():
+    from prometheus_client import REGISTRY
+
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+    from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+
+    stats = SchedulerStats(prefill_compute_seconds=0.25, prefill_compute_share=0.4)
+    encoded = MsgpackEncoder().encode(EngineCoreOutputs(scheduler_stats=stats))
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(encoded)
+    assert decoded.scheduler_stats == stats
+
+    config = VllmConfig(model_config=ModelConfig(model="facebook/opt-125m"))
+    try:
+        logger = PrometheusStatLogger(config)
+        logger.record(decoded.scheduler_stats, None)
+        logger.record(SchedulerStats(prefill_compute_share=0.4), None)
+        labels = {"model_name": "facebook/opt-125m", "engine": "0"}
+        assert (
+            REGISTRY.get_sample_value(
+                "vllm:scheduler_compute_seconds_total", {**labels, "class": "prefill"}
+            )
+            == 0.25
+        )
+        assert (
+            REGISTRY.get_sample_value("vllm:scheduler_prefill_compute_share", labels)
+            == 0.4
+        )
+    finally:
+        unregister_vllm_metrics()
+
+
 def test_prefix_cache_stats_hits_by_source_accumulate():
     stats = PrefixCacheStats()
     stats.record(

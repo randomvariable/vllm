@@ -263,6 +263,12 @@ class SchedulerStats:
     # B12X disk row-cache and advisory prefetch counters, relayed from the
     # worker that ran the step; None when no model state holds disk tables.
     b12x_row_cache_stats: B12xRowCacheStats | None = None
+    decode_compute_seconds: float = 0.0
+    prefill_compute_seconds: float = 0.0
+    prefill_compute_share: float = 0.0
+    decode_compute_pressure: float = 1.0
+    prefill_compute_pressure: float = 1.0
+    local_prefill_backlog_tokens: int = 0
 
 
 @dataclass(slots=True)

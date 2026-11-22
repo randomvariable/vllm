@@ -719,12 +719,24 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         if scheduler_output.total_num_scheduled_tokens > 0:
             self.num_executed_steps += 1
+        compute_started = (
+            time.monotonic() if scheduler_output.compute_timing_enabled else None
+        )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
             model_output = self._wait_for_output(future)
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        if compute_started is not None:
+            service_class = scheduler_output.compute_service_class
+            assert service_class is not None
+            self.scheduler.record_compute_time(
+                service_class,
+                time.monotonic() - compute_started,
+                contended=scheduler_output.compute_contention,
+                scheduled_tokens=scheduler_output.compute_service_tokens,
+            )
         iteration_details = self._untimed_iteration_details(scheduler_output)
 
         # Before processing the model output, process any aborts that happened
@@ -790,6 +802,8 @@ class EngineCore:
         # Workers need a deferred step's sample_tokens() before the next step.
         if self.deferred_step is None and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if scheduler_output.compute_timing_enabled:
+                scheduler_output.compute_dispatch_time = time.monotonic()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -848,6 +862,15 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        if scheduler_output.compute_dispatch_time is not None:
+            service_class = scheduler_output.compute_service_class
+            assert service_class is not None
+            self.scheduler.record_compute_time(
+                service_class,
+                time.monotonic() - scheduler_output.compute_dispatch_time,
+                contended=scheduler_output.compute_contention,
+                scheduled_tokens=scheduler_output.compute_service_tokens,
+            )
         iteration_details = self._untimed_iteration_details(scheduler_output)
 
         # Before processing the model output, process any aborts that happened

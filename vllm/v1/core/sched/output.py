@@ -4,7 +4,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.utils.gc_utils import untrack_long_lists
@@ -339,6 +339,12 @@ class SchedulerOutput:
     # (non-final prefill chunks, or requests sure to reach max_tokens), so the
     # drafter can skip proposing them.
     skip_drafts: bool = False
+
+    compute_service_class: Literal["decode", "prefill"] | None = None
+    compute_contention: bool = False
+    compute_timing_enabled: bool = False
+    compute_service_tokens: int = 0
+    compute_dispatch_time: float | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

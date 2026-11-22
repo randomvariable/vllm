@@ -116,7 +116,14 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
+    PrefillComputeHalfLife,
+    PrefillComputeShare,
+    PrefillPolicy,
+    SchedulerPolicy,
+)
 from vllm.config.utils import get_field, replace
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
@@ -179,6 +186,58 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
         return parse_type(return_type)(val)
 
     return _optional_type
+
+
+def prefill_compute_share_type(value: str) -> PrefillComputeShare:
+    """Parse a fixed prefill share or automatic compute sharing."""
+    if value == "auto":
+        return "auto"
+    try:
+        share = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be 'auto' or a number between zero and one"
+        ) from exc
+    if not 0.0 < share < 1.0:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be strictly between zero and one"
+        )
+    return share
+
+
+def prefill_compute_half_life_type(value: str) -> PrefillComputeHalfLife:
+    """Parse an automatic compute-share half-life in seconds or a preset."""
+    if value == "smooth":
+        return "smooth"
+    if value == "responsive":
+        return "responsive"
+    try:
+        half_life = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be 'smooth', 'responsive', or a "
+            "positive number of seconds"
+        ) from exc
+    if not 0.0 < half_life < float("inf"):
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be a finite number greater than zero"
+        )
+    return half_life
+
+
+def positive_int_or_auto_type(value: str) -> int | Literal["auto"]:
+    """Parse `auto` or a strictly positive integer."""
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be 'auto' or a positive integer"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be 'auto' or a positive integer")
+    return parsed
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
@@ -712,6 +771,18 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    prefill_compute_share: PrefillComputeShare | None = (
+        SchedulerConfig.prefill_compute_share
+    )
+    prefill_compute_half_life: PrefillComputeHalfLife | None = (
+        SchedulerConfig.prefill_compute_half_life
+    )
+    max_num_prefill_tokens_per_step: int = (
+        SchedulerConfig.max_num_prefill_tokens_per_step
+    )
+    max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
+    prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
+    decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
     cache_aware_admission_window: int = SchedulerConfig.cache_aware_admission_window
     cache_aware_admission_threshold: float = (
         SchedulerConfig.cache_aware_admission_threshold
@@ -1831,6 +1902,38 @@ class EngineArgs:
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
+        prefill_compute_share_kwargs = scheduler_kwargs["prefill_compute_share"]
+        prefill_compute_share_kwargs.pop("choices", None)
+        prefill_compute_share_kwargs["type"] = prefill_compute_share_type
+        scheduler_group.add_argument(
+            "--prefill-compute-share", **prefill_compute_share_kwargs
+        )
+        prefill_compute_half_life_kwargs = scheduler_kwargs["prefill_compute_half_life"]
+        prefill_compute_half_life_kwargs.pop("choices", None)
+        prefill_compute_half_life_kwargs["type"] = prefill_compute_half_life_type
+        scheduler_group.add_argument(
+            "--prefill-compute-half-life", **prefill_compute_half_life_kwargs
+        )
+        scheduler_group.add_argument(
+            "--max-num-prefill-tokens-per-step",
+            **scheduler_kwargs["max_num_prefill_tokens_per_step"],
+        )
+        max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
+        max_parallel_prefills_kwargs.pop("choices", None)
+        max_parallel_prefills_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--max-parallel-prefills", **max_parallel_prefills_kwargs
+        )
+        scheduler_group.add_argument(
+            "--prefill-policy",
+            **scheduler_kwargs["prefill_policy"],
+        )
+        decode_refill_target_kwargs = scheduler_kwargs["decode_refill_target"]
+        decode_refill_target_kwargs.pop("choices", None)
+        decode_refill_target_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--decode-refill-target", **decode_refill_target_kwargs
+        )
         scheduler_group.add_argument(
             "--cache-aware-admission-window",
             **scheduler_kwargs["cache_aware_admission_window"],
@@ -2736,6 +2839,12 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            prefill_compute_share=self.prefill_compute_share,
+            prefill_compute_half_life=self.prefill_compute_half_life,
+            max_num_prefill_tokens_per_step=self.max_num_prefill_tokens_per_step,
+            max_parallel_prefills=self.max_parallel_prefills,
+            prefill_policy=self.prefill_policy,
+            decode_refill_target=self.decode_refill_target,
             cache_aware_admission_window=self.cache_aware_admission_window,
             cache_aware_admission_threshold=self.cache_aware_admission_threshold,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,

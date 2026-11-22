@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.config.kv_events import KVEventsConfig
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -201,6 +202,18 @@ class SchedulerInterface(ABC):
         non-empty. This information is useful for DP attention.
         """
         raise NotImplementedError
+
+    def record_compute_time(
+        self,
+        service_class: "ComputeServiceClass",
+        elapsed_seconds: float,
+        *,
+        contended: bool,
+        scheduled_tokens: int = 0,
+    ) -> None:
+        """Feed measured step execution time back to the scheduler's prefill
+        compute-share policy. Schedulers without that policy ignore it."""
+        return
 
     def has_requests(self) -> bool:
         """Returns True if there are unfinished requests, or finished requests

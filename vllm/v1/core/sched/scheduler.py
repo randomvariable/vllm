@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -48,6 +49,10 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.compute_fairness import (
+    ComputeServiceClass,
+    PrefillComputeShareController,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -56,6 +61,11 @@ from vllm.v1.core.sched.output import (
     KVConnectorBlockState,
     NewRequestData,
     SchedulerOutput,
+)
+from vllm.v1.core.sched.prefill_interleave import (
+    PrefillInterleaveController,
+    resolve_decode_refill_target,
+    resolve_max_parallel_prefills,
 )
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
@@ -111,6 +121,31 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
+        cfg = self.scheduler_config
+        self.max_parallel_prefills = resolve_max_parallel_prefills(
+            cfg.max_parallel_prefills, max_num_seqs=cfg.max_num_seqs
+        )
+        self.decode_refill_target = resolve_decode_refill_target(
+            cfg.decode_refill_target, max_parallel_prefills=self.max_parallel_prefills
+        )
+        self.prefill_interleave_controller = PrefillInterleaveController()
+        self.compute_share_controller = (
+            PrefillComputeShareController(
+                cfg.prefill_compute_share, cfg.prefill_compute_half_life
+            )
+            if cfg.prefill_compute_share is not None
+            else None
+        )
+        if (
+            self.compute_share_controller is not None
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share requires a synchronized fairness "
+                "decision across DP ranks"
+            )
+        self._prefill_compute_seconds = 0.0
+        self._decode_compute_seconds = 0.0
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
@@ -774,6 +809,68 @@ class Scheduler(SchedulerInterface):
             None,
         )
 
+    @staticmethod
+    def _request_has_local_prefill(request: Request) -> bool:
+        """Whether a request still needs model compute for its input."""
+        return request.is_prefill_chunk or (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.num_computed_tokens < request.num_tokens - 1
+        )
+
+    def _request_is_runnable_decode(
+        self, request: Request, *, scheduling_step: int | None = None
+    ) -> bool:
+        """Whether a running request contributes to the decode reservoir.
+
+        `is_prefill_chunk` describes the most recently scheduled step and
+        can remain true while MTP or async output placeholders are in flight.
+        Prompt progress plus the explicit in-flight-prefill set is stable at
+        utility-call boundaries and still excludes partial or resumed
+        prefills. Utility calls occur between async steps, so callers can ask
+        about the next scheduling step instead of the completed one.
+        """
+        scheduling_step = (
+            self.current_step if scheduling_step is None else scheduling_step
+        )
+        return (
+            request.num_computed_tokens >= request.num_prompt_tokens
+            and request not in self._inflight_prefills
+            and scheduling_step >= request.next_decode_eligible_step
+        )
+
+    def _has_pending_local_prefill(self) -> bool:
+        return any(
+            self._request_has_local_prefill(request)
+            for request in (*self.running, *self.waiting, *self.kv_holding_waiting)
+        )
+
+    def _local_prefill_pressure(self, now: float) -> tuple[float, int]:
+        """Estimate user-visible local-prefill slowdown and queued work."""
+        controller = self.compute_share_controller
+        if controller is None:
+            return 1.0, 0
+
+        seconds_per_token = controller.prefill_seconds_per_token
+        quantum_seconds = controller.last_prefill_seconds or 0.0
+        pressure = 1.0
+        backlog_tokens = 0
+        for request in (*self.running, *self.waiting, *self.kv_holding_waiting):
+            if not self._request_has_local_prefill(request):
+                continue
+            remaining_tokens = max(
+                request.num_tokens - 1 - request.num_computed_tokens, 0
+            )
+            backlog_tokens += remaining_tokens
+            if seconds_per_token is None or remaining_tokens == 0:
+                continue
+            expected_seconds = max(
+                remaining_tokens * seconds_per_token, quantum_seconds
+            )
+            if expected_seconds > 0.0:
+                age_seconds = max(now - request.arrival_time, 0.0)
+                pressure = max(pressure, 1.0 + age_seconds / expected_seconds)
+        return pressure, backlog_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -803,6 +900,15 @@ class Scheduler(SchedulerInterface):
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        separate_draft_tokens = 0
+        if self.compute_share_controller is not None and spec is not None:
+            if spec.method == "dflash":
+                separate_draft_tokens = 1 + spec.num_speculative_tokens
+            elif spec.method == "dspark":
+                separate_draft_tokens = spec.num_speculative_tokens
+            if separate_draft_tokens:
+                draft_slots = 0
+
         input_budget = self.scheduler_config.max_num_batched_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -833,6 +939,82 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        controller = self.compute_share_controller
+        possible_prefill = bool(self._inflight_prefills or self.waiting)
+        admission_open = (
+            self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_active_reqs
+        )
+        runnable_decodes = (
+            sum(self._request_is_runnable_decode(r) for r in self.running)
+            if possible_prefill
+            and (
+                controller is not None
+                or (
+                    self.max_parallel_prefills > 1
+                    and self.scheduler_config.prefill_policy == "decode-aware"
+                )
+            )
+            else 0
+        )
+        step_token_cap = self.max_num_scheduled_tokens
+        if (
+            controller is not None
+            and possible_prefill
+            and not runnable_decodes
+            and token_budget > 0
+            and os.environ.get("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS") == "1"
+        ):
+            step_token_cap = token_budget = max(step_token_cap, input_budget)
+        lanes = (
+            self.prefill_interleave_controller.begin_step(
+                running=self.running,
+                waiting=self.waiting if admission_open else (),
+                skipped_waiting=self.kv_holding_waiting if admission_open else (),
+                request_lookup=self.requests,
+                is_local_prefill=self._request_has_local_prefill,
+                max_parallel_prefills=self.max_parallel_prefills,
+                policy=self.scheduler_config.prefill_policy,
+                num_runnable_decodes=runnable_decodes,
+                decode_refill_target=self.decode_refill_target,
+                current_step=self.current_step,
+                respect_priority=self.policy == SchedulingPolicy.PRIORITY,
+            )
+            if self.max_parallel_prefills > 1
+            and possible_prefill
+            and not defer_prefills
+            else None
+        )
+        prefill_ids: set[str] = set()
+        selected_class = None
+        contended = False
+        if controller is not None:
+            has_prefill = (
+                possible_prefill
+                and (admission_open or bool(self._inflight_prefills))
+                and token_budget > 0
+            )
+            contended = bool(runnable_decodes and has_prefill)
+            prior_contention = controller.contention_active
+            selected_class = controller.select(
+                decode_runnable=bool(runnable_decodes), prefill_runnable=has_prefill
+            )
+            if contended and controller.auto_enabled:
+                pressure, backlog = self._local_prefill_pressure(scheduled_timestamp)
+                controller.observe_demand(
+                    prefill_pressure=pressure,
+                    local_prefill_backlog_tokens=backlog,
+                    decode_runnable=True,
+                    prefill_runnable=True,
+                    contention_started=not prior_contention,
+                    now=scheduled_timestamp,
+                )
+            if contended and selected_class == "prefill":
+                cap = self.scheduler_config.max_num_prefill_tokens_per_step
+                if cap:
+                    token_budget = min(token_budget, cap)
+
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
         # request there is nobody to starve, so let it use the whole budget.
@@ -860,7 +1042,11 @@ class Scheduler(SchedulerInterface):
                 if not allow_preemption and request.request_id in num_scheduled_tokens:
                     req_index += 1
                     continue
-                if input_budget <= draft_slots:
+                if (
+                    input_budget <= draft_slots
+                    or (len(num_scheduled_tokens) + 1) * separate_draft_tokens
+                    > self.scheduler_config.max_num_batched_tokens
+                ):
                     break
 
                 if (
@@ -885,7 +1071,17 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
 
-                if defer_prefills and request.is_prefill_chunk:
+                if (
+                    contended
+                    and selected_class == "prefill"
+                    and not request.is_prefill_chunk
+                ):
+                    req_index += 1
+                    continue
+
+                if (
+                    defer_prefills or (contended and selected_class == "decode")
+                ) and request.is_prefill_chunk:
                     # DP prefill balancing: defer this in-progress prefill chunk to a
                     # cadence-aligned step; decodes still run to fill this step.
                     req_index += 1
@@ -902,6 +1098,14 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
 
+                if (
+                    lanes is not None
+                    and request.is_prefill_chunk
+                    and not lanes.is_selected(request.request_id)
+                ):
+                    req_index += 1
+                    continue
+
                 num_new_tokens = (
                     request.num_tokens_with_spec
                     + request.num_output_placeholders
@@ -912,6 +1116,11 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = min(
                     num_new_tokens, token_budget, input_budget - draft_slots
                 )
+
+                if lanes is not None and request.is_prefill_chunk:
+                    num_new_tokens = min(
+                        num_new_tokens, lanes.token_budget(token_budget, prefill_ids)
+                    )
 
                 # Make sure the input position does not exceed the max model len.
                 # This is necessary when using spec decoding.
@@ -1071,6 +1280,8 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
                 req_to_new_blocks[request_id] = new_blocks
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if lanes is not None and lanes.is_selected(request_id):
+                    prefill_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 req_index += 1
@@ -1118,6 +1329,18 @@ class Scheduler(SchedulerInterface):
         if not reserve_boundary_logits_step:
             schedule_running_requests()
 
+        if (
+            contended
+            and selected_class == "decode"
+            and not num_scheduled_tokens
+            and not reserve_boundary_logits_step
+        ):
+            selected_class = "prefill"
+            cap = self.scheduler_config.max_num_prefill_tokens_per_step
+            if cap:
+                token_budget = min(token_budget, cap)
+            schedule_running_requests()
+
         # Record the LoRAs of all running requests, including those not
         # scheduled in this step, which can join a later batch.
         scheduled_loras: set[int] = set()
@@ -1141,6 +1364,8 @@ class Scheduler(SchedulerInterface):
             step_started_kv_loads: list[Request] = []
 
             def skip_request(from_queue: RequestQueue) -> None:
+                if lanes is not None:
+                    lanes.mark_unavailable(request.request_id)
                 if selected is None:
                     request_to_skip = from_queue.pop_request()
                 else:
@@ -1189,7 +1414,11 @@ class Scheduler(SchedulerInterface):
                     request_queue = self.async_kv_waiting
                 else:
                     break
-                if not loads_only and input_budget <= draft_slots:
+                if not loads_only and (
+                    input_budget <= draft_slots
+                    or (len(num_scheduled_tokens) + 1) * separate_draft_tokens
+                    > self.scheduler_config.max_num_batched_tokens
+                ):
                     break
                 if (
                     not request_queue
@@ -1221,6 +1450,20 @@ class Scheduler(SchedulerInterface):
                 )
                 request_id = request.request_id
                 considered_boundary_ids.add(request_id)
+
+                if (
+                    lanes is not None
+                    and selected is None
+                    and not loads_only
+                    and request_queue is self.waiting
+                ):
+                    choice = lanes.select_waiting_request((request_queue,))
+                    if choice is not None:
+                        _, request = choice
+                        selected = request
+                        request_id = request.request_id
+                    elif self._request_has_local_prefill(request):
+                        break
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1533,16 +1776,29 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
+                    if lanes is not None:
+                        lanes.release(request_id)
                     num_new_tokens = 0
                 elif (
-                    defer_prefills
-                    and effective_computed_tokens < request.num_tokens - 1
-                ):
+                    defer_prefills or (contended and selected_class == "decode")
+                ) and effective_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    if (
+                        lanes is not None
+                        and effective_computed_tokens < request.num_tokens - 1
+                        and not boundary_logits_only
+                    ):
+                        if not lanes.is_selected(request_id):
+                            skip_request(request_queue)
+                            continue
+                        request_token_budget = lanes.token_budget(
+                            request_token_budget, prefill_ids
+                        )
+
                     if did_prefix_cache_lookup and request.boundary_checkpoint is None:
                         # Fresh admission: local and/or sync external hit.
                         num_replay_tokens = self._mark_prefix_replay(
@@ -1847,6 +2103,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if lanes is not None and lanes.is_selected(request_id):
+                    prefill_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1902,12 +2160,22 @@ class Scheduler(SchedulerInterface):
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
 
-        if reserve_boundary_logits_step and not boundary_logits_taken:
+        service_class = selected_class
+        if contended and selected_class == "prefill":
+            # Decode may use residual capacity after the prefill turn.
+            selected_class = "decode"
+            if not num_scheduled_tokens:
+                service_class = "decode"
+            schedule_running_requests(allow_preemption=not num_scheduled_tokens)
+        elif contended and not num_scheduled_tokens:
+            selected_class = service_class = "prefill"
+            schedule_running_requests()
+        elif reserve_boundary_logits_step and not boundary_logits_taken:
             schedule_running_requests(allow_preemption=not num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= step_token_cap
 
         assert token_budget >= 0
         assert input_budget >= 0
@@ -2050,7 +2318,162 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if (
+            controller is not None
+            and contended
+            and service_class is not None
+            and num_scheduled_tokens
+        ):
+            scheduler_output.compute_service_class = service_class
+            scheduler_output.compute_contention = True
+            scheduler_output.compute_timing_enabled = True
+            scheduler_output.compute_service_tokens = total_num_scheduled_tokens
+            controller.dispatch(service_class, contended=True)
+        if lanes is not None:
+            self.prefill_interleave_controller.record_scheduled(
+                prefill_ids & num_scheduled_tokens.keys(), self.current_step
+            )
         return scheduler_output
+
+    def record_compute_time(
+        self,
+        service_class: ComputeServiceClass,
+        elapsed_seconds: float,
+        *,
+        contended: bool,
+        scheduled_tokens: int = 0,
+    ) -> None:
+        """Apply execution feedback and accumulate metric deltas."""
+        if self.compute_share_controller is None:
+            return
+        if not contended:
+            return
+        if self.log_stats and elapsed_seconds > 0.0:
+            if service_class == "prefill":
+                self._prefill_compute_seconds += elapsed_seconds
+            else:
+                self._decode_compute_seconds += elapsed_seconds
+        self.compute_share_controller.record(
+            service_class,
+            elapsed_seconds,
+            contended=True,
+            scheduled_tokens=scheduled_tokens,
+        )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        """Return the active prefill fairness state."""
+        controller = self.compute_share_controller
+        num_runnable_decodes = sum(
+            self._request_is_runnable_decode(
+                request, scheduling_step=self.current_step + 1
+            )
+            for request in self.running
+        )
+        return {
+            "prefill_compute_share": self.scheduler_config.prefill_compute_share,
+            "prefill_compute_half_life": (
+                self.scheduler_config.prefill_compute_half_life
+            ),
+            "max_num_prefill_tokens_per_step": (
+                self.scheduler_config.max_num_prefill_tokens_per_step
+            ),
+            "effective_prefill_compute_half_life_seconds": (
+                controller.effective_prefill_compute_half_life
+                if controller is not None
+                else None
+            ),
+            "effective_prefill_compute_share": (
+                controller.effective_prefill_compute_share
+                if controller is not None
+                else None
+            ),
+            "decode_pressure": (
+                controller.decode_pressure if controller is not None else None
+            ),
+            "prefill_pressure": (
+                controller.prefill_pressure if controller is not None else None
+            ),
+            "local_prefill_backlog_tokens": (
+                controller.local_prefill_backlog_tokens if controller is not None else 0
+            ),
+            "max_parallel_prefills": self.scheduler_config.max_parallel_prefills,
+            "effective_max_parallel_prefills": self.max_parallel_prefills,
+            "prefill_policy": self.scheduler_config.prefill_policy,
+            "decode_refill_target": self.scheduler_config.decode_refill_target,
+            "effective_decode_refill_target": self.decode_refill_target,
+            "runnable_decodes": num_runnable_decodes,
+        }
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Replace prefill fairness at a scheduler-step boundary."""
+        unknown_fields = set(config) - {
+            "prefill_compute_share",
+            "prefill_compute_half_life",
+        }
+        if unknown_fields:
+            names = ", ".join(sorted(unknown_fields))
+            raise ValueError(f"unknown prefill fairness fields: {names}")
+        prefill_compute_share = config.get("prefill_compute_share")
+        valid_compute_share = prefill_compute_share in (None, "auto")
+        if isinstance(prefill_compute_share, (int, float)) and not isinstance(
+            prefill_compute_share, bool
+        ):
+            valid_compute_share = 0.0 < float(prefill_compute_share) < 1.0
+        if not valid_compute_share:
+            raise ValueError(
+                "prefill_compute_share must be null, 'auto', or strictly between "
+                "zero and one"
+            )
+        prefill_compute_half_life = config.get("prefill_compute_half_life")
+        valid_half_life = prefill_compute_half_life in (
+            None,
+            "smooth",
+            "responsive",
+        )
+        if isinstance(prefill_compute_half_life, (int, float)) and not isinstance(
+            prefill_compute_half_life, bool
+        ):
+            valid_half_life = 0.0 < float(prefill_compute_half_life) < float("inf")
+        if not valid_half_life:
+            raise ValueError(
+                "prefill_compute_half_life must be null, 'smooth', 'responsive', "
+                "or a finite number greater than zero"
+            )
+        if prefill_compute_half_life is not None and prefill_compute_share != "auto":
+            raise ValueError(
+                "prefill_compute_half_life requires prefill_compute_share='auto'"
+            )
+
+        if prefill_compute_share is not None:
+            if self.scheduler_config.prefill_schedule_interval > 1:
+                raise ValueError(
+                    "prefill_compute_share cannot be combined with "
+                    "prefill_schedule_interval greater than one"
+                )
+            if self.parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "prefill_compute_share does not support data parallelism"
+                )
+
+        controller = self.compute_share_controller
+        if prefill_compute_share is None:
+            controller = None
+        elif controller is None:
+            controller = PrefillComputeShareController(
+                prefill_compute_share,
+                prefill_compute_half_life,
+            )
+        else:
+            controller.reconfigure(
+                prefill_compute_share,
+                prefill_compute_half_life,
+            )
+        self.compute_share_controller = controller
+        self._decode_compute_seconds = 0.0
+        self._prefill_compute_seconds = 0.0
+        self.scheduler_config.prefill_compute_share = prefill_compute_share
+        self.scheduler_config.prefill_compute_half_life = prefill_compute_half_life
+        return self.get_prefill_fairness()
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -3450,6 +3873,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self.prefill_interleave_controller.forget(request.request_id)
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
@@ -3708,7 +4132,23 @@ class Scheduler(SchedulerInterface):
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
         num_preempted_reqs, self._num_preempted_reqs = self._num_preempted_reqs, 0
+        controller = self.compute_share_controller
+        decode_seconds, self._decode_compute_seconds = self._decode_compute_seconds, 0.0
+        prefill_seconds, self._prefill_compute_seconds = (
+            self._prefill_compute_seconds,
+            0.0,
+        )
         return SchedulerStats(
+            decode_compute_seconds=decode_seconds,
+            prefill_compute_seconds=prefill_seconds,
+            prefill_compute_share=controller.effective_prefill_compute_share
+            if controller
+            else 0.0,
+            decode_compute_pressure=controller.decode_pressure if controller else 1.0,
+            prefill_compute_pressure=controller.prefill_pressure if controller else 1.0,
+            local_prefill_backlog_tokens=controller.local_prefill_backlog_tokens
+            if controller
+            else 0,
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,

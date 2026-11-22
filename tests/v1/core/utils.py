@@ -99,6 +99,8 @@ def create_scheduler(
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
     encoder_cache_size: int | None = None,
+    device: str | None = None,
+    **scheduler_options,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -150,6 +152,7 @@ def create_scheduler(
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,
+        **scheduler_options,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
