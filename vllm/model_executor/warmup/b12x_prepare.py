@@ -538,6 +538,28 @@ def get_b12x_session(worker: Worker):
     return session
 
 
+def commit_b12x_prime_kv_blocks(runner: GPUModelRunner) -> None:
+    """Back the KV blocks that plan primes on the serving pools address.
+
+    An extensible KV cache backs only its null blocks at allocation, and warmup
+    commits the blocks each step addresses. Primes run before warmup and write
+    up to one max-length request per KV cache group, starting at block 0.
+    """
+    if getattr(runner, "extensible_kv_cache", None) is None:
+        return
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.worker.extensible_kv_cache import (
+        ensure_kv_cache_blocks,
+        num_committable_kv_blocks,
+    )
+
+    num_blocks = 1 + sum(
+        cdiv(runner.max_model_len, group.block_size)
+        for group in runner.kv_cache_config.kv_cache_groups
+    )
+    ensure_kv_cache_blocks(runner, min(num_blocks, num_committable_kv_blocks(runner)))
+
+
 def begin_b12x_preparation(worker: Worker, *, stage: str):
     """Start the world-coordinated preparation of one stage."""
     from vllm.distributed.parallel_state import get_world_group
@@ -547,6 +569,8 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
     batches = []
     units: list[B12xPreparationUnit] = []
     if b12x_native_supported(worker):
+        if stage != "weights":
+            commit_b12x_prime_kv_blocks(worker.model_runner)
         workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
         units = collect_b12x_units(worker, workload)
         batches = b12x_batches(

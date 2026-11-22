@@ -235,6 +235,7 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
 
     worker = SimpleNamespace(
         get_model=lambda: SimpleNamespace(modules=modules),
+        get_draft_model=lambda: None,
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=8,
             max_num_scheduled_tokens=32,
@@ -264,3 +265,51 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
         ("second", (1, 2, 4, 8, 16, 32), torch.bfloat16),
     ]
     assert synchronized == [True]
+
+
+def test_b12x_warmup_covers_draft_head_capture_rows(monkeypatch) -> None:
+    """The drafter's own sampling head (e.g. the NVFP4 MTP lm_head) is outside
+    the target's module tree; draft CUDA-graph capture runs it on one row per
+    request, so it must be warmed for every request count before capture."""
+    import vllm.model_executor.warmup.b12x_warmup as warmup_mod
+
+    calls: dict[str, tuple[int, ...]] = {}
+
+    class Provider:
+        def get_b12x_warmup_unit(self, layer, token_counts, output_dtype):
+            return B12xWarmupUnit(
+                name="fake",
+                key=(type(self), layer.name),
+                compile=lambda: calls.setdefault(layer.name, token_counts),
+            )
+
+    def model(*names):
+        layers = [
+            SimpleNamespace(name=n, b12x_warmup_provider=Provider()) for n in names
+        ]
+        return SimpleNamespace(modules=lambda: iter(layers))
+
+    worker = SimpleNamespace(
+        get_model=lambda: model("target_linear"),
+        get_draft_model=lambda: model("draft_lm_head"),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=64,
+            max_num_scheduled_tokens=None,
+            max_num_seqs=6,
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(compile_sizes=[])
+        ),
+    )
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 120,
+    )
+    monkeypatch.setattr(warmup_mod, "current_platform", platform)
+    monkeypatch.setattr(warmup_mod.torch.accelerator, "synchronize", lambda: None)
+
+    b12x_warmup(worker, [1, 2, 4, 8, 16])
+
+    assert calls["draft_lm_head"] == (1, 2, 3, 4, 5, 6, 8, 16, 64)
+    assert calls["target_linear"] == (1, 2, 4, 8, 16, 64)

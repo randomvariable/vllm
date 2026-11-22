@@ -537,5 +537,20 @@ def test_dummy_norm_weights_are_neutral(default_vllm_config):
             assert torch.all(param == values[name]), (type(norm).__name__, name)
 
 
+def test_dummy_default_quant_scales_stay_valid():
+    """Layers loading `_k_scale`/`_v_scale` buffers straight from a checkpoint
+    (e.g. Qwen QSA) never reset them, so a dummy load must keep them at 1.0: a
+    random, possibly negative, KV scale turns the quantized cache into NaN."""
+    from vllm.model_executor.layers.attention.attention import (
+        set_default_quant_scales,
+    )
+
+    layer = torch.nn.Module()
+    set_default_quant_scales(layer, register_buffer=True)
+    for name, buffer in layer.named_buffers():
+        initialize_single_dummy_weight(buffer, name=name)
+        assert buffer.item() == 1.0, name
+
+
 if __name__ == "__main__":
     test_download_weights_from_hf()

@@ -370,19 +370,23 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self.qsa_state_is_fresh[:num_reqs_padded].fill_(True)
         self.qsa_num_accepted_tokens[:num_reqs_padded].fill_(1)
         if num_reqs:
-            self.qsa_state_slot_ids[:num_reqs].copy_(idx_mapping[:num_reqs])
+            # idx_mapping is -1 on rows the drafter must not act on (every row
+            # of a dummy batch); those keep the padded-row defaults above.
+            idx = idx_mapping[:num_reqs]
+            active = idx >= 0
+            self.qsa_state_slot_ids[:num_reqs].copy_(
+                torch.where(active, idx, self._qsa_default_slot_ids[:num_reqs])
+            )
             # The draft prefill immediately preceding lookahead initialized the
             # MTP QSA selector state in these persistent request slots.
-            self.qsa_state_is_fresh[:num_reqs].fill_(False)
+            torch.logical_not(active, out=self.qsa_state_is_fresh[:num_reqs])
             # Step one continues the reused draft-prefill interval by the
             # target's accepted prefix. Later steps continue a one-row draft
             # decode interval and therefore retain the neutral count of one.
             if draft_index == 1:
-                torch.index_select(
-                    self.qsa_committed_num_accepted_tokens_gpu,
-                    0,
-                    idx_mapping[:num_reqs],
-                    out=self.qsa_num_accepted_tokens[:num_reqs],
+                committed = self.qsa_committed_num_accepted_tokens_gpu[idx.clamp(min=0)]
+                self.qsa_num_accepted_tokens[:num_reqs].copy_(
+                    torch.where(active, committed, 1)
                 )
 
         return Qwen4ExpAttnMetadata(

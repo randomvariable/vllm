@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayerConfig,
     KVCacheLayout,
     get_kv_quant_mode,
+    is_same_kv_cache_allocation,
 )
 from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
@@ -1763,6 +1764,11 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if self._qsa_prefill_bindings and is_same_kv_cache_allocation(
+            self.kv_cache, kv_cache
+        ):
+            # Its prepared plans and captured graphs address this memory.
+            return
         super().bind_kv_cache(kv_cache)
         self.max_seq_len = int(self._qsa_model_config.max_model_len)
         if kv_cache.ndim != 4 or int(kv_cache.shape[1]) != 2:

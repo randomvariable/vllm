@@ -355,6 +355,26 @@ def compute_layout_strides(
     return tuple(strides)
 
 
+def is_same_kv_cache_allocation(bound: object, view: torch.Tensor) -> bool:
+    """Whether `view` addresses the cache memory `bound` already addresses.
+
+    `extend_kv_cache` rebinds layers to views over the committed prefix of the
+    reservation their cache already lives in: same base address and layout,
+    no more blocks. State a layer derived from its old view (prepared plans,
+    pointers captured in CUDA graphs) stays valid across such a rebind.
+    """
+    return (
+        isinstance(bound, torch.Tensor)
+        and bound.numel() > 0
+        and bound.device == view.device
+        and bound.dtype == view.dtype
+        and bound.data_ptr() == view.data_ptr()
+        and bound.stride() == view.stride()
+        and bound.shape[1:] == view.shape[1:]
+        and view.shape[0] <= bound.shape[0]
+    )
+
+
 def create_kv_cache_views(
     raw: torch.Tensor,
     spec: KVCacheSpec,

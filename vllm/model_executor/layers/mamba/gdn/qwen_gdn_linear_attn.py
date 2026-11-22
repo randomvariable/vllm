@@ -7,8 +7,8 @@ import itertools
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Literal
+from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from einops import rearrange
@@ -113,6 +113,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     FLASHINFER_GDN_CHECKPOINT_ALIGNMENT,
     GDNAttentionMetadata,
 )
+from vllm.v1.kv_cache_interface import is_same_kv_cache_allocation
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
@@ -120,7 +121,10 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+        B12xGdnPrefill,
+        GdnPrefillStaging,
+    )
 
 
 @dataclass(frozen=True)
@@ -1175,13 +1179,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_fused_gdn_spec_decode = (
             self.gdn_decode_kernel == "cuda" and self.speculative_config is not None
         )
-        self._b12x_gdn_api = None
-        self._b12x_prefill_api = None
+        self._b12x_gdn_api: ModuleType | None = None
+        self._b12x_prefill_api: ModuleType | None = None
         self._b12x_decode_plan = None
-        self._b12x_decode_staging = None
-        self._b12x_prefill_plans = {}
-        self._b12x_prefill_staging = None
-        self._b12x_prefill = None
+        self._b12x_decode_staging: _B12xGdnDecodeStaging | None = None
+        self._b12x_prefill_plans: dict[int, Any] = {}
+        self._b12x_prefill_staging: GdnPrefillStaging | None = None
+        self._b12x_prefill: B12xGdnPrefill | None = None
+        self._b12x_bound_kv_cache = None
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
             self._initialize_b12x_gdn_prefill()
@@ -1628,7 +1633,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if (
+            self._b12x_decode_plan is not None or self._b12x_prefill_plans
+        ) and is_same_kv_cache_allocation(self._b12x_bound_kv_cache, kv_cache):
+            # Its prepared plans and captured graphs address this memory.
+            return
         super().bind_kv_cache(kv_cache)
+        self._b12x_bound_kv_cache = kv_cache
         self._b12x_decode_plan = None
         self._b12x_prefill_plans = {}
         self._b12x_prefill = None
@@ -1705,6 +1716,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_decode_plan = None
         self._b12x_prefill_plans = {}
         self._b12x_prefill = None
+        self._b12x_bound_kv_cache = None
         self.kv_cache = ()
 
     def _aiter_fused_gdn_decode_unsupported_reason(

@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroup,
     KVCacheTensor,
     MLAAttentionSpec,
+    is_same_kv_cache_allocation,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker import extensible_kv_cache
@@ -1028,3 +1029,21 @@ def test_drafter_capture_writes_kv_only_to_the_null_block(
         speculative_config={"method": "mtp", "num_speculative_tokens": 3},
     ) as runner:
         runner.generate_greedy(["The capital of France is"], max_tokens=16)
+
+
+def test_committed_view_is_same_kv_cache_allocation():
+    """`extend_kv_cache` rebinds a layer to the committed prefix of the view it
+    was bound to; layers keep their prepared state across that rebind, but not
+    across a rebind to other memory or another layout."""
+    reservation = torch.zeros(NUM_BLOCKS, 2, 4, 8)
+    committed = reservation[: NUM_BLOCKS // 2]
+    assert is_same_kv_cache_allocation(reservation, committed)
+    assert is_same_kv_cache_allocation(reservation, reservation)
+    assert not is_same_kv_cache_allocation(committed, reservation)
+    assert not is_same_kv_cache_allocation(reservation, reservation.clone())
+    assert not is_same_kv_cache_allocation(reservation, reservation[1:])
+    assert not is_same_kv_cache_allocation(
+        reservation, reservation.view(NUM_BLOCKS, 4, 2, 8)
+    )
+    assert not is_same_kv_cache_allocation(None, reservation)
+    assert not is_same_kv_cache_allocation(torch.tensor([]), reservation)

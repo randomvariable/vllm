@@ -184,6 +184,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
         hf_config=hf_config,
         get_hidden_size=lambda: 64,
         get_vocab_size=lambda: 32,
+        uses_mrope=False,
     )
     speculative_config = SimpleNamespace(
         method="mtp",
@@ -222,6 +223,8 @@ def test_mm_support_configured_after_model_load(monkeypatch):
     checked_configs = []
 
     class _ModelConfig:
+        uses_mrope = False
+
         @property
         def supports_multimodal_inputs(self):
             checked_configs.append(self)
@@ -519,6 +522,142 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+class _PositionsRecordingDraftModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.positions: torch.Tensor | None = None
+
+    def forward(self, **kwargs):
+        self.positions = kwargs["positions"]
+        return torch.zeros(kwargs["input_ids"].shape[0], 3)
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_run_model_positions_follow_draft_rope(monkeypatch, uses_mrope):
+    """Qwen MTP (M-RoPE) drafts on [3, rows] positions; other drafters on 1D."""
+    speculator = _make_speculator(monkeypatch, torch.zeros(4, 3))
+    speculator.model = _PositionsRecordingDraftModel()
+    if uses_mrope:
+        speculator.mrope_positions = torch.arange(15).view(3, 5)
+
+    speculator._run_model(
+        4,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    positions = speculator.model.positions
+    if uses_mrope:
+        assert positions.tolist() == [[0, 1, 2, 3], [5, 6, 7, 8], [10, 11, 12, 13]]
+    else:
+        assert positions.tolist() == [0, 1, 2, 3]
+
+
+def _prefill_batch(device, target_positions):
+    # Two requests: rows 0..2 and 3..4; the second rejected one draft token.
+    return SimpleNamespace(
+        num_reqs=2,
+        input_ids=torch.arange(10, 15, dtype=torch.int32, device=device),
+        positions=target_positions,
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([3, 9], dtype=torch.int32, device=device),
+    )
+
+
+def _draft_buffers(device, max_num_reqs, num_tokens):
+    return SimpleNamespace(
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        positions=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+        query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device),
+        seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+    )
+
+
+def _prepare_prefill(device, input_batch, input_buffers, **mrope_kwargs):
+    last_token_indices = torch.zeros(4, dtype=torch.int64, device=device)
+    spec_module.prepare_prefill_inputs(
+        last_token_indices,
+        torch.zeros((), dtype=torch.int64, device=device),
+        input_buffers,
+        input_batch,
+        torch.ones(2, dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+        torch.tensor([7, 8], dtype=torch.int64, device=device),
+        torch.zeros(2, dtype=torch.int32, device=device),
+        4,
+        **mrope_kwargs,
+    )
+    return last_token_indices
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("target_uses_mrope", [False, True])
+def test_mrope_draft_positions_follow_target_through_draft_steps(target_uses_mrope):
+    device = torch.device("cuda")
+    flat = torch.tensor([0, 1, 2, 6, 7], dtype=torch.int64, device=device)
+    # Text after an image: the three axes differ by a per-axis offset.
+    target_model_positions = (
+        torch.stack([flat + 100, flat + 200, flat + 300]) if target_uses_mrope else flat
+    )
+    input_batch = _prefill_batch(device, flat)
+    input_buffers = _draft_buffers(device, max_num_reqs=4, num_tokens=8)
+    mrope = torch.full((3, 9), -1, dtype=torch.int64, device=device)
+    scratch = torch.empty(3, 4, dtype=torch.int64, device=device)
+
+    last_token_indices = _prepare_prefill(
+        device,
+        input_batch,
+        input_buffers,
+        target_model_positions=target_model_positions,
+        draft_mrope_positions=mrope,
+    )
+
+    offsets = (100, 200, 300) if target_uses_mrope else (0, 0, 0)
+    expected = [[p + o for p in [0, 1, 2, 6]] for o in offsets]
+    assert mrope[:, :4].tolist() == expected
+    assert input_buffers.positions[:4].tolist() == [0, 1, 2, 6]
+
+    # Draft decode runs one row per request, at that request's last token.
+    spec_module.compact_mrope_positions(mrope, scratch, last_token_indices, 2)
+    assert last_token_indices[:2].tolist() == [2, 3]
+    assert mrope[:, :2].tolist() == [[2 + o, 6 + o] for o in offsets]
+
+    input_buffers.positions[:2] = torch.tensor([2, 6], device=device)
+    draft_tokens = torch.zeros(2, dtype=torch.int64, device=device)
+    hidden_states = torch.zeros(2, 8, device=device)
+    spec_module.update_draft_inputs(
+        draft_tokens,
+        torch.zeros((), dtype=torch.int64, device=device),
+        hidden_states,
+        torch.zeros(2, 3, dtype=torch.int64, device=device),
+        torch.zeros_like(hidden_states),
+        input_buffers,
+        torch.zeros(2, dtype=torch.int64, device=device),
+        2,
+        torch.tensor(1000, dtype=torch.int32, device=device),
+        3,
+        mrope_positions=mrope,
+    )
+    # A draft token is text: every axis takes the next axis-0 position.
+    assert mrope[:, :2].tolist() == [[3 + offsets[0], 7 + offsets[0]]] * 3
+    assert input_buffers.positions[:2].tolist() == [3, 7]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+def test_draft_without_mrope_keeps_1d_positions():
+    device = torch.device("cuda")
+    flat = torch.tensor([0, 1, 2, 6, 7], dtype=torch.int64, device=device)
+    input_batch = _prefill_batch(device, flat)
+    input_buffers = _draft_buffers(device, max_num_reqs=4, num_tokens=8)
+
+    _prepare_prefill(device, input_batch, input_buffers)
+
+    assert input_buffers.positions[:4].tolist() == [0, 1, 2, 6]
 
 
 @pytest.mark.parametrize("partitioned", [False, True])

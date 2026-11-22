@@ -8,7 +8,56 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.distributed import parallel_state
+from vllm.model_executor.warmup import b12x_prepare
 from vllm.model_executor.warmup.b12x_prepare import get_b12x_session
+from vllm.v1.worker import b12x_startup
+
+
+def _begin_on_extensible_pool(monkeypatch, stage, *, committable=10746):
+    """Begin a b12x stage on a worker whose serving KV cache is extensible.
+
+    The Qwen3.8 smoke geometry: ten KV cache groups of 3008-token blocks and an
+    8192-token context, so one QSA prefill prime spans blocks 0..2.
+    """
+    monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda worker: True)
+    monkeypatch.setattr(b12x_prepare, "b12x_workload", lambda worker, stage: None)
+    monkeypatch.setattr(b12x_prepare, "collect_b12x_units", lambda worker, w: [])
+    monkeypatch.setattr(b12x_startup, "B12xPreparationCoordinator", Mock())
+    monkeypatch.setattr(parallel_state, "get_world_group", Mock())
+    kv_cache = SimpleNamespace(warmup_committable_blocks=committable, commit=Mock())
+    runner = SimpleNamespace(
+        extensible_kv_cache=kv_cache,
+        max_model_len=8192,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(block_size=3008)] * 10
+        ),
+    )
+    worker = SimpleNamespace(
+        rank=0,
+        model_runner=runner,
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(enable_b12x_autotune=False)
+        ),
+    )
+    b12x_prepare.begin_b12x_preparation(worker, stage=stage)
+    return kv_cache.commit
+
+
+@pytest.mark.parametrize("stage", ["state", "bind"])
+def test_pool_stages_commit_blocks_primes_address(monkeypatch, stage):
+    # Allocation backs only the null blocks; a prime writes blocks 0..2.
+    commit = _begin_on_extensible_pool(monkeypatch, stage)
+    commit.assert_called_once_with(31)
+
+
+def test_prime_blocks_stay_within_committable_blocks(monkeypatch):
+    commit = _begin_on_extensible_pool(monkeypatch, "bind", committable=8)
+    commit.assert_called_once_with(8)
+
+
+def test_weights_stage_commits_no_kv_blocks(monkeypatch):
+    commit = _begin_on_extensible_pool(monkeypatch, "weights")
+    commit.assert_not_called()
 
 
 @pytest.mark.parametrize(

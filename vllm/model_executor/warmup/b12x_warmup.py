@@ -22,8 +22,10 @@ def _collect_warmup_units(
     model: torch.nn.Module,
     token_counts: tuple[int, ...],
     output_dtype: torch.dtype,
+    units: dict[object, B12xWarmupUnit] | None = None,
 ) -> Iterable[B12xWarmupUnit]:
-    units: dict[object, B12xWarmupUnit] = {}
+    if units is None:
+        units = {}
     for layer in model.modules():
         provider = getattr(layer, "b12x_warmup_provider", None)
         get_unit = getattr(provider, "get_b12x_warmup_unit", None)
@@ -76,12 +78,18 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    units = _collect_warmup_units(
-        worker.get_model(),
-        token_counts,
-        output_dtype,
-    )
-    for name, count in _compile_warmup_units(units).items():
+    units: dict[object, B12xWarmupUnit] = {}
+    draft = worker.get_draft_model()
+    if draft is not None:
+        # The drafter is outside the target's module tree. Its sampling head
+        # runs on one row per request, padded to any request count, so cover
+        # every count up to max_num_seqs. Collected first so a unit shared
+        # with the target keeps these counts.
+        max_num_seqs = int(worker.scheduler_config.max_num_seqs)
+        draft_token_counts = tuple(sorted({*token_counts, *range(1, max_num_seqs + 1)}))
+        _collect_warmup_units(draft, draft_token_counts, output_dtype, units)
+    _collect_warmup_units(worker.get_model(), token_counts, output_dtype, units)
+    for name, count in _compile_warmup_units(units.values()).items():
         logger.info_once(
             "Warmed up %d b12x %s kernel signature(s).",
             count,

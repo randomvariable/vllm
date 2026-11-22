@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.torch_utils import (
@@ -162,10 +163,13 @@ def _largest_kernel_block_within(
 def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) -> None:
     """Sets default quantization scales for the layer."""
     if register_buffer:
-        layer.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
-        layer.register_buffer("_v_scale", torch.tensor(1.0, dtype=torch.float32))
-        layer.register_buffer("_q_scale", torch.tensor(1.0, dtype=torch.float32))
-        layer.register_buffer("_prob_scale", torch.tensor(1.0, dtype=torch.float32))
+        for name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
+            layer.register_buffer(name, torch.tensor(1.0, dtype=torch.float32))
+            # A dummy load fills state-dict buffers with random values. Layers
+            # that load these buffers straight from the checkpoint never reset
+            # them, so a random (possibly negative) KV scale would turn the
+            # quantized cache into NaN.
+            set_weight_attrs(getattr(layer, name), {"dummy_weight_value": 1.0})
     else:
         layer._k_scale.fill_(1.0)
         layer._v_scale.fill_(1.0)
