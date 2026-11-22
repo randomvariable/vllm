@@ -51,6 +51,100 @@ requires_accelerator = pytest.mark.skipif(
 )
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120)
+    or not indexer_module.has_deep_gemm(),
+    reason="requires SM12x with DeepGEMM",
+)
+@torch.inference_mode()
+def test_v41_adaptive_indexer_replays_device_trim(tmp_path):
+    from transformers import LlamaConfig
+
+    from tests.kernels.attention.test_deepgemm_attention import kv_cache_cast_to_fp8
+    from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+    from vllm.v1.worker.gpu.attn_utils import (
+        get_query_lens_mismatch_unsupported_backend,
+    )
+    from vllm.v1.worker.utils import AttentionGroup
+
+    device = torch.device("cuda")
+    # Only model-independent sizing fields are needed by the metadata builder.
+    LlamaConfig().save_pretrained(tmp_path)
+    config = create_vllm_config(model_name=str(tmp_path), max_model_len=256)
+    config.model_config.architectures[:] = ["DeepseekV41ForCausalLM"]
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3, enable_adaptive_verification=True
+    )
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+    )
+    backend = DeepseekV41IndexerBackend
+    group = AttentionGroup(backend, ["indexer"], spec, 0)  # type: ignore[type-abstract]
+    assert get_query_lens_mismatch_unsupported_backend([[group]]) is None
+    assert not DeepseekV4IndexerBackend.supports_device_cpu_query_lens_mismatch()
+
+    builder = backend.get_builder_cls()(
+        spec, ["indexer"], config, device, block_table_width=2
+    )
+    q_starts = torch.tensor([0, 4, 8], dtype=torch.int32)
+    seq_lens = torch.tensor([65, 97], device=device, dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        query_start_loc=q_starts.to(device),
+        query_start_loc_cpu=q_starts,
+        seq_lens=seq_lens,
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=4,
+        max_seq_len=97,
+        block_table_tensor=torch.tensor(
+            [[1, 2], [3, 4]], device=device, dtype=torch.int32
+        ),
+        slot_mapping=torch.arange(8, device=device, dtype=torch.int64),
+    )
+    generator = torch.Generator(device=device).manual_seed(42)
+    q = torch.randn(8, 1, 32, 128, device=device, generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.ones(8, 32, device=device)
+    cache = kv_cache_cast_to_fp8(
+        torch.randn(5, 32, 1, 128, device=device, generator=generator)
+    )
+
+    def logits():
+        decode = builder.build(0, common).decode
+        assert decode is not None and not decode.requires_padding
+        return fp8_fp4_paged_mqa_logits(
+            (q, None),
+            cache,
+            weights,
+            decode.seq_lens,
+            decode.block_table,
+            decode.schedule_metadata,
+            max_model_len=128,
+        ), decode.seq_lens
+
+    reference, _ = logits()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        trimmed, trimmed_lens = logits()
+
+    # Keep only the first two rows of req 0 and the first row of req 1.
+    # The CPU still describes both four-token requests and the eight-row graph.
+    q[2].copy_(q[4])
+    common.query_start_loc[1:].copy_(torch.tensor([2, 3], device=device))
+    seq_lens.copy_(torch.tensor([63, 94], device=device))
+    graph.replay()
+    assert trimmed_lens.flatten().tolist() == [31, 31, 47, 0, 0, 0, 0, 0]
+    for new, old, visible in ((0, 0, 31), (1, 1, 31), (2, 4, 47)):
+        torch.testing.assert_close(
+            trimmed[new, :visible], reference[old, :visible], atol=0, rtol=0
+        )
+
+
 @requires_accelerator
 def test_adaptive_indexer_uses_configured_max_decode_len():
     """GLM adaptive verification may replay wider rows than capture dummy rows."""

@@ -312,6 +312,13 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
 
 class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return (
+            _supports_sm12x_device_query_lens()
+            or super().supports_device_cpu_query_lens_mismatch()
+        )
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V41_INDEXER"
@@ -934,6 +941,26 @@ def _supports_flattened_device_query_lens() -> bool:
     )
 
 
+def _supports_sm12x_device_query_lens() -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and has_deep_gemm()
+    )
+
+
+def _uses_v41_device_decode_rows(vllm_config: VllmConfig) -> bool:
+    spec = vllm_config.speculative_config
+    model = vllm_config.model_config
+    return (
+        spec is not None
+        and spec.enable_adaptive_verification
+        and model is not None
+        and "DeepseekV41ForCausalLM" in model.architectures
+        and _supports_sm12x_device_query_lens()
+    )
+
+
 def _supports_deepseek_v4_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
     model_config = vllm_config.model_config
     return (
@@ -963,12 +990,16 @@ def _supports_native_decode(next_n: int) -> bool:
 def _use_flattening(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     next_n = 1 + vllm_config.num_speculative_tokens
-    return not _supports_native_decode(next_n) or (
-        speculative_config is not None
-        and speculative_config.enable_adaptive_verification
-        and (
-            _supports_flattened_device_query_lens()
-            or _supports_deepseek_v4_flattened_device_query_lens(vllm_config)
+    return (
+        _uses_v41_device_decode_rows(vllm_config)
+        or not _supports_native_decode(next_n)
+        or (
+            speculative_config is not None
+            and speculative_config.enable_adaptive_verification
+            and (
+                _supports_flattened_device_query_lens()
+                or _supports_deepseek_v4_flattened_device_query_lens(vllm_config)
+            )
         )
     )
 
@@ -1707,7 +1738,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if num_decodes > 0:
             assert num_decode_tokens <= self.expanded_block_table_buffer.shape[0]
             custom_rows = self.should_build_custom_decode_rows(common_attn_metadata)
-            if not (self.supports_varlen or custom_rows):
+            device_rows = self.supports_varlen or _uses_v41_device_decode_rows(
+                self.vllm_config
+            )
+            if not (device_rows or custom_rows):
                 torch.diff(
                     common_attn_metadata.query_start_loc[: num_decodes + 1],
                     out=self.decode_lens_buffer[:num_decodes],
@@ -1760,7 +1794,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and step_next_n_ok
             )
 
-            if not self.supports_varlen:
+            if not device_rows:
                 global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
                     global_seq_lens=global_seq_lens_for_decode,
                     decode_lens=decode_lens,
@@ -1772,7 +1806,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
 
             decode_indices = None
-            if self.supports_varlen:
+            if device_rows:
                 from vllm.v1.attention.ops.metadata import (
                     _indexer_decode_metadata_kernel,
                 )
@@ -1802,7 +1836,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
-                decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+                # SM12x consumes ordinary one-query rows, not varlen indices.
+                if self.supports_varlen:
+                    decode_indices = self.decode_indices_buffer[:num_decode_tokens]
                 requires_padding = False
                 if global_seq_lens_for_decode is not None and max_decode_len > 1:
                     self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
