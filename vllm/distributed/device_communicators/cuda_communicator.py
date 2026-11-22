@@ -132,6 +132,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_aiter_ag_rs: bool = False
         self.use_aiter_tp_all_gather: bool = False
         self.b12x_ar_comm = None
+        self.use_dcp_roce = (
+            unique_name.split(":")[0] == "dcp"
+            and envs.VLLM_DCP_ROCENANTE
+            and not envs.VLLM_BATCH_INVARIANT
+        )
         if self.world_size > 1 and self.use_b12x_allreduce:
             from .b12x_pcie_all_reduce import B12xPcieAllReduce
 
@@ -141,7 +146,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
                 global_ranks=self.ranks,
             )
-        elif self.world_size > 1 and self.use_roce_allreduce:
+        elif self.world_size > 1 and (self.use_roce_allreduce or self.use_dcp_roce):
             from .b12x_roce_all_reduce import B12xRoceAllReduce
 
             self.b12x_ar_comm = B12xRoceAllReduce(
@@ -149,6 +154,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device_group=self.device_group,
                 device=self.device,
                 global_ranks=self.ranks,
+                dcp=self.use_dcp_roce,
             )
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
@@ -363,7 +369,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
-        if self.b12x_ar_comm is not None and not self.b12x_ar_comm.disabled:
+        if (
+            self.b12x_ar_comm is not None
+            and not self.b12x_ar_comm.disabled
+            and not self.use_dcp_roce
+        ):
             enabled_ar_backends.append(
                 getattr(self.b12x_ar_comm, "backend_name", "B12X_PCIE")
             )
@@ -541,6 +551,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and should_gather(input_, dim)
         ):
             return comm.all_gather(input_, dim)
+        # Pack heads into the last dimension to preserve rank-major head order.
+        if self.use_dcp_roce and dim == 1 and input_.ndim == 3 and comm is not None:
+            packed = input_.flatten(1).contiguous()
+            if comm.should_all_gather(packed, 1):
+                return comm.all_gather(packed, 1).unflatten(
+                    1, (self.world_size * input_.size(1), input_.size(2))
+                )
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -614,6 +631,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
+        if self.use_dcp_roce and self.b12x_ar_comm is not None:
+            out = self.b12x_ar_comm.try_reduce_scatter(input_tensor)
+            if out is not None:
+                return out.movedim(0, dim).contiguous()
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 

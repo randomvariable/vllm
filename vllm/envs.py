@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_USE_FUSED_MQA_TOPK: bool = True
     VLLM_DS41_DCP_SHARD_INDEX: bool = False
+    VLLM_DCP_ROCENANTE: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1238,6 +1239,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DS41_DCP_SHARD_INDEX": lambda: bool(
         int(os.getenv("VLLM_DS41_DCP_SHARD_INDEX", "0"))
     ),
+    # Enable prepared RoCEnante gather and reduce-scatter for the DCP group.
+    "VLLM_DCP_ROCENANTE": lambda: bool(int(os.getenv("VLLM_DCP_ROCENANTE", "0"))),
     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
     # Default: 512 MB

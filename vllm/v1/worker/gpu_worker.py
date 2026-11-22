@@ -54,6 +54,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
     checkpoint_restore_distributed_state,
+    get_dcp_group,
     get_pcp_group,
     get_pp_group,
     get_tp_group,
@@ -1670,15 +1671,25 @@ class Worker(WorkerBase):
         return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
-        """The RoCEnante health check of the TP communicator, if one is active.
+        """Return a fail-stop check for the active RoCEnante communicators."""
+        groups = [get_tp_group()]
+        if envs.VLLM_DCP_ROCENANTE:
+            groups.append(get_dcp_group())
+        checks = []
+        for group in groups:
+            comm = getattr(group.device_communicator, "b12x_ar_comm", None)
+            if (check := getattr(comm, "check_health", None)) is not None:
+                checks.append(check)
+        if not checks:
+            return None
+        if len(checks) == 1:
+            return checks[0]
 
-        Returns:
-            The check callable, or None when RoCEnante is not in use.
+        def check_all() -> None:
+            for check in checks:
+                check()
 
-        """
-        communicator = get_tp_group().device_communicator
-        comm = getattr(communicator, "b12x_ar_comm", None)
-        return getattr(comm, "check_health", None)
+        return check_all
 
     def _b12x_roce_guarded(self, output):
         """Fail-stop RoCEnante check once the step's output is on the host.

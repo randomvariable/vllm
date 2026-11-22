@@ -65,8 +65,10 @@ class B12xRoceAllReduce:
         device: torch.device,
         *,
         global_ranks: Sequence[int] | None = None,
+        dcp: bool = False,
     ) -> None:
         self.disabled = True
+        self.dcp = dcp
         self.group = group
         self.device_group = device_group
         self.device = device
@@ -110,12 +112,16 @@ class B12xRoceAllReduce:
             # Exchange setup over the CPU (gloo) group: using the torch NCCL
             # group would create a torch NCCL communicator that vLLM otherwise
             # never needs, costing ~3.4 GB of unified memory per rank on Spark.
-            self._runtime = roce.AllReduce.from_exchange_group(
+            options = dict(
                 exchange_group=group,
                 device=device,
                 max_size=max_size,
                 max_gather_bytes=max_gather,
             )
+            if dcp:
+                self._runtime = roce.AllReduce(**options, pipe_bytes=max_gather)
+            else:
+                self._runtime = roce.AllReduce.from_exchange_group(**options)
         except Exception as exc:  # noqa: BLE001 - the runtime already coordinated ranks
             logger.warning("RoCEnante initialization failed: %s", exc)
             return
@@ -193,6 +199,8 @@ class B12xRoceAllReduce:
 
     def _request_name(self) -> str:
         ranks = "-".join(map(str, self.global_ranks))
+        if self.dcp:
+            return f"distributed.roce.dcp.{ranks}.collectives"
         return f"distributed.roce.{ranks}.collectives"
 
     def get_b12x_preparation_units(
@@ -227,10 +235,15 @@ class B12xRoceAllReduce:
             calls = [
                 _preparation.prepared_call(state, inp=buffer) for buffer in buffers
             ]
-            gather = _preparation.prepared_gather_call(state, inp=buffers[1])
+            calls.append(_preparation.prepared_gather_call(state, inp=buffers[1]))
+            if self.dcp:
+                seed = torch.zeros(
+                    (self.world_size, 8), dtype=torch.bfloat16, device=self.device
+                )
+                calls.append(_preparation.prepared_reduce_scatter_call(state, inp=seed))
             return calls[0].__class__(
-                run=lambda: [call.run() for call in (*calls, gather)],
-                output=tuple(call.output for call in (*calls, gather)),
+                run=lambda: [call.run() for call in calls],
+                output=tuple(call.output for call in calls),
             )
 
         request = self._plan.request(
@@ -244,7 +257,7 @@ class B12xRoceAllReduce:
         return (
             B12xPreparationUnit(
                 name="ROCE_ALL_REDUCE",
-                key=(self.global_ranks,),
+                key=(self.global_ranks, "dcp") if self.dcp else (self.global_ranks,),
                 requests=(request,),
                 stage="weights",
             ),
@@ -268,7 +281,9 @@ class B12xRoceAllReduce:
             self._runtime.check_health()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
-        return not self.disabled and self._runtime.should_allreduce(inp)
+        return (
+            not self.dcp and not self.disabled and self._runtime.should_allreduce(inp)
+        )
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
         if not self.should_custom_ar(inp):
@@ -302,6 +317,17 @@ class B12xRoceAllReduce:
                 dim,
             )
         return self._runtime.all_gather(inp, dim=dim, plan=self._prepared_plan())
+
+    def try_reduce_scatter(self, inp: torch.Tensor) -> torch.Tensor | None:
+        """Reduce a contiguous rank-major tensor, or decline before launch."""
+        if (
+            self.disabled
+            or not self.dcp
+            or not self._runtime.should_reduce_scatter(inp)
+        ):
+            return None
+        logger.info_once("RoCEnante DCP reduce-scatter is live.")
+        return self._runtime.reduce_scatter(inp, plan=self._prepared_plan())
 
     def supports_fused_add_rms_norm(self) -> bool:
         return False

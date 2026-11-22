@@ -1856,6 +1856,11 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
         tp.graph_capture(context),
         pp.graph_capture(context),
         dp.graph_capture(context),
+        (
+            _DCP.graph_capture(context)
+            if _DCP is not None and envs.VLLM_DCP_ROCENANTE
+            else nullcontext()
+        ),
     ):
         yield context
 
