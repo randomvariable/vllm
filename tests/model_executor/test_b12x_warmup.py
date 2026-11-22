@@ -144,32 +144,27 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
-    monkeypatch.setattr(
-        b12x_mod,
-        "_import_b12x_mxfp8",
-        lambda: SimpleNamespace(
-            mm=lambda *args, **kwargs: calls.append((args, kwargs))
-        ),
-    )
-    monkeypatch.setattr(
-        b12x_mod,
-        "current_stream",
-        lambda: SimpleNamespace(cuda_stream=object()),
-    )
+
+    def mm(source, packed_weight, *, bias, expected_m):
+        calls.append((source.shape, expected_m))
+        return source.new_empty((source.shape[0], packed_weight.out_features))
+
+    monkeypatch.setattr(b12x_mod, "_import_b12x_mxfp8", lambda: SimpleNamespace(mm=mm))
     packed_weight = SimpleNamespace(
         in_features=128,
         padded_in_features=128,
         out_features=256,
         weight=SimpleNamespace(values=torch.empty(1)),
     )
-    layer = SimpleNamespace(b12x_mxfp8_packed_weight=packed_weight)
+    layer = torch.nn.Module()
+    layer.b12x_mxfp8_packed_weight = packed_weight
+    layer.b12x_activation_mode = "auto"
     kernel = object.__new__(B12xMxfp8LinearKernel)
 
     unit = kernel.get_b12x_warmup_unit(layer, (1, 8), torch.float16)
     unit.compile()
 
-    assert [args[0].shape for args, _ in calls] == [(1, 128), (8, 128)]
-    assert [kwargs["expected_m"] for _, kwargs in calls] == [1, 8]
+    assert calls == [((1, 128), 1), ((8, 128), 8)]
 
 
 def test_b12x_tensor_fp8_warmup_unit(monkeypatch) -> None:
